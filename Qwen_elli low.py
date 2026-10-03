@@ -15,10 +15,19 @@ import time
 import numpy as np
 import cv2
 
+try:
+    import moderngl
+    MODERNGL_AVAILABLE = True
+except Exception:
+    moderngl = None
+    MODERNGL_AVAILABLE = False
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 MODELS_DIR = os.path.join(BASE_DIR, "animejanai")
+SHADERS_DIR = os.path.join(BASE_DIR, "shaders")
+os.makedirs(SHADERS_DIR, exist_ok=True)
 BG_IMAGE_PATH = os.path.join(BASE_DIR, "sfondo.png")
 RIFE_MODEL_PATH = os.path.join(MODELS_DIR, "rife49_ensemble_True_scale_1_sim.onnx")
 RIFE_SCENE_CUT = 0.10   # differenza media oltre la quale non si interpola (cambio scena)
@@ -80,13 +89,52 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import (
     QImage, QPixmap, QKeyEvent, QMouseEvent, QWheelEvent,
     QPainter, QColor, QPen, QBrush, QTransform, QRegion, QPainterPath,
-    QPainterPathStroker, QIcon, QFont, QCursor, QFontMetrics, QLinearGradient, QPolygon
+    QPainterPathStroker, QIcon, QFont, QCursor, QFontMetrics, QLinearGradient, QPolygon,
+    QVector2D
 )
 from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint, QPointF, QRect, QRectF, QSize, QEvent,
     QFileInfo, QStandardPaths, QStorageInfo, QTranslator, QLocale, QLibraryInfo, QMimeDatabase
 )
+from PyQt5.QtGui import QOpenGLContext
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
+
+# Supporto OpenGL per il display video con shader GLSL (Qwen_elli low usa PyQt5)
+try:
+    from PyQt5.QtOpenGLWidgets import QOpenGLWidget  # Qt >= 5.15 / PyQt5 >= 5.15.2
+except ImportError:
+    try:
+        from PyQt5.QtWidgets import QOpenGLWidget     # alcune build di PyQt5 + Qt 5.15
+    except ImportError:
+        QOpenGLWidget = None                          # fallback: display basato su QLabel
+
+if QOpenGLWidget is not None:
+    try:
+        # Build con Qt >= 5.10 che esporre le classi OpenGL complete
+        from PyQt5.QtOpenGL import (
+            QOpenGLShader, QOpenGLShaderProgram, QOpenGLTexture,
+            QOpenGLVertexArrayObject, QOpenGLVersionProfile,
+        )
+    except ImportError:
+        # Alcune build di PyQt5 (es. PyPI wheel per Qt 5.15) hanno un modulo
+        # PyQt5.QtOpenGL ridotto: le classi shader/texture/vao vivono in QtGui.
+        try:
+            from PyQt5.QtGui import (
+                QOpenGLShader, QOpenGLShaderProgram, QOpenGLTexture,
+            )
+        except ImportError:
+            QOpenGLShader = QOpenGLShaderProgram = QOpenGLTexture = None
+        try:
+            from PyQt5.QtGui import QOpenGLVertexArrayObject
+        except ImportError:
+            QOpenGLVertexArrayObject = None
+        try:
+            from PyQt5.QtGui import QOpenGLVersionProfile
+        except ImportError:
+            QOpenGLVersionProfile = None
+        # Se nemmeno QtGui le espone, disabilita il display GL (fallback QLabel)
+        if QOpenGLShader is None or QOpenGLShaderProgram is None or QOpenGLTexture is None:
+            QOpenGLWidget = None
 
 TORCH_AVAILABLE = False
 TORCH_CUDA = False
@@ -964,14 +1012,846 @@ class CenteredRow(QWidget):
         self._place()
         super().showEvent(event)
 
-class VideoDisplayLabel(QLabel):
+VERTEX_SHADER_SRC = """
+#version 330 core
+in vec2 aPos;
+in vec2 aTexCoord;
+out vec2 TexCoord;
+uniform vec2 uScale;
+void main() {
+    gl_Position = vec4(aPos * uScale, 0.0, 1.0);
+    TexCoord = aTexCoord;
+}
+"""
+
+PASSTHROUGH_FRAG_SRC = """
+#version 330 core
+in vec2 TexCoord;
+out vec4 FragColor;
+uniform sampler2D videoTexture;
+void main() {
+    FragColor = texture(videoTexture, TexCoord);
+}
+"""
+
+def _split_mpv_passes(src):
+    """Spezza un sorgente multi-pass mpv/Anime4K in blocchi.
+
+    Ogni blocco e' un dict con: desc, hook, binds (liste), save, glsl (codice
+    del passo, senza righe di metadata). I file mono-pass vengono gestiti
+    naturalmente (un solo blocco).
+    """
+    passes, cur = [], None
+    for ln in src.splitlines():
+        m = re.match(r"\s*//!(\w+)\s*(.*)$", ln)
+        if m:
+            key, val = m.group(1).upper(), m.group(2).strip()
+            if cur is None:
+                cur = {"desc": "", "hook": "MAIN", "binds": [], "save": None, "glsl": []}
+            if key == "DESC":
+                if cur["glsl"]:
+                    passes.append(cur)
+                    cur = {"desc": "", "hook": "MAIN", "binds": [], "save": None, "glsl": []}
+                cur["desc"] = val
+            elif key == "HOOK":
+                cur["hook"] = val or "MAIN"
+            elif key in ("BIND", "BIND_HIST"):
+                if val:
+                    cur["binds"].append(val.split()[0])
+            elif key == "SAVE":
+                cur["save"] = val or None
+            continue
+        if cur is not None:
+            cur["glsl"].append(ln)
+    if cur is not None and "".join(cur["glsl"]).strip():
+        passes.append(cur)
+    return passes
+
+
+def _mpv_header():
+    # NOTA: niente "#extension GL_NV_gpu_shader5" e niente int64 qui. Il
+    # context profile richiesto da PyQt5 e' 3.3 core senza estensioni non
+    # dichiarate nel format; MAXI/MINI ternari sono GLSL puro e risolvono
+    # l'ambiguita' max(int,int)/min(int,int) del compilatore NVIDIA.
+    return """#version 330 core
+
+in vec2 TexCoord;
+out vec4 FragColor;
+uniform sampler2D videoTexture;
+uniform vec2 pixelSize;
+
+// --- Fix overload max/min su interi (NVIDIA driver non li accetta) ---
+int MAXI(int a, int b) { return a > b ? a : b; }
+int MINI(int a, int b) { return a < b ? a : b; }
+
+// --- Ambiente mpv simulato (single-pass: MAIN == videoTexture) ---
+#define HOOKED videoTexture
+vec4 HOOKED_tex(vec2 p) { return texture(videoTexture, p); }
+vec4 HOOKED_texOff(vec2 off) { return texture(videoTexture, TexCoord + off * pixelSize); }
+vec2 HOOKED_pos = TexCoord;
+vec2 HOOKED_size = vec2(1.0) / pixelSize;
+vec2 HOOKED_pt = pixelSize;
+vec4 LINELUMA_tex(vec2 p) { vec4 c = HOOKED_tex(p); return vec4(c.r * 0.299 + c.g * 0.587 + c.b * 0.114, 0.0, 0.0, 1.0); }
+vec4 LINELUMA_texOff(vec2 o) { return LINELUMA_tex(TexCoord + o * pixelSize); }
+vec2 LINELUMA_pos = TexCoord;
+vec4 ORIGINAL_tex(vec2 p) { return texture(videoTexture, p); }
+vec4 ORIGINAL_texOff(vec2 o) { return texture(videoTexture, TexCoord + o * pixelSize); }
+vec2 ORIGINAL_pos = TexCoord;
+"""
+
+
+def _preprocess_glsl(src):
+    """Adatta uno shader in stile mpv/Anime4K al pipeline single-pass del player.
+
+    Supporta i file MULTI-PASS (blocchi ripetuti //!DESC/...): viene scelto il
+    passo finale che termina su MAIN (quello con l'effetto completo) e gli shim
+    delle texture intermedie (!SAVE) puntano tutti alla stessa videoTexture.
+    - commenta i metadati //!;
+    - rimuove versioni GLSL/FragColor duplicati nel corpo;
+    - inietta gli shim mpv (HOOKED_*, LINELUMA_*, TEX_name(...));
+    - risolve max(int,int)/min(int,int) con gli helper ternari MAXI/MINI
+      (compatibili con il profilo core 3.3 richiesto da PyQt5);
+    - rinomina piu' funzioni hook() in neko_hook_N e genera un main() che
+      richiama l'ultima (il passo finale della catena CNN/denoise).
+    Se lo shader contiene gia' un void main(), viene lasciato tale e quale.
+    """
+    # 0) Multi-pass: estrai i blocchi e tieni quello che hooka MAIN
+    try:
+        passes = _split_mpv_passes(src)
+    except Exception:
+        passes = []
+    names = set()
+    for p in passes:
+        for n in (p["save"],) + tuple(p["binds"]):
+            if n:
+                names.add(n)
+    main_passes = [p for p in passes if p["hook"] == "MAIN"]
+    if len(passes) > 1 and main_passes:
+        chosen = main_passes[-1]["glsl"]
+        src = "\n".join(chosen)
+    else:
+        src = "\n".join(p["glsl"]) if passes else src
+
+    # 1) Commenta le righe di metadata mpv residue
+    lines = src.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith("//!"):
+            lines[i] = "//" + ln.lstrip()
+    src = "\n".join(lines)
+
+    # 2) Versione GLSL: una sola, in cima (l'header la fornisce comunque)
+    src = re.sub(r"(?m)^\s*#version\s+\d+.*$", "", src)
+
+    # 3) FragColor dichiarato dall'header: evita "redefinition of 'FragColor'"
+    src = re.sub(r"(?m)^\s*out\s+vec4\s+FragColor\s*;", "", src)
+
+    has_main = bool(re.search(r"\bvoid\s+main\s*\(", src))
+    needs_hook_shim = (not has_main) and ("hook()" in src)
+
+    header = _mpv_header()
+
+    # 5) Shim per le texture intermedie dei passi mpv (!SAVE / !BIND):
+    #    in modalita' single-pass tutto campiona la stessa videoTexture.
+    shims = ""
+    for n in sorted(names):
+        if n in ("MAIN", "HOOKED", "ORIGINAL"):
+            continue
+        shims += (
+            "#define %s videoTexture\n"
+            "vec4 %s_tex(vec2 p) { return texture(videoTexture, p); }\n"
+            "vec4 %s_texOff(vec2 off) { return texture(videoTexture, TexCoord + off * pixelSize); }\n"
+            "vec2 %s_pos = TexCoord;\n"
+            "vec2 %s_size = vec2(1.0) / pixelSize;\n"
+            "vec2 %s_pt = pixelSize;\n"
+            % (n, n, n, n, n, n)
+        )
+    if shims:
+        header += "\n// --- Texture intermedie dei passi mpv (alias su videoTexture) ---\n" + shims
+
+    # 4) Fix max/min su interi: il pre-processore GLSL di Qt espande le macro
+    #    prima del parsing, quindi "max(int(...), 1)" diventa una chiamata
+    #    max(int,int) che il compilatore NVIDIA non accetta. Riscriviamo queste
+    #    chiamate in MAXI/MINI (definiti nell'header) dopo aver espanso le
+    #    #define, usando un mini-valutatore ricorsivo dell'aritmetica intera
+    #    per i casi con soli letterali/cast int().
+    _int_arg = r"(?:int\s*\([^()]*\)|-?\d+)"
+
+    def _const_int(expr):
+        """Valuta l'espressione se e' aritmetica intera pura; None altrimenti."""
+        s = expr.strip()
+        if not s:
+            return None
+        if re.fullmatch(r"-?\d+", s):
+            return int(s)
+        m = re.fullmatch(r"(?:int|uint)\s*\((.*)\)", s, re.S)
+        if m:
+            v = _const_int(m.group(1))
+            return int(v) if v is not None else None
+        m = re.fullmatch(r"\((.*)\)", s, re.S)
+        if m:
+            return _const_int(m.group(1))
+        for op in ("*", "+", "-", "/"):
+            parts = _split_on_op(s, op)
+            if len(parts) >= 2:
+                vals = [_const_int(p) for p in parts]
+                if all(v is not None for v in vals):
+                    acc = vals[0]
+                    for v in vals[1:]:
+                        if op == "*":
+                            acc *= v
+                        elif op == "+":
+                            acc += v
+                        elif op == "-":
+                            acc -= v
+                        else:
+                            acc = int(acc / v) if v else 0
+                    return acc
+        return None
+
+    def _split_on_op(s, op):
+        """Spezza su un operatore a priorita' minima (fuori da parentesi)."""
+        parts, depth, cur, i, n = [], 0, "", 0, len(s)
+        while i < n:
+            ch = s[i]
+            if ch == "(":
+                depth += 1; cur += ch
+            elif ch == ")":
+                depth -= 1; cur += ch
+            elif ch == op and depth == 0 and cur.strip():
+                parts.append(cur); cur = ""
+            else:
+                cur += ch
+            i += 1
+        parts.append(cur)
+        return parts if len(parts) > 1 else [s]
+
+    def _split_args(s):
+        args, depth, cur = [], 0, ""
+        for ch in s:
+            if ch == "(":
+                depth += 1; cur += ch
+            elif ch == ")":
+                depth -= 1; cur += ch
+            elif ch == "," and depth == 0:
+                args.append(cur); cur = ""
+            else:
+                cur += ch
+        if cur.strip():
+            args.append(cur)
+        return args
+
+    def _rewrite_mm(expr):
+        """Riscrive max/min -> MAXI/MINI o costanti intere, ricorsivamente."""
+        res, i, n = "", 0, len(expr)
+        while i < n:
+            m = re.match(r"\b(max|min)\s*\(", expr[i:])
+            if m:
+                fn = m.group(1)
+                start = i + m.end()
+                depth, j = 1, start
+                while j < n and depth:
+                    if expr[j] == "(":
+                        depth += 1
+                    elif expr[j] == ")":
+                        depth -= 1
+                    j += 1
+                inner = expr[start:j - 1]
+                args = [_rewrite_mm(a) for a in _split_args(inner)]
+                ints = [(_const_int(a) if _is_ident(a) is False else None) for a in args]
+                if len(args) == 2 and all(_const_int(a) is not None for a in args):
+                    a0, a1 = _const_int(args[0]), _const_int(args[1])
+                    res += str(max(a0, a1) if fn == "max" else min(a0, a1))
+                elif len(args) == 2 and all(re.match(r"^(int|uint)\s*\(", a) or re.fullmatch(r"-?\d+", a.strip()) or (re.fullmatch(r"[A-Z][A-Z0-9_]*", a.strip()) and a.strip() in defines) for a in args):
+                    res += ("MAXI" if fn == "max" else "MINI") + "(" + ", ".join(args) + ")"
+                else:
+                    res += fn + "(" + ", ".join(args) + ")"
+                i = j
+                continue
+            res += expr[i]
+            i += 1
+        return res
+
+    def _is_ident(s):
+        return bool(re.fullmatch(r"[A-Za-z_]\w*", s.strip()))
+
+    # Raccogli le #define semplici (nome -> valore) per espanderle
+    defines = {}
+    for ln in src.splitlines():
+        m = re.match(r"\s*#\s*define\s+([A-Za-z_]\w*)\s+(.*?)\s*$", ln)
+        if m:
+            val = m.group(2)
+            cpos = val.find("//")
+            if cpos != -1:
+                val = val[:cpos].rstrip()
+            defines[m.group(1)] = val
+
+    final_lines = []
+    for ln in src.splitlines():
+        m = re.match(r"^(\s*#\s*define\s+[A-Za-z_]\w*\s+)(.*?)\s*$", ln)
+        if m:
+            head, val = m.group(1), m.group(2)
+            comment = ""
+            cpos = val.find("//")
+            if cpos != -1:
+                comment = val[cpos:]
+                val = val[:cpos].rstrip()
+            # se il valore della macro contiene max/min con argomenti interi,
+            # prova a ridurlo a costante; altrimenti riscivi solo i nomi
+            rw = _rewrite_mm(val)
+            cv = _const_int(rw)
+            if cv is not None and ("max(" in val or "min(" in val):
+                rw = str(cv)
+            final_lines.append(head + rw + ((" " + comment) if comment else ""))
+        else:
+            final_lines.append(_rewrite_mm(ln))
+    src = "\n".join(final_lines)
+
+    body = src.strip("\n")
+
+    if needs_hook_shim:
+        # Rinomina TUTTE le occorrenze di "vec4 hook()" (i file multi-blocco
+        # contengono piu' funzioni hook con lo stesso nome): la numerazione
+        # evita il conflitto e il main richiama l'ultima definita.
+        n_hooks = len(re.findall(r"\bvec4\s+hook\s*\(\s*\)", body))
+        idx = [0]
+
+        def _rn(mo):
+            idx[0] += 1
+            return "vec4 neko_hook_%d()" % idx[0]
+
+        body = re.sub(r"\bvec4\s+hook\s*\(\s*\)", _rn, body)
+        last = max(idx[0], 1)
+        body += "\n\nvoid main() {\n    FragColor = neko_hook_%d();\n}\n" % last
+    elif not has_main:
+        # shader senza hook() ne' main(): passthrough
+        body += "\n\nvoid main() {\n    FragColor = HOOKED_tex(TexCoord);\n}\n"
+
+    return header + "\n" + body
+
+
+class VideoGLWidget(QOpenGLWidget):
     double_clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.pass_program = None
+        self.custom_program = None
+        self.vao = None
+        self.texture = None
+        self.pending_frame = None
+        self.frame_size = (1, 1)
+        self.fill_mode = "height"
+        self.shader_enabled = False
+        self.current_shader_path = None
+        self.shader_sharpness = 0.5
+        self.bg_pixmap = None
+        self.show_bg_texture = True
+        self.gl = None
+        self._raw_frame = None
+        # Motore multipass moderno (mpv user-shader hook spec / Anime4K originali)
+        self.chain = None
+        self._chain_error = False
+        self._processed_frame = None
+        self._chain_time = time.time()
+        self._chain_frames = 0
+
+    def _get_chain(self):
+        """Ritorna la catena moderngl se disponibile. La chain viene creata in
+        initializeGL (condivisione del contesto Qt) o al primo load_shader
+        fuori dal paint (contesto standalone EGL).
+
+        Se NEKO_NO_EGL e' attivo (auto su NVIDIA, o manuale) NON si crea qui un
+        contesto EGL standalone fuori dal paint: sarebbe esattamente il secondo
+        contesto che causa i 'Failed to make context current'. Si tenta allora
+        l'inizializzazione dentro il contesto corrente del widget; se il widget
+        non e' ancora stato inizializzato, la chain verra' creata in
+        initializeGL."""
+        if not MODERNGL_AVAILABLE or self._chain_error:
+            return None
+        if self.chain is None:
+            if os.environ.get("NEKO_NO_EGL"):
+                ctx = None
+                try:
+                    ctx = self.context()
+                except Exception:
+                    ctx = None
+                if ctx is not None and ctx.isValid():
+                    self._try_init_chain_in_context()
+                else:
+                    # initializeGL non e' ancora avvenuto: niente creazione
+                    # fuori dal paint, sara' fatto li'.
+                    return None
+            else:
+                try:
+                    self.chain = ShaderChain()
+                except Exception as e:
+                    print(f"[ShaderChain] contesto non disponibile: {e}")
+                    self._chain_error = True
+                    return None
+        return self.chain
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton:
+            self.double_clicked.emit()
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
+
+    def wheelEvent(self, event: QWheelEvent):
+        event.ignore()
+
+    def _get_gl_funcs(self):
+        """Ottiene le funzioni OpenGL raw nel modo piu' robusto possibile.
+
+        Nota: su alcune build di PyQt5 (es. PyPI 5.15) il wrapper restituito da
+        QOpenGLContext.versionFunctions() risulta rotto e le sue chiamate causano
+        segmentazione; per questo viene usato solo come ultima risorsa dopo aver
+        provato QOpenGLFunctions (PyQt5 >= 5.10).
+        """
+        ctx = self.context()
+        if ctx is None:
+            return None
+        # 1) QOpenGLFunctions: wrapper stabile su PyQt5 moderni
+        try:
+            try:
+                from PyQt5.QtOpenGL import QOpenGLFunctions
+            except ImportError:
+                from PyQt5.QtGui import QOpenGLFunctions
+            funcs = QOpenGLFunctions(ctx)
+            funcs.initializeOpenGLFunctions()
+            return funcs
+        except Exception:
+            pass
+        # 2) Fallback: versionFunctions (instabile su alcune build PyPI di PyQt5)
+        try:
+            if QOpenGLVersionProfile is not None:
+                funcs = ctx.versionFunctions(QOpenGLVersionProfile())
+            else:
+                funcs = ctx.versionFunctions()
+            if funcs is not None:
+                try:
+                    funcs.initializeOpenGLFunctions()
+                except Exception:
+                    pass
+            return funcs
+        except Exception:
+            return None
+
+    def initializeGL(self):
+        # Diagnostica contesto: utile per capire i "Failed to make context current"
+        try:
+            ctx = self.context()
+            if ctx is not None and ctx.isValid():
+                fmt = ctx.format()
+                print(f"[GL] initializeGL: contesto OK, versione richiesta "
+                      f"{fmt.majorVersion()}.{fmt.minorVersion()} profile={int(fmt.profile())}")
+                if os.environ.get("NEKO_GL_DEBUG"):
+                    try:
+                        cur = QOpenGLContext.currentContext()
+                        same = (cur is not None and cur == ctx)
+                        print(f"[GL] NEKO_GL_DEBUG: contesto corrente {'== quello del widget' if same else 'DIVERSO dal widget!'}")
+                    except Exception as _e:
+                        print(f"[GL] NEKO_GL_DEBUG currentContext: {_e}")
+            else:
+                print("[GL] initializeGL: contesto NON valido (makeCurrent fallito a monte)")
+        except Exception as _e:
+            print(f"[GL] initializeGL diag: {_e}")
+        # PyQt5 non espone context().functions(): si usa il wrapper delle funzioni OpenGL
+        self.gl = self._get_gl_funcs()
+
+        # Nota: NON si crea un VAO. Con i driver Mesa (software o Gallium) l'uso di
+        # vertex array object combinato con QOpenGLBuffer/QOpenGLShaderProgram in PyQt5
+        # puo' causare crash per corruzione di stato GL; il binding degli attributi
+        # viene rifatto ad ogni paint tramite il VBO correntemente bindato.
+        self.vao = None
+
+        # Catena moderngl multipass: va creata QUI, dentro initializeGL, perche'
+        # e' l'unico punto in cui il contesto GL del widget e' garantitamente
+        # corrente. Crearla fuori dal paint (thread GUI) su NVIDIA/X11 genera un
+        # secondo contesto EGL che confligge con quello di Qt causando i
+        # "Failed to make context current" / composeAndFlush.
+        if getattr(self, "current_shader_path", None):
+            self._try_init_chain_in_context()
+
+        # Il quad a schermo viene creato/legato in modo robusto da _ensure_quad()
+        # ad ogni paintGL; qui si prepara solo il programma di base.
+        self._vbo = None
+
+        # Compila il programma di base (senza effetti)
+        self.pass_program = QOpenGLShaderProgram(self)
+        if not self.pass_program.addShaderFromSourceCode(QOpenGLShader.Vertex, VERTEX_SHADER_SRC):
+            print(f"[GLSL Vertex Error]: {self.pass_program.log()}")
+        if not self.pass_program.addShaderFromSourceCode(QOpenGLShader.Fragment, PASSTHROUGH_FRAG_SRC):
+            print(f"[GLSL Fragment Error]: {self.pass_program.log()}")
+        if not self.pass_program.link():
+            print(f"[GLSL Link Error]: {self.pass_program.log()}")
+
+        # Se c'è uno shader impostato da config, compilalo
+        if self.current_shader_path and os.path.isfile(self.current_shader_path):
+            self.load_shader(self.current_shader_path)
+
+    def _try_init_chain_in_context(self):
+        """Inizializza la catena moderngl.
+
+        Due strategie, in ordine di preferenza:
+        1) NEKO_NO_EGL NON impostato (default su sistemi non-NVIDIA): si crea un
+           contesto EGL *standalone* separato da quello di Qt; la chain lavora
+           interamente sul proprio display EGL offscreen e al widget arriva solo
+           il frame elaborato (CPU read-back), senza mai toccare il contesto di
+           Qt. Richiede pero' che il sistema supporti un secondo contesto: su
+           NVIDIA+X11 puo' confliggere con lo share space GLX del contesto
+           primario (loop 'Failed to make context current').
+        2) NEKO_NO_EGL impostato (valore 'auto' quando viene rilevata una GPU
+           NVIDIA all'avvio, oppure 1 manuale): la chain condivide il contesto
+           corrente del QOpenGLWidget (create_context(share=True)) -- un solo
+           contesto attivo, niente conflitto. Richiede che il contesto del widget
+           sia realmente corrente durante initializeGL/paintGL; se il contesto
+           non e' valido la chain viene disattivata invece di innescare errori
+           ripetuti.
+        """
+        if not MODERNGL_AVAILABLE or self._chain_error or self.chain is not None:
+            return
+        try:
+            ctx = self.context()
+            if ctx is None or not ctx.isValid():
+                return
+        except Exception:
+            return
+        try:
+            if os.environ.get("NEKO_NO_EGL"):
+                # Strategia 2: condividi il contesto di Qt (makeCurrent esplicito
+                # per essere sicuri che sia corrente durante la creazione).
+                made = False
+                try:
+                    made = bool(ctx.makeCurrent(self))
+                except Exception:
+                    made = False
+                try:
+                    self.chain = ShaderChain(share_ctx=ctx)
+                    print("[ShaderChain] contesto moderngl condiviso col widget Qt "
+                          "(NEKO_NO_EGL=1)")
+                finally:
+                    if made:
+                        try:
+                            ctx.doneCurrent()
+                        except Exception:
+                            pass
+            else:
+                # Strategia 1 (default): contesto EGL standalone, isolato da Qt.
+                self.chain = ShaderChain()
+                print("[ShaderChain] contesto moderngl EGL standalone attivo "
+                      "(isolato dal contesto Qt; NEKO_NO_EGL=1 per forzare la "
+                      "condivisione)")
+        except Exception as e:
+            print(f"[ShaderChain] init fallita: {e}")
+            self._chain_error = True
+            self.chain = None
+
+    def load_shader(self, shader_path):
+        if not os.path.isfile(shader_path):
+            return False
+        # 1) Motore moderno multi-pass (moderngl + mpv user-shader hook spec):
+        #    esegue i file ORIGINALI di Anime4K (//!HOOK/!BIND/!SAVE, RPN, FP16).
+        chain = self._get_chain()
+        if chain is not None:
+            ok, errors = chain.set_shaders([shader_path])
+            if ok:
+                self.custom_program = None
+                self.current_shader_path = shader_path
+                self.shader_enabled = True
+                self.update()
+                return True
+            for p, err in errors:
+                print(f"[ShaderChain] errore in {os.path.basename(p)}: {err}")
+        # 2) Fallback single-pass: preprocessing del sorgente in GLSL 330
+        try:
+            with open(shader_path, "r", encoding="utf-8") as f:
+                raw_src = f.read()
+
+            # Pre-processing: trasforma gli shader mpv/Anime4K (hook(), HOOKED_tex,
+            # macro con max(int,int), metadati //!...) in un fragment shader GLSL
+            # 330 valido per il pipeline single-pass di NekoPlayer.
+            frag_src = _preprocess_glsl(raw_src)
+
+            new_prog = QOpenGLShaderProgram(self)
+            if not new_prog.addShaderFromSourceCode(QOpenGLShader.Vertex, VERTEX_SHADER_SRC):
+                print(f"[GLSL Vertex Error]: {new_prog.log()}")
+                return False
+            if not new_prog.addShaderFromSourceCode(QOpenGLShader.Fragment, frag_src):
+                print(f"[GLSL Fragment Error in {os.path.basename(shader_path)}]: {new_prog.log()}")
+                return False
+            if not new_prog.link():
+                print(f"[GLSL Link Error]: {new_prog.log()}")
+                return False
+
+            if self.custom_program:
+                self.custom_program.deleteLater()
+            self.custom_program = new_prog
+            self.current_shader_path = shader_path
+            self.shader_enabled = True
+            # Se la chain era stata caricata in un contesto non piu' valido,
+            # il fallback single-pass prende il suo posto.
+            if self.chain is not None and getattr(self.chain, "passes", None):
+                try:
+                    self.chain.set_shaders([])
+                except Exception:
+                    pass
+            self.update()
+            return True
+        except Exception as e:
+            print(f"[GLSL Error]: {e}")
+            return False
+
+    def disable_shader(self):
+        self.shader_enabled = False
+        self.current_shader_path = None
+        if self.chain is not None:
+            try:
+                self.chain.set_shaders([])
+            except Exception:
+                pass
+        self._processed_frame = None
+        self.update()
+
+    def set_frame(self, frame_np):
+        # Catena multi-pass: l'elaborazione avviene DENTRO paintGL, dove il
+        # contesto GL del widget e' garantito corrente. Qui ci limitiamo a
+        # memorizzare il frame grezzo; sara' processato (se shader attivo) in
+        # paintGL e convertito in texture subito dopo. Questo evita di toccare
+        # un contesto moderngl da codice fuori dal paint, causa dei
+        # "Failed to make context current" / composeAndFlush su NVIDIA+X11.
+        self._raw_frame = frame_np
+        self.update()
+
+    def _process_with_chain(self, frame_np):
+        """Esegue la catena moderngl sul frame. Ritorna None se non disponibile
+        o in errore (in tal caso si usa il frame originale)."""
+        if not (self.shader_enabled and self.chain is not None
+               and getattr(self.chain, "passes", None)):
+            return None
+        try:
+            self._chain_frames += 1
+            out = self.chain.run(frame_np, time.time() - self._chain_time, self._chain_frames)
+            if out is not None and getattr(out, "ndim", 0) == 3:
+                return np.ascontiguousarray(out[:, :, :3])
+        except Exception as e:
+            print(f"[ShaderChain] run fallita: {e}")
+            # disattiva la chain per non riprovare ad ogni frame
+            try:
+                self.chain.set_shaders([])
+            except Exception:
+                pass
+        return None
+
+    def clear_frame(self):
+        self.pending_frame = None
+        if self.texture:
+            self.texture.destroy()
+            self.texture = None
+        self.update()
+
+    def set_fill_mode(self, mode):
+        self.fill_mode = mode
+        self.update()
+
+    def set_background(self, pixmap, show_texture):
+        self.bg_pixmap = pixmap
+        self.show_bg_texture = show_texture
+        self.update()
+
+    def _ensure_quad(self, prog):
+        """Carica il quad a schermo e configura gli attributi dei vertici.
+
+        Viene chiamato ad ogni paintGL per garantire che i binding di buffer e
+        attributi siano attivi nel contesto corrente (niente VAO, per evitare
+        crash su driver Mesa/GLobster). Gli attributi vengono presi via
+        QOpenGLShaderProgram.attributeLocation, quindi il layout dipende dal
+        programma attualmente bindato.
+        """
+        try:
+            try:
+                from PyQt5.QtOpenGL import QOpenGLBuffer
+            except ImportError:
+                from PyQt5.QtGui import QOpenGLBuffer
+            if getattr(self, "_vbo", None) is None or not self._vbo.isCreated():
+                try:
+                    vbo = QOpenGLBuffer(QOpenGLBuffer.Type.VertexBuffer)
+                except AttributeError:
+                    vbo = QOpenGLBuffer()
+                vbo.create()
+                verts = np.array([
+                    -1.0, -1.0, 0.0, 1.0,
+                     1.0, -1.0, 1.0, 1.0,
+                    -1.0,  1.0, 0.0, 0.0,
+                     1.0,  1.0, 1.0, 0.0,
+                ], dtype=np.float32)
+                vbo.allocate(verts.nbytes)
+                vbo.write(0, verts.tobytes(), verts.nbytes)
+                self._vbo = vbo
+            self._vbo.bind()
+        except Exception as e:
+            print(f"[GL] Buffer non disponibile: {e}")
+        gl = self.gl
+        if gl is None:
+            return
+        loc_pos = prog.attributeLocation("aPos")
+        loc_uv = prog.attributeLocation("aTexCoord")
+        if loc_pos >= 0:
+            gl.glEnableVertexAttribArray(loc_pos)
+            gl.glVertexAttribPointer(loc_pos, 2, 0x1406, False, 16, 0)   # GL_FLOAT = 0x1406
+        if loc_uv >= 0:
+            gl.glEnableVertexAttribArray(loc_uv)
+            gl.glVertexAttribPointer(loc_uv, 2, 0x1406, False, 16, 8)
+
+    def paintGL(self):
+        # 1) Se c'e' un frame grezzo da elaborare, esegui la catena multi-pass.
+        #    Con chain standalone (default) moderngl fa makeCurrent sul proprio
+        #    contesto EGL e poi lo rilascia: niente conflitto col contesto del
+        #    widget. Con NEKO_NO_EGL=1 la chain condivide il contesto Qt, che
+        #    qui e' gia' corrente.
+        if getattr(self, "_raw_frame", None) is not None:
+            raw = self._raw_frame
+            self._raw_frame = None
+            processed = self._process_with_chain(raw)
+            self.pending_frame = processed if processed is not None else raw
+            # Dopo il run della chain standalone potrebbe essere rimasto
+            # corrente un contesto estraneo: riassicura il contesto del widget
+            # prima dei draw di Qt (evita i warning 'Failed to make context
+            # current' / composeAndFlush su NVIDIA+X11).
+            try:
+                _ctx = self.context()
+                if _ctx is not None and _ctx.isValid():
+                    _cur = QOpenGLContext.currentContext()
+                    if _cur is not None and _cur != _ctx:
+                        _ctx.makeCurrent(self)
+            except Exception:
+                pass
+
+        if self.pending_frame is not None:
+            frame = self.pending_frame
+            self.pending_frame = None
+            fh, fw = frame.shape[:2]
+            self.frame_size = (fw, fh)
+            q_img = QImage(frame.data, fw, fh, frame.strides[0], QImage.Format_RGB888)
+            if self.texture is not None:
+                self.texture.destroy()
+            self.texture = QOpenGLTexture(q_img)
+            self.texture.setMinificationFilter(QOpenGLTexture.Linear)
+            self.texture.setMagnificationFilter(QOpenGLTexture.Linear)
+            self.texture.setWrapMode(QOpenGLTexture.ClampToEdge)
+
+        if self.texture is None:
+            self._draw_fallback()
+            return
+
+        glw = self.window() if hasattr(self, "window") else None
+        theme = getattr(glw, "theme_color", None) if glw is not None else None
+        c = QColor(theme) if theme else QColor("#0f0c12")
+        if self.gl is not None:
+            self.gl.glClearColor(c.redF(), c.greenF(), c.blueF(), 1.0)
+            self.gl.glClear(0x00004000)   # GL_COLOR_BUFFER_BIT
+
+        # Sceglie quale programma usare: custom se attivo, altrimenti passthrough.
+        # Se il motore multi-pass (chain) ha caricato lo shader, il frame arriva
+        # gia' elaborato: si usa il solo programma passthrough.
+        if self.chain is not None and getattr(self.chain, "passes", None):
+            prog = self.pass_program
+        else:
+            prog = self.custom_program if (self.shader_enabled and self.custom_program) else self.pass_program
+        if prog is None:
+            return
+
+        if not prog.bind():
+            print(f"[GL] Errore bind programma: {prog.log()}")
+            return
+        # Ricrea/ribinda il quad e gli attributi dei vertici ad ogni frame:
+        # QOpenGLWidget puo' cambiare context/state tra un paint e l'altro e i
+        # binding GL non sono garantiti persistenti senza VAO.
+        self._ensure_quad(prog)
+        self.texture.bind(0)
+
+        W, H = max(1, self.width()), max(1, self.height())
+        fw, fh = self.frame_size
+        fa = fw / max(1.0, float(fh))
+
+        if self.fill_mode == "width":
+            sx = 1.0
+            sy = (W / fa) / H
+        else:
+            sx = (H * fa) / W
+            sy = 1.0
+
+        prog.setUniformValue("uScale", QVector2D(float(sx), float(sy)))
+        prog.setUniformValue("videoTexture", 0)
+
+        # Invia i parametri dello shader personalizzato solo se attivo e se il
+        # fallback single-pass (custom_program) sta disegnando lui lo shader.
+        if self.shader_enabled and prog is self.custom_program:
+            prog.setUniformValue("pixelSize", QVector2D(1.0 / float(fw), 1.0 / float(fh)))
+            prog.setUniformValue("sharpness", float(self.shader_sharpness))
+
+        if self.gl is not None:
+            self.gl.glDrawArrays(0x0005, 0, 4)   # GL_TRIANGLE_STRIP = 0x0005
+
+        self.texture.release()
+        prog.release()
+
+    def _draw_fallback(self):
+        painter = QPainter(self)
+        if self.show_bg_texture and self.bg_pixmap and not self.bg_pixmap.isNull():
+            scaled = self.bg_pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            x = (self.width() - scaled.width()) // 2
+            y = (self.height() - scaled.height()) // 2
+            painter.drawPixmap(x, y, scaled)
+        else:
+            painter.fillRect(self.rect(), QColor("#0f0c12"))
+            painter.setPen(QColor("#cdd6f4"))
+            font = QFont(resolve_ui_font_family(), 12)
+            painter.setFont(font)
+            painter.drawText(
+                self.rect(), Qt.AlignCenter,
+                "🐾 Neko Player\nNessun video caricato.\n[Tasto Q = Chiudi | 🎨 = Colore]"
+            )
+        painter.end()
+
+
+class VideoDisplayLabel(QLabel):
+    """Fallback senza OpenGL: display su QLabel (usato se QOpenGLWidget non è disponibile)."""
+    double_clicked = pyqtSignal()
+    shader_enabled = False
+    current_shader_path = None
+
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton:
             self.double_clicked.emit()
             event.accept()
         else: super().mouseDoubleClickEvent(event)
     def wheelEvent(self, event: QWheelEvent): event.ignore()
+
+    def load_shader(self, shader_path):
+        return False
+
+    def disable_shader(self):
+        self.shader_enabled = False
+        self.current_shader_path = None
+
+    def set_frame(self, frame_np):
+        fh, fw = frame_np.shape[:2]
+        q_img = QImage(frame_np.data, fw, fh, frame_np.strides[0], QImage.Format_RGB888)
+        self.setPixmap(QPixmap.fromImage(q_img))
+
+    def clear_frame(self):
+        self.clear()
+
+    def set_fill_mode(self, mode):
+        pass
+
+    def set_background(self, pixmap, show_texture):
+        pass
+
+
+if QOpenGLWidget is not None:
+    VideoDisplayLabel = VideoGLWidget
 
 class FFmpegCapture:
     """Sostituto minimale di cv2.VideoCapture: ffmpeg decodifica (NVDEC) e manda frame BGR24 su una pipe."""
@@ -1148,6 +2028,435 @@ _Frame = collections.namedtuple("_Frame", "gen pos img is_seek")
 _EOF = object()
 _LOOP = object()
 
+# ============================================================================
+# Motore shader GLSL (mpv user-shader hook spec + Shadertoy + single-pass)
+# Blocco sostitutivo della sezione shader: supporta i file originali Anime4K
+# (multi-pass //!HOOK/!BIND/!SAVE, RPN in //!WIDTH/!HEIGHT, texture FP16/FP32).
+# ============================================================================
+_GLSL_COMMENTS = re.compile(r"/\*.*?\*/|//(?!!)[^\n]*", re.S)
+_GLSL_VERSION = re.compile(r"^[ \t]*#version[^\n]*\n?", re.M)
+_GLSL_SAMPLER = re.compile(r"\buniform\s+(?:(?:lowp|mediump|highp)\s+)?sampler2D\s+(\w+)\s*;")
+_GLSL_VARYING = re.compile(r"^[ \t]*(?:in|varying)\s+(?:(?:lowp|mediump|highp)\s+)?(float|vec2|vec3|vec4)\s+(\w+)\s*;", re.M)
+
+_SU_RES = ("iResolution", "u_resolution", "uResolution", "resolution", "u_res", "u_size", "uSize",
+           "inputSize", "outputSize", "screenSize", "texSize", "u_texSize")
+_SU_TEXEL = ("texelSize", "u_texelSize", "uTexelSize", "u_texel", "pixelSize", "u_pixelSize", "onePixel", "invResolution")
+_SU_TIME = ("iTime", "iGlobalTime", "u_time", "uTime", "time", "Time")
+_SU_FRAME = ("iFrame", "u_frame", "uFrame", "frame", "frameCount", "FrameCount")
+
+def _eval_rpn(expr: str, vars_map: dict):
+    """Valuta espressioni RPN usate dalle direttive //!WIDTH e //!HEIGHT di mpv."""
+    if not expr: return None
+    tokens = expr.strip().split()
+    stack = []
+    for t in tokens:
+        if t in vars_map:
+            stack.append(float(vars_map[t]))
+        elif t == '+':
+            if len(stack) >= 2: b = stack.pop(); a = stack.pop(); stack.append(a + b)
+        elif t == '-':
+            if len(stack) >= 2: b = stack.pop(); a = stack.pop(); stack.append(a - b)
+        elif t == '*':
+            if len(stack) >= 2: b = stack.pop(); a = stack.pop(); stack.append(a * b)
+        elif t == '/':
+            if len(stack) >= 2:
+                b = stack.pop(); a = stack.pop()
+                stack.append(a / b if b != 0 else 1.0)
+        else:
+            try: stack.append(float(t))
+            except ValueError: pass
+    return int(round(stack[-1])) if stack else None
+
+def _parse_mpv_hook_file(src: str):
+    """Estrae i blocchi multi-pass e le direttive //! da un file hook MPV/Anime4K."""
+    src = src.replace("\r\n", "\n")
+    raw_blocks = re.split(r'(?=^[ \t]*//!\s*HOOK\b)', src, flags=re.M)
+    passes = []
+    for block in raw_blocks:
+        if not re.search(r'^[ \t]*//!\s*HOOK\b', block, flags=re.M):
+            continue
+        directives = {"BIND": []}
+        body_lines = []
+        for line in block.split("\n"):
+            sline = line.strip()
+            if sline.startswith("//!"):
+                content = sline[3:].strip()
+                if content:
+                    parts = content.split(None, 1)
+                    cmd = parts[0].upper()
+                    val = parts[1].strip() if len(parts) > 1 else ""
+                    if cmd == "BIND":
+                        directives["BIND"].append(val)
+                    else:
+                        directives[cmd] = val
+            else:
+                body_lines.append(line)
+        body = "\n".join(body_lines)
+        if "hook" not in body:
+            continue
+        passes.append({
+            "hook": directives.get("HOOK", "MAIN"),
+            "binds": directives.get("BIND", []),
+            "save": directives.get("SAVE", None),
+            "width": directives.get("WIDTH", None),
+            "height": directives.get("HEIGHT", None),
+            "components": int(directives.get("COMPONENTS", 4)),
+            "body": body
+        })
+    return passes
+
+class ShaderChain:
+    """Motore GLSL universale per Neko Player.
+    Supporta:
+      1. Shader standard a singolo passaggio (GLSL 330)
+      2. Shader formato Shadertoy (mainImage)
+      3. Shader multipass in formato MPV Hook (Anime4K v4.x, FSRCNNX, ecc.)"""
+    QUAD = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype="f4")
+
+    def __init__(self, share_ctx=None):
+        if not MODERNGL_AVAILABLE:
+            raise RuntimeError("modulo 'moderngl' non installato (pip install moderngl)")
+        self.ctx = None
+        last = None
+        # 1) Se ci viene passato il contesto corrente di QOpenGLWidget, lo
+        #    condividiamo: un solo contesto EGL/GLX attivo evita i conflitti che
+        #    causano "Failed to make context current" / composeAndFlush con
+        #    driver NVIDIA su X11.
+        if share_ctx is not None:
+            try:
+                self.ctx = moderngl.create_context(share=True)
+            except Exception as e:
+                last = e
+        # 2) Contesto standalone (EGL headless o GLX), usato quando la chain
+        #    lavora fuori dal paint GL di Qt (elaborazione CPU-side del frame).
+        if self.ctx is None:
+            for kw in ({"backend": "egl"}, {}):
+                try:
+                    self.ctx = moderngl.create_standalone_context(**kw)
+                    break
+                except Exception as e: last = e
+        if self.ctx is None: raise RuntimeError(f"contesto OpenGL non disponibile: {last}")
+        self.vbo = self.ctx.buffer(self.QUAD.tobytes())
+        self.passes = []
+        self.in_tex = None
+
+    @staticmethod
+    def _rel(obj):
+        try:
+            if obj is not None: obj.release()
+        except Exception: pass
+
+    def _compile_standard(self, path, src):
+        src = _GLSL_VERSION.sub("", src, count=1)
+        clean = _GLSL_COMMENTS.sub("", src)
+        toy = "mainImage" in clean and not re.search(r"\bvoid\s+main\s*\(", clean)
+        head = ["#version 330", "#define texture2D texture", "#define varying in"]
+        tail = ""
+        if toy:
+            for decl, name in (("uniform vec3 iResolution;", "iResolution"), ("uniform float iTime;", "iTime"),
+                               ("uniform int iFrame;", "iFrame"), ("uniform vec4 iMouse;", "iMouse"),
+                               ("uniform sampler2D iChannel0;", "iChannel0")):
+                if not re.search(r"\buniform\b[^;]*\b" + name + r"\b", clean): head.append(decl)
+            head.append("out vec4 _fragColor;")
+            tail = "\nvoid main() { vec4 c = vec4(0.0, 0.0, 0.0, 1.0); mainImage(c, gl_FragCoord.xy); _fragColor = c; }\n"
+        elif "gl_FragColor" in clean and not re.search(r"\bout\s+vec4\b", clean):
+            head += ["out vec4 _fragColor;", "#define gl_FragColor _fragColor"]
+        init = {"float": "1.0", "vec2": "in_pos * 0.5 + 0.5", "vec3": "vec3(1.0)", "vec4": "vec4(1.0)"}
+        vs = ["#version 330", "in vec2 in_pos;"]
+        body = ["gl_Position = vec4(in_pos, 0.0, 1.0);"]
+        for typ, name in _GLSL_VARYING.findall(clean):
+            vs.append(f"out {typ} {name};")
+            body.append(f"{name} = {init[typ]};")
+        vs.append("void main() { " + " ".join(body) + " }")
+        fs = "\n".join(head) + "\n#line 1\n" + src + tail
+        vs_src = "\n".join(vs)
+
+        prog = self.ctx.program(vertex_shader=vs_src, fragment_shader=fs)
+        vao = self.ctx.vertex_array(prog, [(self.vbo, "2f", "in_pos")])
+        for name in _GLSL_SAMPLER.findall(fs):
+            try: prog[name].value = 0
+            except Exception: pass
+        def find(names, dims):
+            out = []
+            for n in names:
+                try: u = prog[n]
+                except KeyError: continue
+                if getattr(u, "dimension", 0) in dims and getattr(u, "array_length", 1) == 1: out.append(u)
+            return out
+        def is_float(u):
+            try:
+                u.value = 0.5
+                return True
+            except Exception: return False
+        return {
+            "type": "standard", "path": path, "prog": prog, "vao": vao,
+            "res": find(_SU_RES, (2, 3)), "texel": find(_SU_TEXEL, (2,)), "time": find(_SU_TIME, (1,)),
+            "frame": [(u, is_float(u)) for u in find(_SU_FRAME, (1,))],
+            "fbos": [], "ping": 0, "size": None
+        }
+
+    def _compile_mpv(self, path, src):
+        passes_data = _parse_mpv_hook_file(src)
+        if not passes_data:
+            raise ValueError("Nessun blocco //!HOOK valido trovato nel file Anime4K")
+
+        vs = """#version 330
+in vec2 in_pos;
+out vec2 in_uv;
+void main() {
+    in_uv = in_pos * 0.5 + 0.5;
+    gl_Position = vec4(in_pos, 0.0, 1.0);
+}"""
+
+        compiled_passes = []
+        for idx, pdata in enumerate(passes_data):
+            body = pdata["body"]
+            body_clean = _GLSL_VERSION.sub("", body, count=1)
+            binds = list(pdata["binds"])
+            refs = set(re.findall(r'\b([A-Za-z0-9_]+)_(?:raw|size|pt|pos|tex|texOff)\b', body_clean))
+            for r in refs:
+                if r not in binds: binds.append(r)
+            if not binds: binds.append("HOOKED")
+            if "MAIN" not in binds and pdata["hook"] == "MAIN": binds.append("MAIN")
+            if "HOOKED" not in binds: binds.append("HOOKED")
+
+            decls = [
+                "#version 330",
+                "#define texture2D texture",
+                "in vec2 in_uv;",
+                "out vec4 _fragColor;",
+            ]
+            for bname in sorted(set(binds)):
+                decls.append(f"uniform sampler2D {bname}_raw;")
+                decls.append(f"uniform vec2 {bname}_size;")
+                uniform_pt = f"uniform vec2 {bname}_pt;"
+                decls.append(uniform_pt)
+                decls.append(f"#define {bname}_pos in_uv")
+                decls.append(f"#define {bname}_tex(p) texture({bname}_raw, vec2(p))")
+                decls.append(f"#define {bname}_texOff(offset) texture({bname}_raw, in_uv + vec2(offset) * {bname}_pt)")
+
+            fs = "\n".join(decls) + "\n#line 1\n" + body_clean + "\nvoid main() { _fragColor = hook(); }\n"
+            prog = self.ctx.program(vertex_shader=vs, fragment_shader=fs)
+            vao = self.ctx.vertex_array(prog, [(self.vbo, "2f", "in_pos")])
+
+            compiled_passes.append({
+                "prog": prog, "vao": vao, "hook": pdata["hook"], "binds": binds,
+                "save": pdata["save"], "width": pdata["width"], "height": pdata["height"],
+                "components": pdata["components"]
+            })
+
+        return {
+            "type": "mpv", "path": path, "passes": compiled_passes,
+            "targets": {}, "fbos": {}, "cached_size": None
+        }
+
+    def set_shaders(self, paths):
+        for p in self.passes:
+            self._release_pass(p)
+        self.passes = []
+        ok, errors = [], []
+        for path in paths:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    src = f.read()
+                if "//!HOOK" in src:
+                    compiled = self._compile_mpv(path, src)
+                else:
+                    compiled = self._compile_standard(path, src)
+                self.passes.append(compiled)
+                ok.append(path)
+            except Exception as e:
+                errors.append((path, str(e)))
+        return ok, errors
+
+    def _release_pass(self, p):
+        if p["type"] == "mpv":
+            for t in p.get("targets", {}).values(): self._rel(t)
+            for f in p.get("fbos", {}).values(): self._rel(f)
+            for sub in p.get("passes", []):
+                self._rel(sub["vao"])
+                self._rel(sub["prog"])
+        else:
+            for tex, fbo in p.get("fbos", []):
+                self._rel(fbo)
+                self._rel(tex)
+            self._rel(p["vao"])
+            self._rel(p["prog"])
+
+    def _run_standard(self, p, in_tex, w, h, t, frame_no):
+        if p.get("size") != (w, h):
+            for tex, fbo in p.get("fbos", []):
+                self._rel(fbo); self._rel(tex)
+            p["fbos"] = []
+            for _ in range(2):
+                tex = self.ctx.texture((w, h), 4)
+                tex.repeat_x = tex.repeat_y = False
+                p["fbos"].append((tex, self.ctx.framebuffer(color_attachments=[tex])))
+            p["size"] = (w, h)
+            p["ping"] = 0
+
+        tex, fbo = p["fbos"][p["ping"] & 1]
+        p["ping"] += 1
+        fbo.use()
+        in_tex.use(0)
+        for u in p["res"]: u.value = (float(w), float(h), 1.0)[:u.dimension]
+        for u in p["texel"]: u.value = (1.0 / w, 1.0 / h)
+        for u in p["time"]: u.value = float(t)
+        for u, as_float in p["frame"]: u.value = float(frame_no) if as_float else int(frame_no)
+        p["vao"].render(moderngl.TRIANGLE_STRIP)
+        return tex, fbo, w, h
+
+    def _run_mpv(self, p, in_tex, w, h):
+        passes = p["passes"]
+        if p.get("cached_size") != (w, h):
+            for t in p.get("targets", {}).values(): self._rel(t)
+            for f in p.get("fbos", {}).values(): self._rel(f)
+            p["targets"].clear()
+            p["fbos"].clear()
+
+            vars_map = {
+                "MAIN.w": w, "MAIN.width": w, "MAIN.h": h, "MAIN.height": h,
+                "OUTPUT.w": w, "OUTPUT.width": w, "OUTPUT.h": h, "OUTPUT.height": h,
+                "HOOKED.w": w, "HOOKED.width": w, "HOOKED.h": h, "HOOKED.height": h,
+            }
+
+            for idx, sub in enumerate(passes):
+                pw = _eval_rpn(sub["width"], vars_map) or vars_map["HOOKED.w"]
+                ph = _eval_rpn(sub["height"], vars_map) or vars_map["HOOKED.h"]
+                # Neko Player applica la chain a monte della resize per il display:
+                # i //!WIDTH/!HEIGHT che ingrandiscono oltre il frame sorgente
+                # (es. MAIN.w 2 *) vengono clampati alla dimensione d'ingresso.
+                pw = max(1, min(int(pw), w))
+                ph = max(1, min(int(ph), h))
+                sub["size"] = (pw, ph)
+                if sub["save"]:
+                    s = sub["save"]
+                    vars_map[f"{s}.w"] = vars_map[f"{s}.width"] = pw
+                    vars_map[f"{s}.h"] = vars_map[f"{s}.height"] = ph
+                vars_map["HOOKED.w"] = pw
+                vars_map["HOOKED.h"] = ph
+
+                is_last = (idx == len(passes) - 1)
+                tname = "_final" if is_last else (sub["save"] or f"_pass_{idx}")
+                tex = None
+                for dtype in ('f2', 'f4'):
+                    try:
+                        tex = self.ctx.texture((pw, ph), 4, dtype=dtype)
+                        break
+                    except Exception: pass
+                if tex is None:
+                    tex = self.ctx.texture((pw, ph), 4)
+                tex.repeat_x = tex.repeat_y = False
+                tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                fbo = self.ctx.framebuffer(color_attachments=[tex])
+                p["targets"][tname] = tex
+                p["fbos"][tname] = fbo
+                if sub["save"] and is_last:
+                    p["targets"][sub["save"]] = tex
+                    p["fbos"][sub["save"]] = fbo
+
+            p["cached_size"] = (w, h)
+
+        # Nota anti-feedback: se un blocco SAVE e poi BIND lo STESSO nome, mpv
+        # allocherebbe una texture NUOVA per quel bind. Qui ogni target ha gia'
+        # la propria texture dedicata (creata sopra); il binding usa sempre e
+        # solo le texture prodotte dai blocchi PRECEDENTI (copia di snapshot),
+        # mai l'FBO correntemente attivo come sampler -> niente lettura/scrittura
+        # sulla stessa texture (comportamento undefined che satura l'output).
+        named_textures = {"MAIN": in_tex, "HOOKED": in_tex}
+        last_tex = in_tex
+        last_fbo = None
+        last_w, last_h = w, h
+
+        for idx, sub in enumerate(passes):
+            is_last = (idx == len(passes) - 1)
+            tname = "_final" if is_last else (sub["save"] or f"_pass_{idx}")
+            target_tex = p["targets"][tname]
+            target_fbo = p["fbos"][tname]
+
+            prog = sub["prog"]
+            for u_idx, bname in enumerate(sub["binds"]):
+                if bname == "MAIN": tex = in_tex
+                elif bname == "HOOKED": tex = named_textures.get("HOOKED", in_tex)
+                elif bname in named_textures: tex = named_textures[bname]
+                else: tex = in_tex
+
+                # Se questo blocco SALVA nel buffer che sta anche leggendo,
+                # usa una copia istantanea della sorgente (snapshot) invece
+                # della texture-target condivisa.
+                if sub["save"] and bname == sub["save"]:
+                    snap_name = f"_snap_{idx}_{bname}"
+                    snap = p["targets"].get(snap_name)
+                    if snap is None or snap.size != (tex.width, tex.height):
+                        if snap is not None: self._rel(snap)
+                        st = self.ctx.texture((tex.width, tex.height), 4, dtype=tex.dtype)
+                        st.repeat_x = st.repeat_y = False
+                        st.filter = tex.filter
+                        p["targets"][snap_name] = st
+                        snap = st
+                    try:
+                        snap.copy_from(tex)
+                        tex = snap
+                    except Exception:
+                        pass  # fallback: usa comunque la sorgente
+
+                target_fbo.use()  # re-bind dopo ogni copy_from/tex.use
+                tex.use(location=u_idx)
+                try: prog[f"{bname}_raw"].value = u_idx
+                except KeyError: pass
+                try: prog[f"{bname}_size"].value = (float(tex.width), float(tex.height))
+                except KeyError: pass
+                try: prog[f"{bname}_pt"].value = (1.0 / tex.width, 1.0 / tex.height)
+                except KeyError: pass
+
+            target_fbo.use()
+            sub["vao"].render(moderngl.TRIANGLE_STRIP)
+
+            if sub["save"]:
+                named_textures[sub["save"]] = target_tex
+            named_textures["HOOKED"] = target_tex
+            last_tex = target_tex
+            last_fbo = target_fbo
+            last_w, last_h = sub["size"]
+
+        return last_tex, last_fbo, last_w, last_h
+
+    def run(self, frame, t, frame_no):
+        if not self.passes: return frame
+        h, w = frame.shape[:2]
+
+        if self.in_tex is None or self.in_tex.size != (w, h):
+            self._rel(self.in_tex)
+            self.in_tex = self.ctx.texture((w, h), 3)
+            self.in_tex.repeat_x = self.in_tex.repeat_y = False
+            self.in_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+
+        self.in_tex.write(np.ascontiguousarray(frame[::-1]))
+
+        cur_tex = self.in_tex
+        cur_fbo = None
+        cur_w, cur_h = w, h
+
+        for p in self.passes:
+            if p["type"] == "mpv":
+                cur_tex, cur_fbo, cur_w, cur_h = self._run_mpv(p, cur_tex, cur_w, cur_h)
+            else:
+                cur_tex, cur_fbo, cur_w, cur_h = self._run_standard(p, cur_tex, cur_w, cur_h, t, frame_no)
+
+        if cur_fbo is None:
+            return frame
+
+        raw = cur_fbo.read(components=3, alignment=1)
+        return np.ascontiguousarray(np.frombuffer(raw, dtype=np.uint8).reshape(cur_h, cur_w, 3)[::-1])
+
+    def release(self):
+        self.set_shaders([])
+        self._rel(self.in_tex)
+        self.in_tex = None
+        self._rel(self.vbo)
+        self._rel(self.ctx)
+
+
 class VideoProcessorThread(QThread):
     frame_ready = pyqtSignal(object, float, float, int, int)
     position_changed = pyqtSignal(int, int, float, float)
@@ -1190,6 +2499,28 @@ class VideoProcessorThread(QThread):
         self._shown_pos = 0
         self.display_size = None
 
+    @staticmethod
+    def _create_session_with_fallback(model_path, providers):
+        """Crea una InferenceSession ONNX con fallback automatico.
+
+        Su alcune configurazioni NVIDIA il provider CUDA fallisce
+        initialization ('cudnnCreate -> CUDNN_STATUS_INTERNAL_ERROR', spesso per
+        mismatch tra versione cuDNN di onnxruntime-gpu e driver, o perche' la
+        GPU e' gia' saturata da altri contesti). In tal caso si riprova solo
+        con CPUExecutionProvider invece di propagare l'eccezione.
+        NEKO_CPU_ONLY=1 forza subito la CPU (utile per debug).
+        """
+        if os.environ.get("NEKO_CPU_ONLY"):
+            return ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        try:
+            return ort.InferenceSession(model_path, providers=providers)
+        except Exception as e_cuda:
+            if providers == ["CPUExecutionProvider"]:
+                raise
+            print(f"[Neko Player] Provider GPU non disponibile ({type(e_cuda).__name__}: "
+                  f"{str(e_cuda)[:180]}...) -- fallback su CPUExecutionProvider")
+            return ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+
     def _load_model_internal(self, model_path):
         """Carica un modello e restituisce un dizionario con le sue proprietà."""
         ext = os.path.splitext(model_path)[1].lower()
@@ -1212,7 +2543,7 @@ class VideoProcessorThread(QThread):
                 }))
             if 'CUDAExecutionProvider' in available: providers.append('CUDAExecutionProvider')
             providers.append('CPUExecutionProvider')
-            session = ort.InferenceSession(model_path, providers=providers)
+            session = self._create_session_with_fallback(model_path, providers)
             input_meta = session.get_inputs()[0]
             output_meta = session.get_outputs()[0]
             in_fp16 = "float16" in input_meta.type
@@ -1290,7 +2621,7 @@ class VideoProcessorThread(QThread):
             available = ort.get_available_providers()
             providers = ['CUDAExecutionProvider'] if 'CUDAExecutionProvider' in available else []
             providers.append('CPUExecutionProvider')
-            session = ort.InferenceSession(RIFE_MODEL_PATH, providers=providers)
+            session = self._create_session_with_fallback(RIFE_MODEL_PATH, providers)
             inputs = session.get_inputs()
             if len(inputs) < 2: raise RuntimeError("il modello RIFE deve avere almeno 2 ingressi (img0, img1)")
             use_gpu = TORCH_AVAILABLE and TORCH_CUDA and session.get_providers()[0] == 'CUDAExecutionProvider'
@@ -1963,6 +3294,7 @@ class NekoPlayer(QMainWindow):
         self.setCentralWidget(self.container)
         self._video_aspect = None
         self._video_fill_mode = "height"  # "height": adatta il video all'altezza; "width": alla larghezza
+        self.current_shader = None  # Shader GLSL attivo (spento di default)
         self._last_display_frame = None   # ultima cornice mostrata, per ridisegnarla al volo
         # Modalità "minimal": dimensioni della finestra separate, salvate in config come window_minimal_*
         self._minimal_on = False              # stato del toggle (spunta nel menu col tasto destro)
@@ -2040,7 +3372,9 @@ class NekoPlayer(QMainWindow):
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
         self.video_display = VideoDisplayLabel(self.container)
-        self.video_display.setAlignment(Qt.AlignCenter)
+        if hasattr(self.video_display, "setAlignment"):
+            # Solo il fallback QLabel ha setAlignment; QOpenGLWidget non lo possiede.
+            self.video_display.setAlignment(Qt.AlignCenter)
         self.video_display.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         # Nessun minimo fisso sul video: la finestra deve potersi rimpicciolire liberamente
         # (anche sotto i 320x200). In modalità minimal il limite minimo della finestra viene
@@ -2829,7 +4163,9 @@ class NekoPlayer(QMainWindow):
             except RuntimeError: pass
         can_fit = not (self.isFullScreen() or self.isMaximized() or self.isMinimized())
         has_video = self._has_video()
-        self._bubble = BubbleMenu([
+        active_shader = getattr(self, "current_shader", None)
+
+        menu_items = [
             ("Adatta altezza", self.fit_height_to_screen, can_fit),
             ("Adatta larghezza", self.fit_width_to_screen, can_fit),
             ("Adatta tutto", self.fit_all_to_screen, can_fit),
@@ -2837,8 +4173,64 @@ class NekoPlayer(QMainWindow):
             ("Adatta video H", lambda: self.set_video_fill_mode("height"), has_video),
             # Toggle: dimensioni separate "minimal" (salvate in config come window_minimal_*)
             ("Minimal", self.toggle_minimal_mode, can_fit, bool(self._minimal_on)),
-        ])
+
+            # --- Sezione Shader GLSL ---
+            ("Shader: Disattivato", self.disable_glsl_shader, True, active_shader is None),
+        ]
+
+        # Elenca tutti i file .glsl presenti nella cartella shaders/
+        shader_files = sorted(glob.glob(os.path.join(SHADERS_DIR, "*.glsl")))
+        for s_path in shader_files:
+            s_name = os.path.basename(s_path)
+            is_checked = (active_shader == s_name)
+            menu_items.append((
+                f"Shader: {s_name}",
+                lambda name=s_name: self.toggle_glsl_shader(name),
+                True,
+                is_checked
+            ))
+
+        menu_items.append(("Carica file shader...", self.browse_glsl_shader, True))
+
+        self._bubble = BubbleMenu(menu_items)
         self._bubble.popup_at(gpos)
+
+    def toggle_glsl_shader(self, shader_filename):
+        """Attiva lo shader selezionato, oppure lo disattiva se era già selezionato."""
+        if getattr(self, "current_shader", None) == shader_filename:
+            self.disable_glsl_shader()
+        else:
+            path = os.path.join(SHADERS_DIR, shader_filename)
+            if self.video_display.load_shader(path):
+                self.current_shader = shader_filename
+                self.status.showMessage(f"✨ Shader attivato: {shader_filename}", 2500)
+                self.save_settings()
+
+    def disable_glsl_shader(self):
+        """Disattiva qualsiasi shader GLSL."""
+        self.current_shader = None
+        self.video_display.disable_shader()
+        self.status.showMessage("Shader GLSL disattivato", 2000)
+        self.save_settings()
+
+    def browse_glsl_shader(self):
+        """Permette di selezionare un file .glsl da qualsiasi cartella."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Seleziona Shader GLSL", SHADERS_DIR, "File GLSL (*.glsl *.frag);;Tutti i file (*)"
+        )
+        if path:
+            filename = os.path.basename(path)
+            # Se è fuori da shaders/, copialo dentro per comodità
+            dest = os.path.join(SHADERS_DIR, filename)
+            if not os.path.exists(dest):
+                try:
+                    shutil.copyfile(path, dest)
+                except Exception:
+                    dest = path
+            if self.video_display.load_shader(dest):
+                self.current_shader = filename
+                self.status.showMessage(f"✨ Shader attivato: {filename}", 2500)
+                self.save_settings()
 
     def _apply_minimal_size_limits(self, on: bool):
         """Abbassa/ripristina il limite minimo della finestra in base allo stato di minimal.
@@ -2978,6 +4370,13 @@ class NekoPlayer(QMainWindow):
             self.whiskers_right.raise_()
 
     def show_default_background(self):
+        if hasattr(self.video_display, "clear_frame"):
+            # VideoGLWidget: elimina la texture e mostra lo sfondo via QPainter
+            self.video_display.clear_frame()
+        if hasattr(self.video_display, "set_background"):
+            # VideoGLWidget / fallback: lo sfondo viene gestito dal widget stesso
+            self.video_display.set_background(self.bg_pixmap, self.show_bg_texture)
+            return
         if self.show_bg_texture and self.bg_pixmap and not self.bg_pixmap.isNull():
             scaled = self.bg_pixmap.scaled(self.video_display.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.video_display.setPixmap(scaled)
@@ -3083,6 +4482,7 @@ class NekoPlayer(QMainWindow):
             # timestamp di ripresa per ogni video visto (mappa percorso -> millisecondi)
             "resume_positions": self.resume_positions,
             "theme_color": self.theme_color,
+            "current_shader": getattr(self, "current_shader", "") or "",
             "window_shape": "ellipse",
             "window_width": self._normal_window_size()[0],
             "window_height": self._normal_window_size()[1],
@@ -3140,6 +4540,14 @@ class NekoPlayer(QMainWindow):
             self.container.set_show_texture(saved_texture)
             saved_fill = config_data.get("video_fill_mode", "height")
             if saved_fill in ("width", "height"): self._video_fill_mode = saved_fill
+            # Shader GLSL salvato: riattivalo solo se il file esiste ancora
+            saved_shader = config_data.get("current_shader", "")
+            if saved_shader and os.path.isfile(os.path.join(SHADERS_DIR, saved_shader)):
+                self.current_shader = saved_shader
+                if hasattr(self, "video_display"):
+                    self.video_display.load_shader(os.path.join(SHADERS_DIR, saved_shader))
+            else:
+                self.current_shader = None
             # Stato e dimensioni separate della modalità "minimal"
             # (le dimensioni minimal sostituiscono window_width/height: verranno salvate
             #  al prossimo write, così le due coppie restano sempre coerenti con lo stato)
@@ -3523,6 +4931,9 @@ class NekoPlayer(QMainWindow):
         """Cambia il riempimento della finestra per il video: "width" o "height"."""
         if mode not in ("width", "height"): return
         self._video_fill_mode = mode
+        # Sincronizza il fill mode del widget GL (scaling via shader)
+        if hasattr(self.video_display, "set_fill_mode"):
+            self.video_display.set_fill_mode(mode)
         self.save_settings()
         # Ridisegna subito l'ultima cornice con il nuovo riempimento
         frame = self._last_display_frame
@@ -3537,24 +4948,30 @@ class NekoPlayer(QMainWindow):
     def update_video_frame(self, frame, fps, gpu_ms, out_w, out_h):
         h, w = frame.shape[:2]
         self._last_display_frame = np.ascontiguousarray(frame)
-        q_img = QImage(frame.data, w, h, frame.strides[0], QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(q_img)
         target = self.video_display.size()
-        tw, th = target.width(), target.height()
-        if getattr(self, "_video_fill_mode", "height") == "width":
-            # Adatta alla larghezza dell'area centrale; se è più alto, taglia sopra/sotto (centrato)
-            if tw > 0 and abs(pixmap.width() - tw) > 1:
-                pixmap = pixmap.scaledToWidth(tw, Qt.FastTransformation)
-            if th > 0 and pixmap.height() > th:
-                pixmap = pixmap.copy(0, (pixmap.height() - th) // 2, pixmap.width(), th)
-        else:
-            # Adatta all'altezza dell'area centrale; se è più largo, taglia i lati (centrato)
-            if th > 0 and abs(pixmap.height() - th) > 1:
-                pixmap = pixmap.scaledToHeight(th, Qt.FastTransformation)
-            if tw > 0 and pixmap.width() > tw:
-                pixmap = pixmap.copy((pixmap.width() - tw) // 2, 0, tw, pixmap.height())
-        self.video_display.setPixmap(pixmap)
         self.worker.display_size = (target.width(), target.height())
+        if hasattr(self.video_display, "set_frame"):
+            # Percorso OpenGL: la texture viene caricata dal widget GL e lo
+            # scaling è gestito dallo shader (uniform uScale + fill_mode)
+            self.video_display.set_frame(self._last_display_frame)
+        else:
+            # Fallback QLabel: scaling CPU con eventuale crop centrato
+            q_img = QImage(frame.data, w, h, frame.strides[0], QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(q_img)
+            tw, th = target.width(), target.height()
+            if getattr(self, "_video_fill_mode", "height") == "width":
+                # Adatta alla larghezza dell'area centrale; se è più alto, taglia sopra/sotto (centrato)
+                if tw > 0 and abs(pixmap.width() - tw) > 1:
+                    pixmap = pixmap.scaledToWidth(tw, Qt.FastTransformation)
+                if th > 0 and pixmap.height() > th:
+                    pixmap = pixmap.copy(0, (pixmap.height() - th) // 2, pixmap.width(), th)
+            else:
+                # Adatta all'altezza dell'area centrale; se è più largo, taglia i lati (centrato)
+                if th > 0 and abs(pixmap.height() - th) > 1:
+                    pixmap = pixmap.scaledToHeight(th, Qt.FastTransformation)
+                if tw > 0 and pixmap.width() > tw:
+                    pixmap = pixmap.copy((pixmap.width() - tw) // 2, 0, tw, pixmap.height())
+            self.video_display.setPixmap(pixmap)
         now = time.monotonic()
         if now - self._last_hud_update < 0.25: return
         self._last_hud_update = now
@@ -3566,6 +4983,8 @@ class NekoPlayer(QMainWindow):
                 models.append(f"⚡ {os.path.basename(self.worker.upscaler_model_path)}")
             if self.worker.rife_enabled and self.worker.rife:
                 models.append("🎞️ RIFE 2x")
+            if getattr(self, "current_shader", None):
+                models.append(f"✨ GLSL: {self.current_shader}")
             if not models:
                 model_text = "Nativo"
             else:
@@ -3615,7 +5034,102 @@ class NekoPlayer(QMainWindow):
         event.accept()
 
 if __name__ == '__main__':
+    # --- Diagnostica e robustezza del contesto OpenGL (QOpenGLWidget) ---
+    # "Failed to make context current" su Linux/NVIDIA accade quando il formato
+    # di default della finestra non e' compatibile con il contesto creato da Qt
+    # (es. profile mismatch o integrazione EGL del WM), oppure quando un secondo
+    # contesto EGL (quello standalone di moderngl per gli shader) entra in
+    # conflitto con lo share space GLX del contesto NVIDIA primario usato anche
+    # da ONNX Runtime CUDA. Qui si impone un formato core 3.3 esplicito e si
+    # forza il backend desktop OpenGL prima che venga creata qualsiasi QWindow.
+    try:
+        from PyQt5.QtGui import QSurfaceFormat
+        _fmt = QSurfaceFormat()
+        if os.environ.get("NEKO_GL_ES"):
+            # OpenGLES 3.1: utile se il contesto desktop core 3.3 non viene creato
+            _fmt.setVersion(3, 1)
+            _fmt.setProfile(QSurfaceFormat.NoProfile)
+        else:
+            _fmt.setVersion(3, 3)
+            _fmt.setProfile(QSurfaceFormat.CoreProfile)
+        _fmt.setDepthBufferSize(0)
+        _fmt.setStencilBufferSize(0)
+        _fmt.setSwapBehavior(QSurfaceFormat.DoubleBuffer)
+        QSurfaceFormat.setDefaultFormat(_fmt)
+    except Exception as _e:
+        print(f"[GL] impostazione QSurfaceFormat fallita: {_e}")
+    if os.environ.get("NEKO_GL_ES"):
+        QApplication.setAttribute(Qt.AA_UseOpenGLES, True)
+    elif os.environ.get("NEKO_GL_SOFTWARE"):
+        QApplication.setAttribute(Qt.AA_UseSoftwareOpenGL, True)
+    else:
+        QApplication.setAttribute(Qt.AA_UseDesktopOpenGL, True)
+
+    # --- Rilevamento EARLY del conflitto multi-contesto NVIDIA+X11 ---
+    # Su questa piattaforma creare un secondo contesto EGL (moderngl standalone)
+    # mentre esiste gia' un contesto GLX NVIDIA puo' mandare in loop
+    # "make context current". Se rileviamo una GPU NVIDIA e nessun override e'
+    # stato impostato dall'utente, passiamo in modalita' sicura PRIMA di creare
+    # qualunque finestra: niente catena EGL separata e niente provider CUDA.
+    _nvidia_detected = False
+    try:
+        import subprocess
+        _out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                              capture_output=True, text=True, timeout=4).stdout
+        _nvidia_detected = bool(_out.strip())
+    except Exception:
+        pass
+    if not _nvidia_detected:
+        try:
+            with open("/proc/driver/nvidia/version", "r") as _f:
+                _nvidia_detected = "NVIDIA" in _f.read().upper()
+        except Exception:
+            pass
+
+    _egl_env = os.environ.get("NEKO_NO_EGL")
+    if _egl_env is None and _nvidia_detected:
+        os.environ["NEKO_NO_EGL"] = "auto"
+        print("[GL] GPU NVIDIA rilevata: catena shader in condivisione col contesto Qt "
+              "(evitato doppio contesto EGL; NEKO_NO_EGL=0 per forzare EGL standalone)")
+    elif _egl_env == "0":
+        os.environ.pop("NEKO_NO_EGL", None)
+
+    _cpu_env = os.environ.get("NEKO_CPU_ONLY")
+    if _cpu_env is None and _nvidia_detected:
+        # Il fallback CPU di ORT scatta comunque da solo se cudnnCreate fallisce;
+        # qui avvisiamo soltanto, senza togliere l'accelerazione GPU di default.
+        print("[ORT] hint: se compaiono errori cuDNN (CUDNN_STATUS_INTERNAL_ERROR), "
+              "avviare con NEKO_CPU_ONLY=1 per forzare i modelli ONNX su CPU")
+
+    if os.environ.get("NEKO_NO_EGL"):
+        print("[GL] catena shader: condivisione contesto Qt (NEKO_NO_EGL)")
+    if os.environ.get("NEKO_CPU_ONLY"):
+        print("[ORT] NEKO_CPU_ONLY=1: modelli ONNX forzati su CPUExecutionProvider")
+
     app = QApplication(sys.argv)
+
+    def _gl_diag():
+        try:
+            w = QWidget(); w.resize(64, 64); w.show()
+            app.processEvents()
+            ctx = w.windowHandle()._qt_createPlatformWindow if False else None
+        except Exception:
+            pass
+        try:
+            probe = QOpenGLWidget()
+            probe.resize(32, 32)
+            probe.show()
+            app.processEvents()
+            fmt = probe.format()
+            print(f"[GL] probe widget: formato richiesto {fmt.majorVersion()}.{fmt.minorVersion()} "
+                  f"profile={fmt.profile()}; se compaiono errori 'make context current' sopra, "
+                  f"riprovare con NEKO_GL_ES=1 oppure NEKO_GL_SOFTWARE=1")
+            probe.close()
+        except Exception as e:
+            print(f"[GL] probe widget fallito: {e}")
+    if os.environ.get("NEKO_GL_DEBUG"):
+        QTimer.singleShot(300, _gl_diag)
+
     app_font = QFont(resolve_ui_font_family(), 10)
     app_font.setBold(False)
     app.setFont(app_font)
