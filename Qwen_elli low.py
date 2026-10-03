@@ -14,7 +14,7 @@ import threading
 import time
 import numpy as np
 import cv2
-from shaders import CAS_FRAGMENT_SHADER
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
