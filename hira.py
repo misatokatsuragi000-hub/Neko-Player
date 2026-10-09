@@ -84,7 +84,7 @@ _aggiungi_path_librerie_cuda()
 
 import numpy as np
 
-from PyQt5.QtCore import Qt, QThread, QTimer, QUrl, QPointF, QRectF, QSizeF, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, QUrl, QPointF, QRectF, QSizeF, pyqtSignal, QSettings
 from PyQt5.QtGui import (
     QBrush, QColor, QFont, QKeySequence, QPainter, QPalette, QPen, QPolygonF, QTextCursor,
     QTextDocument, QTextOption,
@@ -145,7 +145,7 @@ STILE = """
 QDialog, QFileDialog { background: %(bg)s; color: %(text)s; }
 QScrollArea { background: transparent; border: none; }
 QWidget { color: %(text)s; font-size: 13px;
-         font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", "Noto Sans CJK JP", "Hiragino Sans", sans-serif; }
+          font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", "Noto Sans CJK JP", "Hiragino Sans", sans-serif; }
 QFrame#card { background: %(card)s; border: 1px solid %(border)s; border-radius: 12px; }
 QLabel { background: transparent; }
 QLabel#titolo { font-size: 22px; font-weight: 700; }
@@ -1251,7 +1251,7 @@ class SliderPos(QSlider):
 
     def _vai(self, x):
         v = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(),
-                                           int(x), max(1, self.width()))
+                                            int(x), max(1, self.width()))
         self.setValue(v)
         self.seek.emit(v / 1000.0)
 
@@ -1435,6 +1435,9 @@ class Finestra(QWidget):
         self.setObjectName("finestra")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setWindowTitle("Trascrivi Audio/Video (faster-whisper)")
+        QApplication.setApplicationName("NekoPlayer")
+        QApplication.setApplicationVersion("1.0")
+        self.settings = QSettings("NekoPlayer", "NekoPlayer")
         scr = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1180, scr.width() - 40), min(920, scr.height() - 90))
         self.setAcceptDrops(True)
@@ -1807,6 +1810,57 @@ class Finestra(QWidget):
         self.sc_f = QShortcut(QKeySequence("F"), self)
         self.sc_f.setContext(Qt.WindowShortcut)
         self.sc_f.activated.connect(self._tasto_f)
+
+        self._carica_impostazioni()
+        self.cb_modello.currentTextChanged.connect(self._salva_impostazioni)
+        self.cb_lingua.currentIndexChanged.connect(self._salva_impostazioni)
+        self.cb_device.currentTextChanged.connect(self._salva_impostazioni)
+        self.sp_inizio.valueChanged.connect(self._salva_impostazioni)
+        self.sp_fine.valueChanged.connect(self._salva_impostazioni)
+        self.ck_timestamp.stateChanged.connect(self._salva_impostazioni)
+        self.ck_acapo.stateChanged.connect(self._salva_impostazioni)
+        self.ck_parole.stateChanged.connect(self._salva_impostazioni)
+        self.ck_prefisso.stateChanged.connect(self._salva_impostazioni)
+        self.ck_doppio.stateChanged.connect(self._salva_impostazioni)
+        self.ed_prompt.textChanged.connect(self._salva_impostazioni)
+        self.cb_vel.currentTextChanged.connect(self._salva_impostazioni)
+        self.sl_vol.valueChanged.connect(self._salva_impostazioni)
+        self.cb_sub.currentIndexChanged.connect(self._salva_impostazioni)
+
+    def _carica_impostazioni(self):
+        """Carica le impostazioni salvate dalla sessione precedente."""
+        self.cb_modello.setCurrentText(self.settings.value("modello", "large-v2"))
+        self.cb_lingua.setCurrentIndex(int(self.settings.value("lingua", 0)))
+        self.cb_device.setCurrentText(self.settings.value("device", "auto"))
+        self.sp_inizio.setValue(float(self.settings.value("inizio", 0.0)))
+        self.sp_fine.setValue(float(self.settings.value("fine", 0.0)))
+        self.ck_timestamp.setChecked(bool(self.settings.value("timestamp", False)))
+        self.ck_acapo.setChecked(bool(self.settings.value("acapo", False)))
+        self.ck_parole.setChecked(bool(self.settings.value("parole", True)))
+        self.ck_prefisso.setChecked(bool(self.settings.value("prefisso", False)))
+        self.ck_doppio.setChecked(bool(self.settings.value("doppio", True)))
+        self.ed_prompt.setText(self.settings.value("prompt", ""))
+        self.cb_vel.setCurrentText(self.settings.value("velocita", "1x"))
+        self.sl_vol.setValue(int(self.settings.value("volume", 80)))
+        self.cb_sub.setCurrentIndex(int(self.settings.value("sottotitoli", 0)))
+
+    def _salva_impostazioni(self):
+        """Salva le impostazioni correnti."""
+        self.settings.setValue("modello", self.cb_modello.currentText())
+        self.settings.setValue("lingua", self.cb_lingua.currentIndex())
+        self.settings.setValue("device", self.cb_device.currentText())
+        self.settings.setValue("inizio", self.sp_inizio.value())
+        self.settings.setValue("fine", self.sp_fine.value())
+        self.settings.setValue("timestamp", self.ck_timestamp.isChecked())
+        self.settings.setValue("acapo", self.ck_acapo.isChecked())
+        self.settings.setValue("parole", self.ck_parole.isChecked())
+        self.settings.setValue("prefisso", self.ck_prefisso.isChecked())
+        self.settings.setValue("doppio", self.ck_doppio.isChecked())
+        self.settings.setValue("prompt", self.ed_prompt.text())
+        self.settings.setValue("velocita", self.cb_vel.currentText())
+        self.settings.setValue("volume", self.sl_vol.value())
+        self.settings.setValue("sottotitoli", self.cb_sub.currentIndex())
+        self.settings.sync()
 
     # ------------------------------------------------------------------ file
     def dragEnterEvent(self, e):
