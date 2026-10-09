@@ -24,6 +24,7 @@ from html import escape
 import wave
 import subprocess
 import tempfile
+import shutil
 from bisect import bisect_right
 from math import ceil
 
@@ -84,7 +85,7 @@ _aggiungi_path_librerie_cuda()
 
 import numpy as np
 
-from PyQt5.QtCore import Qt, QThread, QTimer, QUrl, QPointF, QRectF, QSizeF, pyqtSignal, QSettings
+from PyQt5.QtCore import Qt, QThread, QTimer, QUrl, QPointF, QRectF, QSizeF, pyqtSignal
 from PyQt5.QtGui import (
     QBrush, QColor, QFont, QKeySequence, QPainter, QPalette, QPen, QPolygonF, QTextCursor,
     QTextDocument, QTextOption,
@@ -129,6 +130,9 @@ FILTRO_FILE = (
 
 PREFISSO_COSYVOICE = "You are a helpful assistant.<|endofprompt|>"
 
+# impostazioni salvate da una sessione all'altra (accanto allo script)
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hira_config.json")
+
 SR = 16000  # frequenza di campionamento usata per decodifica/riproduzione
 
 # colori
@@ -145,7 +149,7 @@ STILE = """
 QDialog, QFileDialog { background: %(bg)s; color: %(text)s; }
 QScrollArea { background: transparent; border: none; }
 QWidget { color: %(text)s; font-size: 13px;
-          font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", "Noto Sans CJK JP", "Hiragino Sans", sans-serif; }
+         font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", "Noto Sans CJK JP", "Hiragino Sans", sans-serif; }
 QFrame#card { background: %(card)s; border: 1px solid %(border)s; border-radius: 12px; }
 QLabel { background: transparent; }
 QLabel#titolo { font-size: 22px; font-weight: 700; }
@@ -397,6 +401,52 @@ def _u16_slice(s, a, b):
     return s.encode("utf-16-le")[2 * a:2 * b].decode("utf-16-le")
 
 
+def allinea_traduzione(t0, t1, trad):
+    """Riallinea i tempi delle righe tradotte a quelli dei token giapponesi.
+
+    Le righe nascono da un secondo passaggio di whisper con tempi propri (di solito
+    in anticipo rispetto alle parole giapponesi). Ogni token giapponese viene
+    assegnato alla riga con cui si sovrappone di piu' (o alla piu' vicina) e la riga
+    appare quando parte il suo primo token e scompare quando finisce l'ultimo.
+    Righe senza token vicini: tempi originali. Ripetibile senza effetti collaterali."""
+    if not trad or not trad.get("righe") or not t0:
+        return trad
+    ta, tb = list(trad["t0"]), list(trad["t1"])
+    n = len(ta)
+    if n == 0 or not (len(tb) == n == len(trad["righe"])):
+        return trad
+
+    assegn = [[] for _ in range(n)]
+    for j in range(len(t0)):
+        a, b = t0[j], t1[j]
+        m = (a + b) / 2.0
+        k = bisect_right(ta, m) - 1
+        cand = range(max(0, k - 2), min(n, k + 3))
+        best, best_ov = None, 0.0
+        for i in cand:
+            ov = min(b, tb[i]) - max(a, ta[i])
+            if ov > best_ov:
+                best, best_ov = i, ov
+        if best is None:
+            best = min(cand, key=lambda i: 0.0 if ta[i] <= m <= tb[i] else min(abs(m - ta[i]), abs(m - tb[i])))
+        assegn[best].append(j)
+
+    na, nb = list(ta), list(tb)
+    for i in range(n):
+        if assegn[i]:
+            na[i] = t0[assegn[i][0]]
+            nb[i] = t1[assegn[i][-1]]
+    prev = 0.0
+    for i in range(n):
+        na[i] = max(na[i], prev)
+        nb[i] = max(nb[i], na[i])
+        prev = na[i]
+
+    out = dict(trad)
+    out["t0"], out["t1"] = na, nb
+    return out
+
+
 def karaoke_espandi(d):
     """Da formato v2 a v1 (quello usato internamente). I dati v1 passano invariati."""
     if d.get("versione", 1) < 2:
@@ -439,6 +489,8 @@ def karaoke_espandi(d):
             t0=[e[1] for e in d["tr"]],
             t1=[e[2] for e in d["tr"]],
         )
+    if out.get("trad"):
+        out["trad"] = allinea_traduzione(t0, t1, out["trad"])
     out.update(
         orig="".join(orig), hira="".join(hira),
         span_o=span_o, span_h=span_h, t0=t0, t1=t1,
@@ -640,8 +692,36 @@ class Worker(QThread):
             f"Impossibile caricare faster-whisper {p['modello']}: {msg_err}{guida}"
         )
 
+    def _isola_voce(self, path):
+        """Separa la voce dalla musica con Demucs (modello htdemucs, stem 'vocals').
+        Restituisce (wav_voce, cartella_temporanea, messaggio_errore): wav_voce e' None se fallisce.
+        Richiede:  python -m pip install demucs"""
+        d = tempfile.mkdtemp(prefix="hira_demucs_")
+        try:
+            src = os.path.join(d, "audio.wav")
+            subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-i", path, "-vn", "-ar", "44100", "-ac", "2", src],
+                check=True, stdin=subprocess.DEVNULL, capture_output=True)
+
+            ultimo = ""
+            for dev in (["cpu"] if self.p["device"] == "cpu" else ["cuda", "cpu"]):
+                r = subprocess.run(
+                    [sys.executable, "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
+                     "-d", dev, "-o", d, src],
+                    stdin=subprocess.DEVNULL, capture_output=True)
+                voce = os.path.join(d, "htdemucs", "audio", "vocals.wav")
+                if r.returncode == 0 and os.path.isfile(voce):
+                    return voce, d, ""
+                ultimo = (r.stderr or b"").decode(errors="replace").strip()[-300:]
+            return None, d, ultimo or "errore sconosciuto"
+        except FileNotFoundError:
+            return None, d, "ffmpeg non trovato"
+        except subprocess.CalledProcessError as e:
+            return None, d, (e.stderr or b"").decode(errors="replace").strip()[-300:]
+
     def run(self):
         tmp = None
+        dir_demucs = None
         try:
             p = self.p
             path = p["file"]
@@ -658,6 +738,18 @@ class Worker(QThread):
                 subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, capture_output=True)
                 path = tmp
 
+            # Musica di sottofondo: Demucs isola la voce, poi si trascrive solo quella
+            voce_isolata = False
+            avviso_pre = ""
+            if p.get("demucs"):
+                self.stato.emit("Isolo la voce con Demucs (puo' richiedere alcuni minuti)...")
+                voce, dir_demucs, err = self._isola_voce(path)
+                if voce:
+                    path = voce
+                    voce_isolata = True
+                else:
+                    avviso_pre = " (Demucs non utilizzabile, uso l'audio originale: {})".format(err)
+
             model, device, compute_type = self._load_model()
 
             self.stato.emit("Trascrivo con faster-whisper{}...".format(
@@ -671,8 +763,13 @@ class Worker(QThread):
             doppio = bool(p.get("doppio")) and p["lingua"] not in (None, "ja")
             lingua_jp = "ja" if doppio else p["lingua"]
 
+            # Musica (anche con voce isolata): il filtro VAD e le soglie "no speech" / compressione
+            # scartano spesso i testi cantati, quindi si rilassano; con la voce isolata il VAD resta
+            # attivo ma piu' sensibile, con la musica ancora presente viene disattivato.
+            musica = bool(p.get("musica")) or bool(p.get("demucs"))
+
             def _opzioni(lang, con_prompt):
-                return dict(
+                o = dict(
                     language=lang,
                     task="transcribe",
                     beam_size=5,
@@ -683,6 +780,18 @@ class Worker(QThread):
                     temperature=0.0,
                     compression_ratio_threshold=2.0,
                 )
+                if musica:
+                    o.update(
+                        no_speech_threshold=None,
+                        compression_ratio_threshold=3.0,
+                        temperature=[0.0, 0.2, 0.4],
+                    )
+                    if voce_isolata:
+                        o["vad_parameters"] = dict(threshold=0.3, min_silence_duration_ms=700, speech_pad_ms=400)
+                    else:
+                        o["vad_filter"] = False
+                        o.pop("vad_parameters")
+                return o
 
             def _consume(lang, word_timestamps, con_prompt=True):
                 segments_iter, info = model.transcribe(
@@ -711,7 +820,7 @@ class Worker(QThread):
 
             self.stato.emit("Converto in hiragana e calcolo la sincronizzazione...")
 
-            avviso = ""
+            avviso = avviso_pre
             try:
                 get_kakasi()
                 kk_ok = True
@@ -852,7 +961,7 @@ class Worker(QThread):
                 t1=[t[1] for t in tempi],
                 avviso=avviso,
                 tok=dict(o=tok_o, h=tok_h, seg=tok_seg),
-                trad=trad,
+                trad=allinea_traduzione([t[0] for t in tempi], [t[1] for t in tempi], trad),
             ))
 
         except FileNotFoundError:
@@ -884,6 +993,8 @@ class Worker(QThread):
                     os.remove(tmp)
                 except OSError:
                     pass
+            if dir_demucs:
+                shutil.rmtree(dir_demucs, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1251,7 +1362,7 @@ class SliderPos(QSlider):
 
     def _vai(self, x):
         v = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(),
-                                            int(x), max(1, self.width()))
+                                           int(x), max(1, self.width()))
         self.setValue(v)
         self.seek.emit(v / 1000.0)
 
@@ -1435,9 +1546,6 @@ class Finestra(QWidget):
         self.setObjectName("finestra")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setWindowTitle("Trascrivi Audio/Video (faster-whisper)")
-        QApplication.setApplicationName("NekoPlayer")
-        QApplication.setApplicationVersion("1.0")
-        self.settings = QSettings("NekoPlayer", "NekoPlayer")
         scr = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1180, scr.width() - 40), min(920, scr.height() - 90))
         self.setAcceptDrops(True)
@@ -1584,6 +1692,21 @@ class Finestra(QWidget):
             "1° passaggio: whisper in giapponese (kanji, hiragana e tempi per parola)\n"
             "2° passaggio: whisper nella lingua scelta (es. italiano) per il testo tradotto")
         l1.addWidget(self.ck_doppio)
+
+        self.ck_musica = QCheckBox(
+            "Musica di sottofondo: non scartare i testi cantati (niente filtro VAD, soglie rilassate)")
+        self.ck_musica.setToolTip(
+            "Whisper tende a ignorare i testi quando c'e' musica: il filtro VAD li scambia per\n"
+            "non-parlato e le soglie 'no speech' / compressione scartano i segmenti.\n"
+            "Questa opzione le disattiva o le rilassa (puo' aggiungere qualche frase in piu' nei silenzi).")
+        l1.addWidget(self.ck_musica)
+
+        self.ck_demucs = QCheckBox(
+            "Isola prima la voce con Demucs (molto piu' efficace con la musica, ma lento)")
+        self.ck_demucs.setToolTip(
+            "Separa la voce dalla musica prima della trascrizione. Richiede:  python -m pip install demucs\n"
+            "Se Demucs non e' disponibile si usa l'audio originale. Implica le impostazioni 'musica'.")
+        l1.addWidget(self.ck_demucs)
         self.cb_lingua.currentIndexChanged.connect(self._lingua_cambiata)
         self._lingua_cambiata()
 
@@ -1811,56 +1934,83 @@ class Finestra(QWidget):
         self.sc_f.setContext(Qt.WindowShortcut)
         self.sc_f.activated.connect(self._tasto_f)
 
+        self.ultima_cartella = ""
         self._carica_impostazioni()
-        self.cb_modello.currentTextChanged.connect(self._salva_impostazioni)
-        self.cb_lingua.currentIndexChanged.connect(self._salva_impostazioni)
-        self.cb_device.currentTextChanged.connect(self._salva_impostazioni)
-        self.sp_inizio.valueChanged.connect(self._salva_impostazioni)
-        self.sp_fine.valueChanged.connect(self._salva_impostazioni)
-        self.ck_timestamp.stateChanged.connect(self._salva_impostazioni)
-        self.ck_acapo.stateChanged.connect(self._salva_impostazioni)
-        self.ck_parole.stateChanged.connect(self._salva_impostazioni)
-        self.ck_prefisso.stateChanged.connect(self._salva_impostazioni)
-        self.ck_doppio.stateChanged.connect(self._salva_impostazioni)
-        self.ed_prompt.textChanged.connect(self._salva_impostazioni)
-        self.cb_vel.currentTextChanged.connect(self._salva_impostazioni)
-        self.sl_vol.valueChanged.connect(self._salva_impostazioni)
-        self.cb_sub.currentIndexChanged.connect(self._salva_impostazioni)
 
-    def _carica_impostazioni(self):
-        """Carica le impostazioni salvate dalla sessione precedente."""
-        self.cb_modello.setCurrentText(self.settings.value("modello", "large-v2"))
-        self.cb_lingua.setCurrentIndex(int(self.settings.value("lingua", 0)))
-        self.cb_device.setCurrentText(self.settings.value("device", "auto"))
-        self.sp_inizio.setValue(float(self.settings.value("inizio", 0.0)))
-        self.sp_fine.setValue(float(self.settings.value("fine", 0.0)))
-        self.ck_timestamp.setChecked(bool(self.settings.value("timestamp", False)))
-        self.ck_acapo.setChecked(bool(self.settings.value("acapo", False)))
-        self.ck_parole.setChecked(bool(self.settings.value("parole", True)))
-        self.ck_prefisso.setChecked(bool(self.settings.value("prefisso", False)))
-        self.ck_doppio.setChecked(bool(self.settings.value("doppio", True)))
-        self.ed_prompt.setText(self.settings.value("prompt", ""))
-        self.cb_vel.setCurrentText(self.settings.value("velocita", "1x"))
-        self.sl_vol.setValue(int(self.settings.value("volume", 80)))
-        self.cb_sub.setCurrentIndex(int(self.settings.value("sottotitoli", 0)))
+    # ------------------------------------------------------------ impostazioni
+    def _impostazioni(self):
+        return dict(
+            modello=self.cb_modello.currentText(),
+            lingua=LINGUE[self.cb_lingua.currentIndex()][1] or "auto",
+            device=self.cb_device.currentText(),
+            timestamp=self.ck_timestamp.isChecked(),
+            a_capo=self.ck_acapo.isChecked(),
+            parole=self.ck_parole.isChecked(),
+            prefisso=self.ck_prefisso.isChecked(),
+            doppio=self.ck_doppio.isChecked(),
+            musica=self.ck_musica.isChecked(),
+            demucs=self.ck_demucs.isChecked(),
+            prompt_iniziale=self.ed_prompt.text(),
+            sottotitoli=self.cb_sub.currentIndex(),
+            velocita=self.cb_vel.currentText(),
+            volume=self.sl_vol.value(),
+            cartella=self.ultima_cartella,
+            finestra=[self.width(), self.height()],
+        )
 
     def _salva_impostazioni(self):
-        """Salva le impostazioni correnti."""
-        self.settings.setValue("modello", self.cb_modello.currentText())
-        self.settings.setValue("lingua", self.cb_lingua.currentIndex())
-        self.settings.setValue("device", self.cb_device.currentText())
-        self.settings.setValue("inizio", self.sp_inizio.value())
-        self.settings.setValue("fine", self.sp_fine.value())
-        self.settings.setValue("timestamp", self.ck_timestamp.isChecked())
-        self.settings.setValue("acapo", self.ck_acapo.isChecked())
-        self.settings.setValue("parole", self.ck_parole.isChecked())
-        self.settings.setValue("prefisso", self.ck_prefisso.isChecked())
-        self.settings.setValue("doppio", self.ck_doppio.isChecked())
-        self.settings.setValue("prompt", self.ed_prompt.text())
-        self.settings.setValue("velocita", self.cb_vel.currentText())
-        self.settings.setValue("volume", self.sl_vol.value())
-        self.settings.setValue("sottotitoli", self.cb_sub.currentIndex())
-        self.settings.sync()
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+                json.dump(self._impostazioni(), fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+    def _carica_impostazioni(self):
+        try:
+            with open(CONFIG_FILE, encoding="utf-8") as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            return
+        if not isinstance(d, dict):
+            return
+
+        def combo(cb, valore):
+            i = cb.findText(valore) if isinstance(valore, str) else -1
+            if i >= 0:
+                cb.setCurrentIndex(i)
+
+        def spunta(ck, chiave):
+            if isinstance(d.get(chiave), bool):
+                ck.setChecked(d[chiave])
+
+        combo(self.cb_modello, d.get("modello"))
+        combo(self.cb_device, d.get("device"))
+        cod = d.get("lingua")
+        for i, (_, c) in enumerate(LINGUE):
+            if (c or "auto") == cod:
+                self.cb_lingua.setCurrentIndex(i)
+                break
+        for ck, k in ((self.ck_timestamp, "timestamp"), (self.ck_acapo, "a_capo"),
+                      (self.ck_parole, "parole"), (self.ck_prefisso, "prefisso"),
+                      (self.ck_doppio, "doppio"), (self.ck_musica, "musica"),
+                      (self.ck_demucs, "demucs")):
+            spunta(ck, k)
+        if isinstance(d.get("prompt_iniziale"), str):
+            self.ed_prompt.setText(d["prompt_iniziale"])
+        sub = d.get("sottotitoli")
+        if isinstance(sub, int) and 0 <= sub < self.cb_sub.count():
+            self.cb_sub.setCurrentIndex(sub)
+        combo(self.cb_vel, d.get("velocita"))
+        vol = d.get("volume")
+        if isinstance(vol, int) and 0 <= vol <= 100:
+            self.sl_vol.setValue(vol)
+        if isinstance(d.get("cartella"), str) and os.path.isdir(d["cartella"]):
+            self.ultima_cartella = d["cartella"]
+        fin = d.get("finestra")
+        if (isinstance(fin, list) and len(fin) == 2 and all(isinstance(v, int) for v in fin)
+                and fin[0] >= 400 and fin[1] >= 300):
+            scr = QApplication.primaryScreen().availableGeometry()
+            self.resize(min(fin[0], scr.width()), min(fin[1], scr.height()))
 
     # ------------------------------------------------------------------ file
     def dragEnterEvent(self, e):
@@ -1878,7 +2028,7 @@ class Finestra(QWidget):
 
     def scegli_file(self):
         f, _ = QFileDialog.getOpenFileName(
-            self, "Scegli un file", "",
+            self, "Scegli un file", self.ultima_cartella,
             FILTRO_FILE,
             options=QFileDialog.DontUseNativeDialog
         )
@@ -1886,6 +2036,8 @@ class Finestra(QWidget):
             self.imposta_file(f)
 
     def imposta_file(self, path):
+        if os.path.isdir(os.path.dirname(path)):
+            self.ultima_cartella = os.path.dirname(path)
         self.ed_file.setText(path)
         self._file_modificato()
 
@@ -2220,8 +2372,12 @@ class Finestra(QWidget):
             parole=self.ck_parole.isChecked(),
             prefisso=self.ck_prefisso.isChecked(),
             doppio=self.ck_doppio.isEnabled() and self.ck_doppio.isChecked(),
+            musica=self.ck_musica.isChecked(),
+            demucs=self.ck_demucs.isChecked(),
             prompt_iniziale=self.ed_prompt.text().strip(),
         )
+
+        self._salva_impostazioni()
 
         self.b_avvia.setEnabled(False)
         self.barra.setRange(0, 0)
@@ -2519,6 +2675,7 @@ class Finestra(QWidget):
         self.lb_stato.setText("Modello scaricato dalla memoria.")
 
     def closeEvent(self, e):
+        self._salva_impostazioni()
         self._fullscreen(False)
         if self.cont_fs is not None:
             self.cont_fs.hide()
