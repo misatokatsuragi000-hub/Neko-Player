@@ -17,24 +17,85 @@ python -m pip install faster-whisper PyQt5 pykakasi numpy
 """
 
 import os
+import re
 import sys
+import json
+from html import escape
 import wave
 import subprocess
 import tempfile
 from bisect import bisect_right
 from math import ceil
 
+
+def _aggiungi_path_librerie_cuda():
+    """Aggiunge ai percorsi di ricerca le librerie CUDA installate via pip
+    (cublas, cudnn, ...) dentro il venv corrente.
+
+    Su Windows servono i DLL (cartelle *\\bin), su Linux/Mint servono i .so
+    (cartelle */lib): qui li aggiungo a LD_LIBRARY_PATH prima che
+    ctranslate2/faster-whisper provino a caricarli."""
+    try:
+        from importlib.metadata import distributions
+    except ImportError:
+        return
+    is_win = os.name == "nt"
+    est = (".dll",) if is_win else (".so", ".so.12")
+    siti = set()
+    for dist in distributions():
+        nome = (dist.metadata.get("Name") or "").lower()
+        if nome.startswith(("nvidia-", "torch", "triton")):
+            try:
+                loc = str(dist.locate_file(""))
+            except Exception:
+                continue
+            candidati = []
+            for subdir in ("bin", "lib"):
+                d = os.path.join(loc, subdir)
+                if os.path.isdir(d):
+                    candidati.append(d)
+            if not candidati and os.path.isdir(loc):
+                candidati.append(loc)
+            for d in candidati:
+                try:
+                    if any(f.endswith(est) for f in os.listdir(d)):
+                        siti.add(d)
+                except OSError:
+                    pass
+    if not siti:
+        return
+    if is_win:
+        for sito in siti:
+            try:
+                os.add_dll_directory(sito)
+            except (AttributeError, OSError):
+                # Python < 3.8 oppure cartella inesistente: usa il PATH
+                os.environ["PATH"] = sito + os.pathsep + os.environ.get("PATH", "")
+    else:
+        ld = os.environ.get("LD_LIBRARY_PATH", "")
+        nuove = [s for s in siti if s not in ld.split(os.pathsep)]
+        if nuove:
+            os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(nuove) + (
+                os.pathsep + ld if ld else ""
+            )
+
+
+_aggiungi_path_librerie_cuda()
+
 import numpy as np
 
-from PyQt5.QtCore import Qt, QThread, QTimer, QUrl, QPointF, QRectF, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, QUrl, QPointF, QRectF, QSizeF, pyqtSignal
 from PyQt5.QtGui import (
-    QBrush, QColor, QFont, QPainter, QPen, QPolygonF, QTextCursor,
+    QBrush, QColor, QFont, QKeySequence, QPainter, QPalette, QPen, QPolygonF, QTextCursor,
+    QTextDocument, QTextOption,
 )
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
+from PyQt5.QtMultimediaWidgets import QGraphicsVideoItem
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QLineEdit, QPushButton, QComboBox, QCheckBox, QDoubleSpinBox, QTextEdit,
     QFileDialog, QProgressBar, QMessageBox, QFrame, QSlider, QSplitter,
+    QScrollArea, QShortcut, QStyle, QGraphicsView, QGraphicsScene,
 )
 
 
@@ -59,6 +120,13 @@ LINGUE = [
     ("Rilevamento automatico", None),
 ]
 
+EST_AUDIO = "*.wav *.mp3 *.m4a *.flac *.ogg *.opus *.aac *.wma *.aiff *.aif *.amr *.mka"
+EST_VIDEO = ("*.mp4 *.mkv *.webm *.mov *.avi *.flv *.wmv *.m4v *.mpg *.mpeg "
+             "*.ts *.m2ts *.3gp *.ogv *.mts")
+FILTRO_FILE = (
+    "Audio e video ({a} {v});;Audio ({a});;Video ({v});;Tutti i file (*)"
+).format(a=EST_AUDIO, v=EST_VIDEO)
+
 PREFISSO_COSYVOICE = "You are a helpful assistant.<|endofprompt|>"
 
 SR = 16000  # frequenza di campionamento usata per decodifica/riproduzione
@@ -73,7 +141,8 @@ C_ACCENT = "#7c6cff"      # parte non ancora riprodotta
 C_SPOKEN = "#ffb454"      # parte gia' pronunciata
 
 STILE = """
-#finestra { background: %(bg)s; }
+#finestra, #interno { background: %(bg)s; }
+QScrollArea { background: transparent; border: none; }
 QWidget { color: %(text)s; font-size: 13px;
          font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", "Noto Sans CJK JP", "Hiragino Sans", sans-serif; }
 QFrame#card { background: %(card)s; border: 1px solid %(border)s; border-radius: 12px; }
@@ -170,6 +239,24 @@ def libera_modello():
         pass
 
 
+def ha_flusso_video(path):
+    """True se il file contiene una vera traccia video (la copertina
+    incorporata in un mp3/m4a non conta). Usa ffprobe; se manca -> False."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v",
+             "-show_entries", "stream=index:stream_disposition=attached_pic",
+             "-of", "json", path],
+            capture_output=True, stdin=subprocess.DEVNULL, timeout=20)
+        dati = json.loads(r.stdout.decode(errors="replace") or "{}")
+        for st in dati.get("streams", []):
+            if not st.get("disposition", {}).get("attached_pic", 0):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def fmt_tempo(s):
     m, sec = divmod(float(s), 60)
     return "{:02d}:{:04.1f}".format(int(m), sec)
@@ -204,7 +291,7 @@ def distribuisci(testo, t0, t1):
 # Thread: decodifica audio + calcolo livelli in dB
 # ---------------------------------------------------------------------------
 class Decoder(QThread):
-    pronto = pyqtSignal(str, str, object, float, float)  # file, wav, db, hop, durata
+    pronto = pyqtSignal(str, str, object, float, float, bool)  # file, wav, db, hop, durata, ha_video
     errore = pyqtSignal(str, str)
 
     def __init__(self, path):
@@ -228,12 +315,13 @@ class Decoder(QThread):
             m = len(x) // win
 
             if m == 0:
-                raise ValueError("Audio vuoto o non leggibile.")
+                raise ValueError("Audio vuoto o non leggibile (il file ha una traccia audio?).")
 
             rms = np.sqrt(np.mean(x[:m * win].reshape(m, win) ** 2, axis=1))
             db = np.clip(20.0 * np.log10(rms + 1e-9), -60.0, 0.0)
 
-            self.pronto.emit(self.path, wav, db, 0.01, len(x) / float(SR))
+            self.pronto.emit(self.path, wav, db, 0.01, len(x) / float(SR),
+                             ha_flusso_video(self.path))
 
         except FileNotFoundError:
             self.errore.emit(self.path, "ffmpeg non trovato: installalo e aggiungilo al PATH.")
@@ -321,12 +409,44 @@ class Worker(QThread):
                 return model, device, compute_type
 
             except Exception as e:
+                msg = str(e)
+                if "libcublas" in msg or "cannot be loaded" in msg:
+                    # Mancano le librerie CUDA: potrebbe essere un problema di
+                    # percorso di ricerca (DLL su Windows, .so via
+                    # LD_LIBRARY_PATH su Linux) dei pacchetti pip nel venv.
+                    _aggiungi_path_librerie_cuda()
                 last_error = e
                 self.stato.emit(f"Tentativo {device}/{compute_type} fallito: {e}")
                 continue
 
+        msg_err = str(last_error)
+        guida = ""
+        if "libcublas" in msg_err or "cudnn" in msg_err.lower() or "cannot be loaded" in msg_err:
+            if os.name == "nt":
+                guida = (
+                    "\n\nLibrerie CUDA mancanti o non trovate. Soluzioni:\n"
+                    "1) Installa le librerie nel venv con pip:\n"
+                    "   python -m pip install nvidia-cublas-cu12 nvidia-cudnn-cu12\n"
+                    "2) Oppure installa il CUDA Toolkit da developer.nvidia.com e "
+                    "assicurati che la cartella ...\\CUDA\\v12.x\\bin sia nel PATH.\n"
+                    "3) Riavvia il programma dopo aver modificato il PATH.\n"
+                    "4) In alternativa scegli 'cpu' come dispositivo."
+                )
+            else:
+                guida = (
+                    "\n\nLibrerie CUDA 12 mancanti o non trovate (Linux). Soluzioni:\n"
+                    "1) Installa le librerie nel venv con pip:\n"
+                    "   python -m pip install nvidia-cublas-cu12 nvidia-cudnn-cu12\n"
+                    "   (il programma aggiunge automaticamente i loro percorsi a\n"
+                    "   LD_LIBRARY_PATH all'avvio)\n"
+                    "2) Oppure installa il CUDA Toolkit 12 di sistema, ad es. su\n"
+                    "   Linux Mint/Ubuntu:  apt install libcublas-12-6 libcudnn9-cuda-12\n"
+                    "   poi verifica con:  ldconfig -p | grep cublas\n"
+                    "3) Controlla che la GPU sia visibile:  nvidia-smi\n"
+                    "4) In alternativa scegli 'cpu' come dispositivo."
+                )
         raise RuntimeError(
-            f"Impossibile caricare faster-whisper {p['modello']}: {last_error}"
+            f"Impossibile caricare faster-whisper {p['modello']}: {msg_err}{guida}"
         )
 
     def run(self):
@@ -465,12 +585,12 @@ class Worker(QThread):
                 segmenti[n] = (s0, s1, nuovi)
 
             # costruzione dei due testi + posizioni (UTF-16) di ogni token
-            sep = "
-            if (p["timestamp"] or p["a_capo"]) else ("" if lingua in ("ja", "zh") else " ")
+            sep = "\n" if (p["timestamp"] or p["a_capo"]) else ("" if lingua in ("ja", "zh") else " ")
 
             po, ph = [], []
             pos_o = pos_h = 0
             span_o, span_h, tempi = [], [], []
+            tok_o, tok_h, tok_seg = [], [], []
 
             if p["prefisso"] and not p["timestamp"]:
                 po.append(PREFISSO_COSYVOICE)
@@ -502,6 +622,9 @@ class Worker(QThread):
                     pos_h += l16(h)
 
                     tempi.append((a, b))
+                    tok_o.append(o)
+                    tok_h.append(h)
+                    tok_seg.append(n)
 
             self.finito.emit(dict(
                 orig="".join(po),
@@ -511,6 +634,7 @@ class Worker(QThread):
                 t0=[t[0] for t in tempi],
                 t1=[t[1] for t in tempi],
                 avviso=avviso,
+                tok=dict(o=tok_o, h=tok_h, seg=tok_seg),
             ))
 
         except FileNotFoundError:
@@ -524,15 +648,13 @@ class Worker(QThread):
 
             if "out of memory" in msg.lower():
                 msg += (
-                    "
-VRAM insufficiente: chiudi altri programmi che usano la GPU, "
+                    "\nVRAM insufficiente: chiudi altri programmi che usano la GPU, "
                     "scegli un modello più piccolo oppure usa CPU."
                 )
 
             if "cuda" in msg.lower() or "cudnn" in msg.lower():
                 msg += (
-                    "
-Errore CUDA/cuDNN con faster-whisper/CTranslate2. "
+                    "\nErrore CUDA/cuDNN con faster-whisper/CTranslate2. "
                     "Prova device=cpu, oppure installa le librerie CUDA/cuDNN compatibili."
                 )
 
@@ -573,7 +695,7 @@ class Forma(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setMinimumHeight(200)
+        self.setMinimumHeight(130)
         self.setCursor(Qt.PointingHandCursor)
         self.setToolTip(
             "Clic/trascina: posizione  |  Rotella: zoom  |  "
@@ -847,7 +969,7 @@ class Evidenziatore:
         if idx >= 0:
             idx = min(idx, len(self.spans) - 1)
 
-            fine_detto = self.spans[idx][0] if in_corso else self.spans[idx][1]
+            fine_detto = self.spans[idx][1]
 
             if fine_detto > 0:
                 s = QTextEdit.ExtraSelection()
@@ -859,16 +981,7 @@ class Evidenziatore:
                 sels.append(s)
 
             if in_corso:
-                a, b = self.spans[idx]
-                s = QTextEdit.ExtraSelection()
-                c = QTextCursor(self.ed.document())
-                c.setPosition(a)
-                c.setPosition(b, QTextCursor.KeepAnchor)
-                s.cursor = c
-                s.format.setBackground(QBrush(QColor(C_SPOKEN)))
-                s.format.setForeground(QBrush(QColor("#14151c")))
-                sels.append(s)
-                self._scorri(a)
+                self._scorri(self.spans[idx][0])
 
         self.ed.setExtraSelections(sels)
 
@@ -886,6 +999,185 @@ class Evidenziatore:
 # ---------------------------------------------------------------------------
 # Finestra principale
 # ---------------------------------------------------------------------------
+class SliderPos(QSlider):
+    """Barra di posizione: clic e trascinamento saltano subito al punto."""
+    seek = pyqtSignal(float)
+
+    def __init__(self):
+        super().__init__(Qt.Horizontal)
+        self.trascina = False
+
+    def _vai(self, x):
+        v = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(),
+                                           int(x), max(1, self.width()))
+        self.setValue(v)
+        self.seek.emit(v / 1000.0)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.trascina = True
+            self._vai(e.x())
+
+    def mouseMoveEvent(self, e):
+        if self.trascina:
+            self._vai(e.x())
+
+    def mouseReleaseEvent(self, e):
+        self.trascina = False
+
+
+class VideoSchermo(QGraphicsView):
+    """Visualizzatore video basato su QGraphicsVideoItem: viene disegnato da Qt
+    come un normale widget (niente finestra nativa sovrapposta), quindi non si
+    blocca nel passaggio a schermo intero."""
+    doppio_clic = pyqtSignal()
+
+    def __init__(self, sorgente=None):
+        super().__init__()
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setBackgroundBrush(QBrush(QColor("#000000")))
+        self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
+        self.setRenderHint(QPainter.SmoothPixmapTransform)
+
+        if sorgente is not None:
+            # seconda vista sulla STESSA scena (usata per lo schermo intero):
+            # il video del player non viene mai spostato ne' riagganciato
+            self._scena = sorgente._scena
+            self.item = sorgente.item
+        else:
+            self._scena = QGraphicsScene(self)
+            self.item = QGraphicsVideoItem()
+            self._scena.addItem(self.item)
+        self.setScene(self._scena)
+        self._sub_html = ""
+        self._sub_cache = None
+        self.item.nativeSizeChanged.connect(self._adatta)
+
+    def _adatta(self, *_):
+        sz = self.item.nativeSize()
+        if sz.isValid() and not sz.isEmpty():
+            self.item.setSize(QSizeF(sz))
+            self._scena.setSceneRect(self.item.boundingRect())
+            self.fitInView(self.item, Qt.KeepAspectRatio)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._adatta()
+
+    def mouseDoubleClickEvent(self, e):
+        self.doppio_clic.emit()
+
+    # --- sottotitoli sovrapposti al video (testo colorato con contorno nero)
+    def imposta_sub(self, html):
+        self._sub_html = html
+        self._sub_cache = None
+        self.viewport().update()
+
+    def _doc(self, html, larg, px):
+        d = QTextDocument()
+        f = QFont(self.font())
+        f.setPixelSize(px)
+        f.setBold(True)
+        d.setDefaultFont(f)
+        o = QTextOption(Qt.AlignHCenter)
+        o.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        d.setDefaultTextOption(o)
+        d.setTextWidth(larg)
+        d.setHtml(html)
+        return d
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if not self._sub_html:
+            return
+
+        w, h = self.viewport().width(), self.viewport().height()
+        px = max(16, min(int(h * 0.055), 64))
+        larg = int(w * 0.92)
+        chiave = (self._sub_html, larg, px)
+
+        if self._sub_cache is None or self._sub_cache[0] != chiave:
+            nero = re.sub(r"color:\s*#[0-9a-fA-F]{6}", "color:#000000", self._sub_html)
+            self._sub_cache = (chiave, self._doc(self._sub_html, larg, px),
+                               self._doc(nero, larg, px))
+
+        _, doc, doc_nero = self._sub_cache
+        x = (w - larg) / 2.0
+        y = h - doc.size().height() - h * 0.05
+        r = max(2, px // 12)
+
+        p = QPainter(self.viewport())
+        p.setRenderHint(QPainter.TextAntialiasing)
+        for dx in (-r, 0, r):
+            for dy in (-r, 0, r):
+                if dx or dy:
+                    p.save()
+                    p.translate(x + dx, y + dy)
+                    doc_nero.drawContents(p)
+                    p.restore()
+        p.translate(x, y)
+        doc.drawContents(p)
+        p.end()
+
+
+class ContenitoreVideo(QWidget):
+    """Video con i sottotitoli karaoke sovrapposti (contorno nero)."""
+    doppio_clic = pyqtSignal()
+    esci = pyqtSignal()
+    play_pausa = pyqtSignal()
+    salta = pyqtSignal(float)
+
+    def __init__(self, sorgente=None):
+        super().__init__()
+        self._html = ""
+        self.setFocusPolicy(Qt.StrongFocus)
+        pal = self.palette()
+        pal.setColor(QPalette.Window, QColor("#000000"))
+        self.setPalette(pal)
+        self.setAutoFillBackground(True)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self.video = VideoSchermo(sorgente)
+        self.video.setMinimumHeight(300)
+        self.video.doppio_clic.connect(self.doppio_clic)
+        lay.addWidget(self.video, 1)
+
+        self._righe = 4
+
+    def imposta_righe(self, n):
+        self._righe = n
+
+    def imposta_sub(self, html):
+        self._html = html
+        self.video.imposta_sub(html)
+
+    def keyPressEvent(self, e):
+        k = e.key()
+        if k == Qt.Key_Escape:
+            self.esci.emit()
+        elif k == Qt.Key_F:
+            self.doppio_clic.emit()
+        elif k == Qt.Key_Space:
+            self.play_pausa.emit()
+        elif k == Qt.Key_Left:
+            self.salta.emit(-5.0)
+        elif k == Qt.Key_Right:
+            self.salta.emit(5.0)
+        else:
+            super().keyPressEvent(e)
+
+    def closeEvent(self, e):
+        # chiusura (Alt+F4) da schermo intero: esce solo dal fullscreen
+        e.ignore()
+        self.esci.emit()
+
+
 def card(titolo=None):
     f = QFrame()
     f.setObjectName("card")
@@ -906,8 +1198,9 @@ class Finestra(QWidget):
         super().__init__()
         self.setObjectName("finestra")
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setWindowTitle("Trascrivi Audio (faster-whisper)")
-        self.resize(1180, 920)
+        self.setWindowTitle("Trascrivi Audio/Video (faster-whisper)")
+        scr = QApplication.primaryScreen().availableGeometry()
+        self.resize(min(1180, scr.width() - 40), min(920, scr.height() - 90))
         self.setAcceptDrops(True)
 
         self.worker = None
@@ -915,6 +1208,13 @@ class Finestra(QWidget):
         self._vecchi = []              # thread in chiusura (evita distruzione prematura)
         self.wav_tmp = None
         self.file_corrente = ""
+        self.modo_video = False        # True se il player riproduce il video originale
+        self._fs = False               # True se il video e' a schermo intero
+        self.cont_fs = None            # finestra a schermo intero (creata alla prima richiesta)
+        self.ultimo_ris = None         # ultimo risultato di trascrizione (dati del karaoke)
+        self.tok_sub = None            # token per i sottotitoli karaoke sul video
+        self.seg_range = {}
+        self._sub_chiave = None
         self.t0 = []
         self.t1 = []
         self._prog = False             # True mentre il testo viene impostato da codice
@@ -926,7 +1226,21 @@ class Finestra(QWidget):
         self.timer.setInterval(30)
         self.timer.timeout.connect(self._tick)
 
-        root = QVBoxLayout(self)
+        # tutto il contenuto sta dentro una scroll area: se lo schermo e'
+        # piccolo si scorre invece di uscire dai bordi
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        inner = QWidget()
+        inner.setObjectName("interno")
+        inner.setAttribute(Qt.WA_StyledBackground, True)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
+
+        root = QVBoxLayout(inner)
+        self.root = root
         root.setContentsMargins(20, 16, 20, 16)
         root.setSpacing(12)
 
@@ -934,7 +1248,7 @@ class Finestra(QWidget):
         h = QVBoxLayout()
         h.setSpacing(0)
 
-        t = QLabel("Trascrivi Audio")
+        t = QLabel("Trascrivi Audio / Video")
         t.setObjectName("titolo")
 
         s = QLabel("faster-whisper · Hiragana · riproduzione con evidenziazione sincronizzata")
@@ -949,7 +1263,7 @@ class Finestra(QWidget):
 
         riga = QHBoxLayout()
         self.ed_file = QLineEdit()
-        self.ed_file.setPlaceholderText("Scegli o trascina qui un file audio/video...")
+        self.ed_file.setPlaceholderText("Scegli o trascina qui un file audio o video...")
         self.ed_file.editingFinished.connect(self._file_modificato)
 
         b_sfoglia = QPushButton("Sfoglia...")
@@ -1037,12 +1351,21 @@ class Finestra(QWidget):
 
         self.b_salva_accanto = QPushButton("💾 Salva accanto all'audio")
         self.b_salva_accanto.setToolTip(
-            "Salva trascrizione e hiragana come file .txt nella stessa cartella dell'audio originale"
+            "Salva trascrizione e hiragana (.txt) e i dati del karaoke (_karaoke.json) "
+            "nella stessa cartella del file originale"
         )
         self.b_salva_accanto.clicked.connect(self.salva_accanto)
 
         az.addWidget(self.b_avvia)
+        self.b_carica_k = QPushButton("📂 Carica karaoke...")
+        self.b_carica_k.setToolTip(
+            "Carica un file _karaoke.json salvato in precedenza: riapre il video/audio "
+            "e ripristina testi e sincronizzazione senza trascrivere di nuovo"
+        )
+        self.b_carica_k.clicked.connect(self.scegli_karaoke)
+
         az.addWidget(self.b_salva_accanto)
+        az.addWidget(self.b_carica_k)
         az.addStretch(1)
         az.addWidget(self.b_libera)
         l1.addLayout(az)
@@ -1056,14 +1379,27 @@ class Finestra(QWidget):
         self.lb_stato.setObjectName("sotto")
         l1.addWidget(self.lb_stato)
 
+        self.c1 = c1
         root.addWidget(c1)
 
         # --- player ---
         c2, l2 = card("Player")
 
+        self.l2, self.c2 = l2, c2
+        self.cont_video = ContenitoreVideo()
+        self.video = self.cont_video.video
+        self._collega_cont(self.cont_video)
+        self.cont_video.hide()
+        self.player.setVideoOutput(self.video.item)
+        l2.addWidget(self.cont_video, 1)
+
+        # il grafico dell'audio non e' piu' mostrato (resta solo come contenitore
+        # dei dati): al suo posto c'e' una barra di posizione
         self.forma = Forma()
-        self.forma.seek.connect(self.vai_a)
-        l2.addWidget(self.forma)
+        self.sl_pos = SliderPos()
+        self.sl_pos.setRange(0, 0)
+        self.sl_pos.seek.connect(self.vai_a)
+        l2.addWidget(self.sl_pos)
 
         ctrl = QHBoxLayout()
         ctrl.setSpacing(10)
@@ -1097,6 +1433,24 @@ class Finestra(QWidget):
         ctrl.addWidget(self.b_stop)
         ctrl.addWidget(self.lb_tempo)
         ctrl.addStretch(1)
+
+        self.lb_sub = QLabel("Sul video")
+        self.cb_sub = QComboBox()
+        self.cb_sub.addItems(["Originale + Hiragana", "Solo originale", "Solo hiragana", "Nessun testo"])
+        self.cb_sub.currentIndexChanged.connect(self._cambia_sub)
+
+        self.b_fs = QPushButton("⛶ Schermo intero")
+        self.b_fs.setObjectName("piccolo")
+        self.b_fs.setToolTip(
+            "Tasto F o doppio clic sul video: schermo intero  |  In schermo intero: Esc esce, "
+            "Spazio play/pausa, frecce ±5 s"
+        )
+        self.b_fs.clicked.connect(self.schermo_intero)
+
+        ctrl.addWidget(self.lb_sub)
+        ctrl.addWidget(self.cb_sub)
+        ctrl.addWidget(self.b_fs)
+        ctrl.addSpacing(10)
         ctrl.addWidget(QLabel("Velocita'"))
         ctrl.addWidget(self.cb_vel)
         ctrl.addSpacing(10)
@@ -1108,10 +1462,12 @@ class Finestra(QWidget):
 
         self.player.stateChanged.connect(self._stato_player)
         self.player.positionChanged.connect(self.aggiorna_pos)
+        self.player.error[QMediaPlayer.Error].connect(self._errore_player)
 
         # --- testi affiancati ---
         split = QSplitter(Qt.Horizontal)
         split.setChildrenCollapsible(False)
+        split.setMinimumHeight(200)
 
         c3, l3 = card()
         h3 = QHBoxLayout()
@@ -1176,6 +1532,13 @@ class Finestra(QWidget):
 
         self._sp_o_orig, self._sp_h_orig, self._hira_orig = [], [], ""
 
+        self._mostra_video(False)
+        self._cambia_sub()
+
+        self.sc_f = QShortcut(QKeySequence("F"), self)
+        self.sc_f.setContext(Qt.WindowShortcut)
+        self.sc_f.activated.connect(self._tasto_f)
+
     # ------------------------------------------------------------------ file
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
@@ -1184,12 +1547,16 @@ class Finestra(QWidget):
     def dropEvent(self, e):
         urls = e.mimeData().urls()
         if urls:
-            self.imposta_file(urls[0].toLocalFile())
+            f = urls[0].toLocalFile()
+            if f.lower().endswith(".json"):
+                self.carica_karaoke_json(f)
+            else:
+                self.imposta_file(f)
 
     def scegli_file(self):
         f, _ = QFileDialog.getOpenFileName(
             self, "Scegli un file", "",
-            "Audio/Video (*.wav *.mp3 *.m4a *.flac *.ogg *.opus *.aac *.mp4 *.mkv *.webm *.mov);;Tutti i file (*)"
+            FILTRO_FILE
         )
         if f:
             self.imposta_file(f)
@@ -1202,6 +1569,7 @@ class Finestra(QWidget):
         path = self.ed_file.text().strip()
         if path and path != self.file_corrente and os.path.isfile(path):
             self.carica_audio(path)
+            self._cerca_karaoke(path)
 
     def _rimuovi_wav(self):
         if self.wav_tmp and os.path.exists(self.wav_tmp):
@@ -1216,8 +1584,11 @@ class Finestra(QWidget):
         self.player.stop()
         self.player.setMedia(QMediaContent())
         self._rimuovi_wav()
+        self._mostra_video(False)
 
         self.forma.pulisci("Decodifico l'audio...")
+        self.sl_pos.setRange(0, 0)
+        self.lb_stato.setText("Decodifico il file...")
         self.lb_tempo.setText("00:00.0 / 00:00.0")
 
         if self.decoder is not None:
@@ -1229,7 +1600,7 @@ class Finestra(QWidget):
         self.decoder.errore.connect(self._audio_errore)
         self.decoder.start()
 
-    def _audio_pronto(self, path, wav, db, hop, durata):
+    def _audio_pronto(self, path, wav, db, hop, durata, ha_video):
         if path != self.file_corrente:       # nel frattempo e' stato scelto un altro file
             try:
                 os.remove(wav)
@@ -1241,9 +1612,15 @@ class Finestra(QWidget):
         self.durata = durata
         self.forma.imposta(db, hop, durata)
 
-        self.player.setMedia(QMediaContent(QUrl.fromLocalFile(wav)))
+        # Video: il player riproduce il file originale (immagine + audio
+        # sincronizzati). Audio: riproduce il wav decodificato.
+        self.modo_video = bool(ha_video)
+        self._mostra_video(self.modo_video)
+        sorgente = path if self.modo_video else wav
+        self.player.setMedia(QMediaContent(QUrl.fromLocalFile(sorgente)))
         self.player.setPlaybackRate(float(self.cb_vel.currentText().rstrip("x")))
 
+        self.sl_pos.setRange(0, int(durata * 1000))
         self._aggiorna_selezione()
         self.aggiorna_pos(0)
 
@@ -1252,6 +1629,135 @@ class Finestra(QWidget):
             self.forma.pulisci("Impossibile decodificare l'audio")
             self.lb_stato.setText("Errore di decodifica audio.")
             QMessageBox.warning(self, "Audio", msg)
+
+    def _mostra_video(self, on):
+        """Mostra/nasconde il riquadro video e i suoi controlli."""
+        self.modo_video = bool(on)
+        if not on:
+            self._fullscreen(False)
+        self.cont_video.setVisible(bool(on))
+        self.root.setStretchFactor(self.c1, 0)
+        self.root.setStretchFactor(self.c2, 4 if on else 0)
+        self.lb_sub.setVisible(bool(on))
+        self.cb_sub.setVisible(bool(on))
+        self.b_fs.setVisible(bool(on))
+        self._sub_chiave = None
+
+    def _tasto_f(self):
+        # non rubare la lettera "f" mentre si scrive in una casella
+        w = QApplication.focusWidget()
+        if isinstance(w, (QLineEdit, QTextEdit, QDoubleSpinBox)):
+            return
+        self.schermo_intero()
+
+    def schermo_intero(self):
+        if self.modo_video:
+            self._fullscreen(not self._fs)
+
+    def _collega_cont(self, c):
+        c.doppio_clic.connect(self.schermo_intero)
+        c.esci.connect(lambda: self._fullscreen(False))
+        c.play_pausa.connect(self.play_pausa)
+        c.salta.connect(self._salta_rel)
+
+    def _sub_set(self, html):
+        self.cont_video.imposta_sub(html)
+        if self.cont_fs is not None:
+            self.cont_fs.imposta_sub(html)
+
+    def _righe_set(self, n):
+        self.cont_video.imposta_righe(n)
+        if self.cont_fs is not None:
+            self.cont_fs.imposta_righe(n)
+
+    def _fullscreen(self, on):
+        """Schermo intero: una seconda finestra mostra la STESSA scena del
+        video. Il video del player non viene toccato (spostarlo/riagganciarlo
+        mentre e' in riproduzione causava 'Internal data stream error')."""
+        if on == self._fs:
+            return
+        self._fs = on
+
+        if on:
+            if self.cont_fs is None:
+                self.cont_fs = ContenitoreVideo(self.video)
+                self.cont_fs.setWindowTitle("Video")
+                self._collega_cont(self.cont_fs)
+            self.cont_fs.imposta_righe(self.cont_video._righe)
+            self.cont_fs.imposta_sub(self.cont_video._html)
+            self.cont_fs.showFullScreen()
+            self.cont_fs.setFocus()
+            self.cont_fs.activateWindow()
+        elif self.cont_fs is not None:
+            self.cont_fs.hide()
+            self.activateWindow()
+
+        self._sub_chiave = None
+        self.aggiorna_pos(self.player.position())
+
+    def _salta_rel(self, delta):
+        t = self.player.position() / 1000.0 + delta
+        self.vai_a(max(0.0, min(getattr(self, "durata", 0.0), t)))
+
+    def _cambia_sub(self, *_):
+        m = self.cb_sub.currentIndex()
+        self._righe_set({0: 4, 1: 2, 2: 2}.get(m, 0))
+        self._sub_chiave = None
+        self.aggiorna_pos(self.player.position())
+
+    def _html_riga(self, tok, a, b, idx, in_corso):
+        out = []
+        for i in range(a, b):
+            tx = escape(tok[i])
+            if i <= idx:
+                out.append('<span style="color:%s;">%s</span>' % (C_SPOKEN, tx))
+            else:
+                out.append('<span style="color:#ffffff;">%s</span>' % tx)
+        return '<div style="white-space: pre-wrap;">%s</div>' % "".join(out)
+
+    def _aggiorna_sub(self, t):
+        """Sottotitoli karaoke sul video: la frase corrente, con le parole
+        gia' pronunciate colorate e quella in corso evidenziata."""
+        if not self.modo_video or not self.tok_sub or not self.t0:
+            return
+
+        m = self.cb_sub.currentIndex()
+        idx = bisect_right(self.t0, t) - 1
+        chiave = None
+
+        if m != 3 and idx >= 0:
+            in_corso = t <= self.t1[idx]
+            if in_corso or t - self.t1[idx] <= 1.5:
+                chiave = (idx, in_corso, m)
+
+        if chiave == self._sub_chiave:
+            return
+        self._sub_chiave = chiave
+
+        if chiave is None:
+            self._sub_set("")
+            return
+
+        a, b = self.seg_range[self.tok_sub["seg"][idx]]
+        righe = []
+        if m in (0, 1):
+            righe.append(self._html_riga(self.tok_sub["o"], a, b, idx, in_corso))
+        if m in (0, 2):
+            righe.append(self._html_riga(self.tok_sub["h"], a, b, idx, in_corso))
+        self._sub_set("".join(righe))
+
+    def _errore_player(self, _codice):
+        """Il backend multimediale non riesce a riprodurre il video (codec
+        mancanti): ripiega sul solo audio gia' decodificato."""
+        if self.modo_video and self.wav_tmp and os.path.exists(self.wav_tmp):
+            self._mostra_video(False)
+            self.player.setMedia(QMediaContent(QUrl.fromLocalFile(self.wav_tmp)))
+            self.player.setPlaybackRate(float(self.cb_vel.currentText().rstrip("x")))
+            self.lb_stato.setText(
+                "Video non riproducibile dal backend multimediale: uso solo l'audio."
+            )
+        elif not self.modo_video:
+            self.lb_stato.setText("Errore del player: " + self.player.errorString())
 
     def _aggiorna_selezione(self):
         a = self.sp_inizio.value()
@@ -1299,6 +1805,8 @@ class Finestra(QWidget):
     def aggiorna_pos(self, ms):
         t = ms / 1000.0
         self.forma.imposta_pos(t)
+        if not self.sl_pos.trascina:
+            self.sl_pos.setValue(int(ms))
         self.lb_tempo.setText("{} / {}".format(fmt_tempo(t), fmt_tempo(getattr(self, "durata", 0.0))))
 
         if self.t0:
@@ -1306,6 +1814,8 @@ class Finestra(QWidget):
             in_corso = idx >= 0 and t <= self.t1[idx]
             self.ev_o.aggiorna(idx, in_corso)
             self.ev_h.aggiorna(idx, in_corso)
+
+        self._aggiorna_sub(t)
 
     def salta_a_testo(self, ev, pos):
         """Doppio clic su una parola: riproduce da li'."""
@@ -1344,6 +1854,7 @@ class Finestra(QWidget):
 
         self.b_avvia.setEnabled(False)
         self.barra.setRange(0, 0)   # barra indeterminata
+        self.ultimo_ris = None
         self._imposta_testi("", "", [], [], [], [])
 
         self.worker = Worker(params)
@@ -1356,7 +1867,7 @@ class Finestra(QWidget):
         self.barra.setRange(0, 1)
         self.b_avvia.setEnabled(True)
 
-    def _imposta_testi(self, orig, hira, span_o, span_h, t0, t1):
+    def _imposta_testi(self, orig, hira, span_o, span_h, t0, t1, tok=None):
         self._prog = True
         self.out.setPlainText(orig)
         self.out_hira.setPlainText(hira)
@@ -1369,12 +1880,22 @@ class Finestra(QWidget):
 
         self._sp_o_orig, self._sp_h_orig, self._hira_orig = span_o, span_h, hira
 
+        self.tok_sub = tok
+        self.seg_range = {}
+        if tok:
+            for i, sg in enumerate(tok["seg"]):
+                r = self.seg_range.setdefault(sg, [i, i + 1])
+                r[1] = i + 1
+        self._sub_chiave = None
+        self._sub_set("")
+
     def fine_ok(self, r):
         self._ripristina()
-        self._imposta_testi(r["orig"], r["hira"], r["span_o"], r["span_h"], r["t0"], r["t1"])
+        self.ultimo_ris = r
+        self._imposta_testi(r["orig"], r["hira"], r["span_o"], r["span_h"], r["t0"], r["t1"], r.get("tok"))
 
         self.lb_stato.setText(
-            "Fatto{}. Premi ▶ per vedere le parole colorarsi mentre vengono pronunciate "
+            "Fatto{}. Premi ▶ per vedere le parole colorarsi mentre vengono pronunciate, anche sul video "
             "(doppio clic su una parola per partire da li').".format(r["avviso"])
         )
 
@@ -1416,6 +1937,97 @@ class Finestra(QWidget):
             self.lb_stato.setText("Hiragana aggiornato dal testo superiore.")
 
     # --------------------------------------------------------------- azioni
+    # ------------------------------------------------------- karaoke (.json)
+    def _scrivi_json(self, percorso):
+        """Salva i dati per rivedere il karaoke senza trascrivere di nuovo."""
+        r = self.ultimo_ris
+        media = self.ed_file.text().strip()
+        dati = dict(
+            versione=1,
+            file=os.path.basename(media),
+            percorso_file=os.path.abspath(media),
+            orig=r["orig"],
+            hira=r["hira"],
+            span_o=[list(x) for x in r["span_o"]],
+            span_h=[list(x) for x in r["span_h"]],
+            t0=r["t0"],
+            t1=r["t1"],
+            tok=r["tok"],
+        )
+        with open(percorso, "w", encoding="utf-8") as fh:
+            json.dump(dati, fh, ensure_ascii=False)
+
+    @staticmethod
+    def _valida_karaoke(d):
+        for k in ("orig", "hira", "span_o", "span_h", "t0", "t1", "tok"):
+            if k not in d:
+                raise ValueError("File karaoke non valido: manca '{}'.".format(k))
+        n = len(d["t0"])
+        tok = d["tok"]
+        if not (len(d["t1"]) == len(d["span_o"]) == len(d["span_h"]) == n
+                and all(len(tok.get(k, [])) == n for k in ("o", "h", "seg"))):
+            raise ValueError("File karaoke non valido: dati incoerenti.")
+
+    def _applica_karaoke(self, d):
+        self._valida_karaoke(d)
+        r = dict(
+            orig=d["orig"], hira=d["hira"],
+            span_o=[tuple(x) for x in d["span_o"]],
+            span_h=[tuple(x) for x in d["span_h"]],
+            t0=list(d["t0"]), t1=list(d["t1"]),
+            tok=d["tok"], avviso="",
+        )
+        self.ultimo_ris = r
+        self._imposta_testi(r["orig"], r["hira"], r["span_o"], r["span_h"],
+                            r["t0"], r["t1"], r["tok"])
+        self.aggiorna_pos(self.player.position())
+
+    def _cerca_karaoke(self, media):
+        """Se accanto al file c'e' un _karaoke.json lo carica al posto della trascrizione."""
+        pj = os.path.splitext(media)[0] + "_karaoke.json"
+        if not os.path.isfile(pj):
+            return
+        try:
+            with open(pj, encoding="utf-8") as fh:
+                self._applica_karaoke(json.load(fh))
+            self.lb_stato.setText(
+                "Karaoke caricato da {}: premi ▶ (non serve trascrivere di nuovo).".format(
+                    os.path.basename(pj)))
+        except Exception as e:
+            self.lb_stato.setText("Karaoke salvato non utilizzabile: {}".format(e))
+
+    def scegli_karaoke(self):
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Carica karaoke", os.path.dirname(self.ed_file.text().strip()),
+            "Karaoke (*.json);;Tutti i file (*)")
+        if f:
+            self.carica_karaoke_json(f)
+
+    def carica_karaoke_json(self, pj):
+        try:
+            with open(pj, encoding="utf-8") as fh:
+                dati = json.load(fh)
+            self._valida_karaoke(dati)
+        except Exception as e:
+            QMessageBox.warning(self, "Karaoke", "Impossibile leggere il file:\n{}".format(e))
+            return
+
+        media = dati.get("percorso_file") or ""
+        if not os.path.isfile(media):
+            media = os.path.join(os.path.dirname(pj), dati.get("file", ""))
+
+        if os.path.isfile(media):
+            if media != self.file_corrente:
+                self.imposta_file(media)
+        else:
+            QMessageBox.information(
+                self, "File non trovato",
+                "Il file audio/video originale non e' stato trovato.\n"
+                "Scegline uno con 'Sfoglia...': testi e sincronizzazione sono comunque caricati.")
+
+        self._applica_karaoke(dati)
+        self.lb_stato.setText("Karaoke caricato da {}.".format(os.path.basename(pj)))
+
     def copia(self):
         QApplication.clipboard().setText(self.out.toPlainText())
         self.lb_stato.setText("Trascrizione originale copiata negli appunti.")
@@ -1431,7 +2043,16 @@ class Finestra(QWidget):
         if f:
             with open(f, "w", encoding="utf-8") as fh:
                 fh.write(self.out.toPlainText())
-            self.lb_stato.setText("Salvato: " + f)
+            msg = "Salvato: " + f
+
+            if self.ultimo_ris:
+                pj = os.path.splitext(f)[0] + "_karaoke.json"
+                try:
+                    self._scrivi_json(pj)
+                    msg += " + " + os.path.basename(pj)
+                except OSError as e:
+                    QMessageBox.critical(self, "Errore di salvataggio", str(e))
+            self.lb_stato.setText(msg)
 
     def salva_accanto(self):
         """Salva trascrizione e hiragana nella stessa cartella dell'audio originale."""
@@ -1448,20 +2069,20 @@ class Finestra(QWidget):
 
         testi = [(suff, t) for suff, t in testi if t.strip()]
 
-        if not testi:
+        con_json = self.ultimo_ris is not None
+
+        if not testi and not con_json:
             QMessageBox.information(self, "Niente da salvare", "Non ci sono ancora testi da salvare.")
             return
 
         base = os.path.splitext(audio)[0]
-        esistenti = [os.path.basename(base + s) for s, _ in testi if os.path.exists(base + s)]
+        nomi = [s for s, _ in testi] + (["_karaoke.json"] if con_json else [])
+        esistenti = [os.path.basename(base + s) for s in nomi if os.path.exists(base + s)]
 
         if esistenti:
             r = QMessageBox.question(
                 self, "Sovrascrivere?",
-                "Esistono gia' questi file:
-" + "
-".join(esistenti) + "
-Vuoi sovrascriverli?"
+                "Esistono gia' questi file:\n" + "\n".join(esistenti) + "\nVuoi sovrascriverli?"
             )
             if r != QMessageBox.Yes:
                 return
@@ -1470,13 +2091,15 @@ Vuoi sovrascriverli?"
             for suff, t in testi:
                 with open(base + suff, "w", encoding="utf-8") as fh:
                     fh.write(t)
+            if con_json:
+                self._scrivi_json(base + "_karaoke.json")
         except OSError as e:
             QMessageBox.critical(self, "Errore di salvataggio", str(e))
             return
 
         self.lb_stato.setText("Salvato in {}: {}".format(
             os.path.dirname(audio),
-            ", ".join(os.path.basename(base + s) for s, _ in testi)
+            ", ".join(os.path.basename(base + s) for s in nomi)
         ))
 
     def libera(self):
@@ -1484,6 +2107,9 @@ Vuoi sovrascriverli?"
         self.lb_stato.setText("Modello scaricato dalla memoria.")
 
     def closeEvent(self, e):
+        self._fullscreen(False)
+        if self.cont_fs is not None:
+            self.cont_fs.hide()
         self.player.stop()
         self.player.setMedia(QMediaContent())
         self._rimuovi_wav()
