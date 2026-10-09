@@ -39,14 +39,16 @@ HW_DECODE = True                 # decodifica hardware (NVDEC) tramite ffmpeg, s
 HW_DECODE_METHODS = ("cuda",)    # metodi hwaccel di ffmpeg da provare, in ordine
 HW_SKIP_MAX = 90                 # seek in avanti entro N frame: si scartano i frame senza riavviare ffmpeg
 
+larghezza_occhi = 500            # larghezza massima (px, da un estremo all'altro dell'arco) di ciascun occhio: seguono la larghezza della finestra fino a questo limite
 FRAME_COLOR = "#0f0c12"
 FRAME_BORDER_WIDTH = 10          # spessore del bordo nero della finestra ellittica
-ELLIPSE_BAND = 14                # fascia a tinta unita (colore tema) tra bordo nero e video; 0 = nessuna
+ELLIPSE_BAND = 0                 # fascia a tinta unita (colore tema) tra bordo nero e video; 0 = nessuna
 EARS_X_FRACTION = 0.27           # posizione orizzontale del centro delle orecchie (frazione della larghezza)
+EARS_ROTATION_REF_HEIGHT = 520.0  # altezza finestra (px) a cui le orecchie ruotano per allinearsi del tutto all'ellisse; sotto, la rotazione scala in proporzione all'altezza
 HEAD_SHAKE_AMPLITUDE = 6.0       # vibrazione della testa quando si clicca un baffo: ampiezza massima (px)
 HEAD_SHAKE_DURATION = 0.45       # durata (s)
 HEAD_SHAKE_FREQ = 13.0           # oscillazioni al secondo
-EARS_OUTER_CORNER_DY = 60.0       # fine tuning: sposta in y (px) l'angolo ESTERNO della base di entrambe le orecchie; + = verso il basso, - = verso l'alto
+WHISKER_PULL_MAX_STRETCH = 1.5   # tenendo premuto e tirando un baffo si allunga fino a questa frazione della sua lunghezza (1.5 = 150%); oltre, la finestra inizia a seguire il cursore
 # Le dimensioni salvate dalle versioni a 5 finestre erano quelle del solo rettangolo centrale: gli archi
 # lo ingrandivano di questo fattore (più il bordo) su ogni asse. Serve a convertirle alla prima apertura.
 LEGACY_SIZE_GROWTH = 1.0 + 0.7 * (math.sqrt(2.0) - 1.0)
@@ -55,6 +57,9 @@ WHISKERS_REF_WIDTH = 740   # larghezza finestra a cui i baffi hanno lunghezza 10
 WHISKERS_REF_HEIGHT = 520  # altezza finestra a cui distanza tra i baffi e spessore sono al 100%
 # (i due riferimenti valgono per la vecchia finestra rettangolare; la finestra ellittica viene convertita)
 WHISKERS_LENGTH_SCALE = 0.6  # i baffi ora partono dal bordo e non più dal bordo del video: accorciati di conseguenza
+WHISKERS_MIN_LENGTH_SCALE = 0.30     # minimo della scala di lunghezza (1.0 = riferimento): a finestra molto stretta i baffi non si accorciano oltre
+WHISKERS_MIN_SPACING_SCALE = 0.45    # minimo della scala verticale (distanza tra i baffi): a finestra molto bassa non si avvicinano oltre
+WHISKERS_MIN_THICKNESS_SCALE = 0.60  # minimo dello spessore (1.0 = LINE_W/GLOW_W/DOT_R): a finestra molto bassa le linee non si assottigliano oltre
 
 UI_FONT_FAMILY = "Nunito"
 UI_FONT_FALLBACKS = ("Nunito", "Nunito Sans", "Quicksand", "Comfortaa", "sans-serif")
@@ -239,10 +244,6 @@ def make_main_style(bg_hex: str) -> str:
         + FLAT_ICON_QSS +
         "QCheckBox { color: #cdd6f4; font-weight: bold; font-size: 12px; } "
         f"QStatusBar {{ background-color: {bg_hex}; color: #a6adc8; border-top: 1px solid #25202b; }} "
-        "QSlider#videoSlider::groove:horizontal { height: 6px; background: rgba(49, 50, 68, 0.80); border-radius: 3px; } "
-        "QSlider#videoSlider::sub-page:horizontal { background: #fab387; border-radius: 3px; } "
-        "QSlider#videoSlider::handle:horizontal { background: #cdd6f4; border: 2px solid #fab387; width: 14px; margin-top: -4px; margin-bottom: -4px; border-radius: 7px; } "
-        "QSlider#videoSlider::handle:horizontal:hover { background: #ffffff; } "
         "QSlider#volumeSlider::groove:horizontal { height: 5px; background: rgba(49, 50, 68, 0.80); border-radius: 2px; } "
         "QSlider#volumeSlider::sub-page:horizontal { background: #a6e3a1; border-radius: 2px; } "
         "QSlider#volumeSlider::handle:horizontal { background: #cdd6f4; border: 1px solid #a6e3a1; width: 12px; margin-top: -4px; margin-bottom: -4px; border-radius: 6px; } "
@@ -407,7 +408,8 @@ def open_file_dialog(parent, title, start_dir, filters, places, icons, select=No
 class CatEar(QWidget):
     BASE_WIDTH = 340
     BASE_HEIGHT = 310
-    BOX_SIZE = 420
+    BOX_WIDTH = 560     # finestra rettangolare: larga e con margine sotto l'ancora, cosi' la base ruotata non viene tagliata
+    BOX_HEIGHT = 500
     def __init__(self, is_left=True, parent=None):
         flags = Qt.FramelessWindowHint | Qt.WindowDoesNotAcceptFocus | Qt.Tool
         if sys.platform.startswith("linux"): flags |= Qt.X11BypassWindowManagerHint
@@ -415,14 +417,15 @@ class CatEar(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.is_left = is_left
-        self.setFixedSize(self.BOX_SIZE, self.BOX_SIZE)
+        self.setFixedSize(self.BOX_WIDTH, self.BOX_HEIGHT)
         self.flare = 0.0
         self.squash = 0.0
         self.ear_w = float(self.BASE_WIDTH)
         self.ear_h = float(self.BASE_HEIGHT)
-        self.angle = 0.0
-        self.anchor_x = self.BOX_SIZE / 2.0
-        self.anchor_y = self.BOX_SIZE - 40.0
+        self.angle = 0.0        # inclinazione dell'asse verticale dell'orecchio (gradi)
+        self.base_angle = 0.0   # inclinazione della base, uguale alla corda sull'ellisse (gradi)
+        self.anchor_x = self.BOX_WIDTH / 2.0
+        self.anchor_y = 380.0
         self.texture_pixmap = None
         if os.path.isfile(EARS_IMAGE_PATH):
             raw_pixmap = QPixmap(EARS_IMAGE_PATH)
@@ -459,17 +462,19 @@ class CatEar(QWidget):
         vb = float(v.max())
         sel = v >= vb - 0.02
         return float(u[sel].min()), float(u[sel].max()), vb
-    def top_reach(self, angle: float, ear_w: float, ear_h: float) -> float:
-        # Distanza in px tra l'ancora e il punto più alto dell'orecchio ruotato (stessa trasformazione del paintEvent)
-        th = math.radians(angle)
-        s, c = math.sin(th), math.cos(th)
+    def top_reach(self, angle: float, ear_w: float, ear_h: float, base_angle: float = None) -> float:
+        # Distanza in px tra l'ancora e il punto più alto dell'orecchio (stessa trasformazione del paintEvent:
+        # asse x lungo la base inclinata di base_angle, asse y inclinato di angle)
+        if base_angle is None: base_angle = angle
+        sp = math.sin(math.radians(base_angle))
+        ca = math.cos(math.radians(angle))
         pts = self._opaque_unit_points()
         if pts is None:
-            return ear_h * c + (ear_w / 2.0) * abs(s)
+            return ear_h * ca + (ear_w / 2.0) * abs(sp)
         u, v = pts
         x = (u - 0.5) * ear_w
         y = (v - 1.0) * ear_h
-        return float(-(x * s + y * c).min())
+        return float(-(x * sp + y * ca).min())
     def trigger_twitch(self):
         self.anim_step = 0
         self.anim_timer.start(16)
@@ -483,8 +488,9 @@ class CatEar(QWidget):
             if progress < 0.28: self.flare = progress / 0.28
             else: self.flare = 1.0 - ((progress - 0.28) / 0.72)
         self.update()
-    def set_ear_config(self, angle: float, width: float, height: float):
+    def set_ear_config(self, angle: float, width: float, height: float, base_angle: float = None):
         self.angle = angle
+        self.base_angle = angle if base_angle is None else base_angle
         self.ear_w = width
         self.ear_h = height
         self.update()
@@ -494,7 +500,9 @@ class CatEar(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
         painter.translate(self.anchor_x, self.anchor_y)
-        painter.rotate(self.angle)
+        # la base segue la corda sull'ellisse (base_angle) mentre l'asse verticale dell'orecchio si inclina solo di angle
+        pa, aa = math.radians(self.base_angle), math.radians(self.angle)
+        painter.setTransform(QTransform(math.cos(pa), math.sin(pa), -math.sin(aa), math.cos(aa), 0.0, 0.0), True)
         tilt = (0.24 * self.squash + 0.18 * self.flare)
         if tilt > 0.001:
             pivot_x = (self.ear_w / 2.0) if self.is_left else (-self.ear_w / 2.0)
@@ -514,6 +522,8 @@ class CatWhiskers(QWidget):
     WIDTH = 340
     HEIGHT = 180
     clicked = pyqtSignal()
+    pull_window_moved = pyqtSignal(QPoint)   # spostamento cumulativo (px) che la finestra deve seguire mentre si tira un baffo oltre il limite
+    pull_ended = pyqtSignal()
     LINE_W = 7.0    # spessore linea nera (px a finestra di riferimento)
     GLOW_W = 10.0   # spessore alone bianco
     DOT_R = 5.0     # raggio puntino alla base
@@ -526,6 +536,12 @@ class CatWhiskers(QWidget):
         self.is_left = is_left
         self._sx = 1.0   # scala orizzontale (lunghezza): proporzionale alla larghezza della finestra
         self._sy = 1.0   # scala verticale (distanza tra i baffi, spessore): proporzionale all'altezza della finestra
+        self._pad = 0                       # larghezza extra (px) sul lato esterno, solo mentre si tira un baffo
+        self._stretch = [1.0, 1.0, 1.0]     # fattore di lunghezza di ciascun baffo (1.0 = a riposo)
+        self._pull_idx = None               # baffo afferrato (None = nessuna trazione)
+        self._pull_press = None
+        self._pull_w = QPointF(0.0, 0.0)
+        self._pull_rest = 1.0
         self.setFixedSize(self.WIDTH, self.HEIGHT)
         self.anim_timer = QTimer(self)
         self.anim_timer.setInterval(16)
@@ -538,9 +554,27 @@ class CatWhiskers(QWidget):
         sy = max(0.1, float(sy))
         if abs(sx - self._sx) < 1e-4 and abs(sy - self._sy) < 1e-4: return
         self._sx, self._sy = sx, sy
-        self.setFixedSize(max(1, int(round(self.WIDTH * sx))), max(1, int(round(self.HEIGHT * sy))))
+        self.setFixedSize(self.base_size().width() + self._pad, self.base_size().height())
         self._update_mask()
         self.update()
+    def base_size(self) -> QSize:
+        # dimensioni a riposo (senza il margine extra della trazione)
+        return QSize(max(1, int(round(self.WIDTH * self._sx))), max(1, int(round(self.HEIGHT * self._sy))))
+    def origin_offset(self) -> QPoint:
+        # di quanto il widget sporge a sinistra rispetto alla sua posizione a riposo (solo baffo sinistro, in trazione)
+        return QPoint(self._pad if self.is_left else 0, 0)
+    def _set_pad(self, pad: int):
+        pad = max(0, int(pad))
+        if pad == self._pad: return
+        d = pad - self._pad
+        self._pad = pad
+        self.setFixedSize(self.base_size().width() + pad, self.base_size().height())
+        if self.is_left: self.move(self.x() - d, self.y())   # la base dei baffi resta ferma
+        self._update_mask()
+        self.update()
+    def _thickness_scale(self) -> float:
+        # lo spessore segue l'altezza della finestra ma non scende sotto il minimo
+        return max(self._sy, WHISKERS_MIN_THICKNESS_SCALE)
     def trigger_wiggle(self):
         self.anim_time = 0.0
         self.is_wiggling = True
@@ -559,7 +593,8 @@ class CatWhiskers(QWidget):
         sx, sy = self._sx, self._sy
         # Le forme sono definite in coordinate "logiche" 340x180; x scala con la larghezza, y con l'altezza.
         # Si converte ogni punto (senza scalare il painter) così lo spessore delle linee resta uniforme.
-        def P(x, y): return QPointF(x * sx, y * sy)
+        ox = float(self._pad) if self.is_left else 0.0
+        def P(x, y): return QPointF(x * sx + ox, y * sy)
         base_x = float(self.WIDTH - 15) if self.is_left else 15.0
         center_y = self.HEIGHT / 2.0
         whisker_configs = [
@@ -569,10 +604,10 @@ class CatWhiskers(QWidget):
         ]
         direction = -1.0 if self.is_left else 1.0
         paths = []
-        for cfg in whisker_configs:
+        for i, cfg in enumerate(whisker_configs):
             by = cfg["base_y"]
             base_angle = cfg["angle"]
-            length = cfg["len"]
+            length = cfg["len"] * self._stretch[i]
             wiggle_deg = 0.0
             if self.is_wiggling:
                 damp = math.exp(-3.0 * self.anim_time)
@@ -594,7 +629,7 @@ class CatWhiskers(QWidget):
         # solo i baffi (con un po' di margine) ricevono il mouse: il resto della finestra resta trasparente ai clic
         paths, cfgs, base_x, P = self._shapes()
         st = QPainterPathStroker()
-        st.setWidth(self.GLOW_W * self._sy + 8.0)
+        st.setWidth(self.GLOW_W * self._thickness_scale() + 8.0)
         st.setCapStyle(Qt.RoundCap)
         st.setJoinStyle(Qt.RoundJoin)
         region = QRegion()
@@ -605,13 +640,62 @@ class CatWhiskers(QWidget):
         self.setMask(region)
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
+            # baffo afferrato = quello più vicino al punto premuto
+            paths = self._shapes()[0]
+            pos = QPointF(event.pos())
+            best, idx = None, 0
+            for i, pth in enumerate(paths):
+                for k in range(41):
+                    pt = pth.pointAtPercent(k / 40.0)
+                    d = (pt.x() - pos.x()) ** 2 + (pt.y() - pos.y()) ** 2
+                    if best is None or d < best: best, idx = d, i
+            self._pull_idx = idx
+            self._pull_rest = max(1.0, paths[idx].length())
+            self._pull_press = QPoint(event.globalPos())
+            self._pull_w = QPointF(0.0, 0.0)
             self.clicked.emit()
+            event.accept()
+        else: event.ignore()
+    def mouseMoveEvent(self, event):
+        if self._pull_idx is None or not (event.buttons() & Qt.LeftButton):
+            event.ignore()
+            return
+        # il baffo si allunga con la distanza del cursore dal punto afferrato, fino a WHISKER_PULL_MAX_STRETCH;
+        # oltre il limite la finestra segue il cursore (guinzaglio: non torna indietro se il cursore rientra)
+        limit = (WHISKER_PULL_MAX_STRETCH - 1.0) * self._pull_rest
+        cur = event.globalPos()
+        rel = QPointF(cur.x() - self._pull_press.x() - self._pull_w.x(),
+                      cur.y() - self._pull_press.y() - self._pull_w.y())
+        r = math.hypot(rel.x(), rel.y())
+        if r > limit and r > 0.0:
+            k = (r - limit) / r
+            self._pull_w = QPointF(self._pull_w.x() + rel.x() * k, self._pull_w.y() + rel.y() * k)
+            r = limit
+        if r > 2.0 and self._pad == 0:
+            # il widget si allarga sul lato esterno per contenere il baffo allungato
+            ext = max(0.0, 305.0 * WHISKER_PULL_MAX_STRETCH - (self.WIDTH - 15))
+            self._set_pad(int(math.ceil(ext * self._sx)) + 8)
+        self._stretch[self._pull_idx] = 1.0 + r / self._pull_rest
+        self._update_mask()
+        self.update()
+        w = QPoint(int(round(self._pull_w.x())), int(round(self._pull_w.y())))
+        if not w.isNull(): self.pull_window_moved.emit(w)
+        event.accept()
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._pull_idx is not None:
+            self._pull_idx = None
+            self._stretch = [1.0, 1.0, 1.0]
+            self._set_pad(0)
+            self._update_mask()
+            self.update()
+            self.trigger_wiggle()   # scatto elastico al rilascio
+            self.pull_ended.emit()
             event.accept()
         else: event.ignore()
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        sy = self._sy
+        sy = self._thickness_scale()
         paths, whisker_configs, base_x, P = self._shapes()
         pen_glow = QPen(QColor(255, 255, 255, 120), self.GLOW_W * sy, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
         painter.setPen(pen_glow)
@@ -683,6 +767,7 @@ class ClickableSlider(QSlider):
 
 class MouthVolumeSlider(ClickableSlider):
     PAD = 8
+    JUNCTION_Y = 9.0   # quota (px dal bordo alto del widget) del punto centrale della bocca: sopra resta solo il posto per la maniglia
     OFF_COLOR = "#585b70"
     ON_COLOR = "#a6e3a1"
     OFF_ALPHA_REST = 255
@@ -705,7 +790,8 @@ class MouthVolumeSlider(ClickableSlider):
 
     def _apply_size(self):
         depth = self._depth_for_width(self._mouth_w)
-        height = int(round(2 * depth + 10))
+        # il widget parte appena sopra il punto centrale della bocca (prima aveva sopra uno spazio vuoto alto quanto la bocca)
+        height = int(round(self.JUNCTION_Y + depth + 10))
         total = self._mouth_w + 2 * self._side_margin
         if self.width() != total or self.height() != height:
             self.setFixedSize(total, height)
@@ -727,8 +813,8 @@ class MouthVolumeSlider(ClickableSlider):
         cx = (x0 + x1) / 2.0
         a = (x1 - x0) / 4.0
         depth = self._depth_for_width(self._mouth_w)
-        y_top = 0.5
-        y_j = y_top + depth
+        y_j = self.JUNCTION_Y
+        y_top = y_j - depth
         return x0, x1, cx, a, y_top, y_j, depth
 
     def _mouth_path(self):
@@ -829,6 +915,111 @@ class MouthVolumeSlider(ClickableSlider):
         p.setPen(QPen(QColor(self.ON_COLOR), 2))
         p.setBrush(QColor("#ffffff" if hover else "#cdd6f4"))
         p.drawEllipse(QPointF(hx, hy), 7.5, 7.5)
+        p.end()
+
+class EyeSlider(QSlider):
+    """Barra di avanzamento a forma di collina (arco verso l'alto): affiancandone due sembrano due occhi chiusi sorridenti ^ ^."""
+    PAD = 8           # margine laterale (spazio per la maniglia): gli estremi dell'arco stanno a PAD dal bordo del widget
+    TOP = 9.0         # spazio sopra il culmine dell'arco (per la maniglia)
+    BOTTOM = 9.0      # spazio sotto la base dell'arco
+    MIN_DEPTH, MAX_DEPTH, DEPTH_RATIO = 20.0, 170.0, 0.35  # altezza della collina = 35% della larghezza dell'arco, limitata tra 20 e 170 px
+    GAP_RATIO, GAP_MIN = 0.20, 24                          # distanza tra i due occhi: 10% della larghezza della riga sotto, almeno 24 px
+    OFF_COLOR = "#585b70"
+    ON_COLOR = "#fab387"
+    def __init__(self, parent=None):
+        super().__init__(Qt.Horizontal, parent)
+        self.setAttribute(Qt.WA_Hover, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setCursor(Qt.PointingHandCursor)
+        self._depth = self.MIN_DEPTH
+        self.setFixedHeight(int(round(self.TOP + self._depth + self.BOTTOM)))
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._dragging = False
+    @classmethod
+    def depth_for_width(cls, arc_width):
+        """Altezza della collina per un arco largo arc_width px (stessa regola della bocca)."""
+        return max(cls.MIN_DEPTH, min(cls.MAX_DEPTH, cls.DEPTH_RATIO * float(arc_width)))
+    def set_arc_depth(self, depth):
+        """Imposta l'altezza della collina e quindi del widget; True se è cambiata."""
+        h = int(round(self.TOP + depth + self.BOTTOM))
+        self._depth = float(depth)
+        if h == self.height(): return False
+        self.setFixedHeight(h)
+        self.update()
+        return True
+    def sizeHint(self): return QSize(110, self.height())
+    def minimumSizeHint(self): return QSize(40, self.height())
+    def _geom(self):
+        x0, x1 = float(self.PAD), float(self.width() - self.PAD)
+        a = max(1.0, (x1 - x0) / 2.0)
+        y_b = float(self.height()) - self.BOTTOM       # quota della base dell'arco (estremi)
+        depth = max(4.0, min(y_b - self.TOP, a * 0.8))  # altezza della collina
+        return x0, x1, a, y_b, depth
+    def _arch_path(self):
+        x0, x1, a, y_b, depth = self._geom()
+        path = QPainterPath()
+        path.moveTo(x0, y_b)
+        path.arcTo(QRectF(x0, y_b - depth, 2 * a, 2 * depth), 180, -180)   # semiellisse superiore, da sinistra a destra
+        return path
+    def _handle_pos(self):
+        x0, x1, a, y_b, depth = self._geom()
+        span = max(1, self.maximum() - self.minimum())
+        t = (self.value() - self.minimum()) / span
+        hx = x0 + t * (x1 - x0)
+        u = (hx - (x0 + a)) / a
+        return hx, y_b - depth * math.sqrt(max(0.0, 1.0 - u * u))
+    def _value_from_x(self, x):
+        x0, x1 = self._geom()[0], self._geom()[1]
+        x = max(x0, min(x1, float(x)))
+        return QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), int(x - x0), max(1, int(x1 - x0)))
+    def _set_from_mouse(self, x):
+        val = self._value_from_x(x)
+        self.setValue(val)
+        self.sliderMoved.emit(val)
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._dragging = True
+            self.setSliderDown(True)          # emette sliderPressed
+            self._set_from_mouse(event.x())
+            event.accept()
+        else: event.ignore()
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            self._set_from_mouse(event.x())
+            event.accept()
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._dragging:
+            self._dragging = False
+            self.setSliderDown(False)         # emette sliderReleased
+            event.accept()
+    def enterEvent(self, event):
+        self.update()
+        super().enterEvent(event)
+    def leaveEvent(self, event):
+        self.update()
+        super().leaveEvent(event)
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        path = self._arch_path()
+        hx, hy = self._handle_pos()
+        hover = self.underMouse() or self._dragging
+        pen = QPen(QColor(self.OFF_COLOR), 15.0)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+        p.save()
+        p.setClipRect(QRectF(0, 0, hx, self.height()))
+        pen.setColor(QColor(self.ON_COLOR))
+        p.setPen(pen)
+        p.drawPath(path)
+        p.restore()
+        p.setPen(QPen(QColor(self.ON_COLOR), 2))
+        p.setBrush(QColor("#0aa633" if hover else "#0aa633"))
+        p.drawEllipse(QPointF(hx, hy), 11.0, 11.0)
         p.end()
 
 class MouthStemOverlay(QWidget):
@@ -2214,9 +2405,11 @@ class VideoProcessorThread(QThread):
         self.wait()
 
 class BubbleMenu(QWidget):
-    """Menu contestuale a forma di fumetto, con la codina che punta al cursore."""
-    TAIL_H = 14
-    TAIL_W = 20
+    """Menu contestuale a forma di nuvoletta di pensiero: al posto della codina, due cerchi (uno grande e uno piccolo) che
+    scendono verso il cursore, come se il gatto stesse pensando il menu."""
+    TAIL_H = 24          # altezza riservata ai due cerchi del pensiero
+    DOT_R1, DOT_R2 = 5.5, 3.5   # raggio del cerchio vicino al fumetto e di quello vicino al cursore
+    DOT_GAP = 3.0        # distanza tra i cerchi e tra il cerchio grande e il fumetto
     PAD = 8
     ROW_H = 30
     RADIUS = 16
@@ -2233,6 +2426,7 @@ class BubbleMenu(QWidget):
         self._hover = -1
         self._tail_top = True
         self._tail_x = 24
+        self._from_center = None   # (dx, dy): posizione del cursore rispetto al centro della finestra del gatto
         self._font = QFont(resolve_ui_font_family(), 10)
         self._font.setBold(True)
         fm = QFontMetrics(self._font)
@@ -2248,7 +2442,10 @@ class BubbleMenu(QWidget):
         self._scroll = 0
         self._body_h = self._rows * self.ROW_H + 2 * self.PAD
         self.resize(self._body_w + 2 * self.MARGIN, self._body_h + self.TAIL_H + 2 * self.MARGIN)
-    def popup_at(self, gpos):
+    def popup_at(self, gpos, center=None):
+        # center: centro (globale) della finestra del gatto. I cerchi del pensiero sono orientati verso di esso: partono
+        # dal fumetto, che sta dal lato del cursore opposto al centro, e puntano al centro della finestra.
+        self._from_center = (gpos.x() - center.x(), gpos.y() - center.y()) if center is not None else None
         screen = QApplication.screenAt(gpos) or QApplication.primaryScreen()
         sg = screen.geometry()
         W, H, M = self.width(), self.height(), self.MARGIN
@@ -2257,12 +2454,13 @@ class BubbleMenu(QWidget):
         if x + W > sg.right() + 1: x = gpos.x() - (W - inset)
         x = max(sg.left(), min(x, sg.right() + 1 - W))
         self._tail_x = max(M + self.RADIUS, min(gpos.x() - x, W - M - self.RADIUS))
-        if gpos.y() + H > sg.bottom() + 1:
-            self._tail_top = False
-            y = gpos.y() - H + M
-        else:
-            self._tail_top = True
-            y = gpos.y() - M
+        below = True if self._from_center is None else self._from_center[1] >= 0   # fumetto sotto il cursore se questo sta nella metà bassa
+        fits_below = gpos.y() + H <= sg.bottom() + 1
+        fits_above = gpos.y() - H + M >= sg.top()
+        if below and not fits_below: below = False
+        elif not below and not fits_above and fits_below: below = True
+        self._tail_top = below
+        y = (gpos.y() - M) if below else (gpos.y() - H + M)
         self.move(x, max(sg.top(), y))
         self.show()
     def _body_rect(self):
@@ -2280,17 +2478,21 @@ class BubbleMenu(QWidget):
         path = QPainterPath()
         path.addRoundedRect(body, self.RADIUS, self.RADIUS)
         tx = float(self._tail_x)
-        lean = 1.0 if tx < self.width() / 2.0 else -1.0
-        base_y = body.top() if self._tail_top else body.bottom()
+        d = 1.0 if self._tail_top else -1.0                  # verso del pensiero: dal cursore al fumetto
         tip_y = float(self.MARGIN) if self._tail_top else self.height() - float(self.MARGIN)
-        bx1 = tx + lean * 3.0
-        bx2 = tx + lean * (3.0 + self.TAIL_W)
-        tail = QPainterPath()
-        tail.moveTo(bx1, base_y)
-        tail.lineTo(tx, tip_y)
-        tail.lineTo(bx2, base_y)
-        tail.closeSubpath()
-        return path.united(tail)
+        r1, r2, g = self.DOT_R1, self.DOT_R2, self.DOT_GAP
+        step = r2 + g + r1                                   # distanza verticale tra i centri dei due cerchi
+        if self._from_center is not None:
+            # la fila di cerchi giace sulla retta tra il centro della finestra e il cursore: il cerchio piccolo è il più vicino al centro
+            dx, dy = self._from_center
+            off = max(-12.0, min(12.0, dx / max(abs(dy), 1.0) * step))
+        else:
+            off = (7.0 if tx < self.width() / 2.0 else -7.0)
+        c2 = QPointF(tx, tip_y + d * r2)
+        c1 = QPointF(tx + off, tip_y + d * (2 * r2 + g + r1))
+        path.addEllipse(c1, r1, r1)
+        path.addEllipse(c2, r2, r2)
+        return path
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -2528,7 +2730,7 @@ class NekoPlayer(QMainWindow):
         self.container = BackgroundContainer(self.bg_pixmap, self.theme_color)
         self.setCentralWidget(self.container)
         self._video_aspect = None
-        self._video_fill_mode = "height"  # "height": adatta il video all'altezza; "width": alla larghezza
+        self._video_fill_mode = "height"  # "height": adatta il video all'altezza; "width": alla larghezza; "contain": angoli dentro l'ellisse
         self._last_display_frame = None   # ultima cornice mostrata, per ridisegnarla al volo
         # Modalità "minimal": dimensioni della finestra separate, salvate in config come window_minimal_*
         self._minimal_on = False              # stato del toggle (spunta nel menu col tasto destro)
@@ -2568,9 +2770,15 @@ class NekoPlayer(QMainWindow):
         self.whiskers_right = CatWhiskers(is_left=False)
         self.whiskers_left.clicked.connect(self.on_whiskers_clicked)
         self.whiskers_right.clicked.connect(self.on_whiskers_clicked)
+        for _wh in (self.whiskers_left, self.whiskers_right):
+            _wh.pull_window_moved.connect(self.on_whisker_pull_moved)
+            _wh.pull_ended.connect(self.on_whisker_pull_ended)
         self._shaking = False
         self._shake_origin = None
         self._shake_t0 = 0.0
+        self._shake_ph0 = 0.0          # istante d'inizio della vibrazione (la fase continua senza salti)
+        self._shake_hold = False       # baffo tenuto premuto: la vibrazione resta a piena ampiezza finché non si rilascia
+        self._shake_last_off = QPoint(0, 0)
         self._shake_timer = QTimer(self)
         self._shake_timer.setInterval(8)
         self._shake_timer.timeout.connect(self._shake_tick)
@@ -2632,18 +2840,28 @@ class NekoPlayer(QMainWindow):
         self.timeline_widget = QWidget()
         timeline_layout = QHBoxLayout()
         timeline_layout.setContentsMargins(0, 0, 0, 0)
-        self.slider = ClickableSlider(Qt.Horizontal)
-        self.slider.setObjectName("videoSlider")
-        self.slider.setRange(0, 1000)
-        self.slider.setValue(0)
-        self.slider.setFocusPolicy(Qt.NoFocus)
-        self.slider.sliderPressed.connect(self.on_slider_pressed)
-        self.slider.sliderReleased.connect(self.on_slider_released)
-        self.slider.sliderMoved.connect(self.on_slider_moved)
-        timeline_layout.addWidget(self.slider)
-        self.lbl_time = QLabel("00:00 / 00:00")
-        self.lbl_time.setStyleSheet("font-family: monospace; font-weight: bold; padding-left: 8px;")
-        timeline_layout.addWidget(self.lbl_time)
+        # due barre di avanzamento a collina affiancate (due occhi chiusi sorridenti), sincronizzate: muoverne una sposta anche l'altra
+        timeline_layout.setSpacing(0)
+        self.slider = EyeSlider()
+        self.slider_b = EyeSlider()
+        for sl in (self.slider, self.slider_b):
+            sl.setRange(0, 1000)
+            sl.setValue(0)
+            sl.setFocusPolicy(Qt.NoFocus)
+            sl.sliderPressed.connect(self.on_slider_pressed)
+            sl.sliderReleased.connect(self.on_slider_released)
+        def _link(src, dst):
+            def f(v):
+                if dst.value() != v:
+                    dst.blockSignals(True)
+                    dst.setValue(v)
+                    dst.blockSignals(False)
+                    dst.update()
+            src.valueChanged.connect(f)
+        _link(self.slider, self.slider_b)
+        _link(self.slider_b, self.slider)
+        timeline_layout.addWidget(self.slider, 1)
+        timeline_layout.addWidget(self.slider_b, 1)
         self.timeline_widget.setLayout(timeline_layout)
         self.controls_widget = QWidget()
         controls_layout = QVBoxLayout()
@@ -2810,13 +3028,13 @@ class NekoPlayer(QMainWindow):
         self.controls_panel.setAttribute(Qt.WA_StyledBackground, True)
         panel_lay = QVBoxLayout(self.controls_panel)
         panel_lay.setContentsMargins(10, 6, 10, 8)
-        panel_lay.setSpacing(5)
+        panel_lay.setSpacing(100)
         controls_layout.setSpacing(4)
         # le righe si centrano (non si stirano ai bordi) e vengono limitate alla corda dell'ellisse in _fit_rows_to_ellipse
         controls_layout.addWidget(nose_row, 0, Qt.AlignHCenter)
         controls_layout.addWidget(self.mouth_row, 0, Qt.AlignHCenter)
         self.controls_widget.setLayout(controls_layout)
-        panel_lay.addWidget(self.timeline_widget)
+        panel_lay.addWidget(self.timeline_widget, 0, Qt.AlignHCenter)   # larghezza fissata da _fit_timeline_eyes
         panel_lay.addWidget(self.controls_widget)
         self.container.setLayout(self.main_layout)
         #self.mouth_stem = MouthStemOverlay(self.controls_panel, self.slider_volume, self.btn_play_pause)
@@ -2842,9 +3060,13 @@ class NekoPlayer(QMainWindow):
     def _overlay_zone_rect(self):
         if not hasattr(self, "controls_panel"): return QRect()
         cw, ch = self.container.width(), self.container.height()
+        if getattr(self, "_minimal_on", False):
+            top = max(0, ch // 2 - 30)   # in minimal il pannello parte da metà finestra
+            return QRect(0, top, cw, ch - top)
         ph = self.controls_panel.sizeHint().height()
         band = max(120, ph + 46)
         top = max(0, ch - band)
+        top = min(top, max(0, ch // 2 - 100))   # il pannello parte da metà finestra (occhi sopra la metà)
         return QRect(0, top, cw, ch - top)
 
     def _has_video(self):
@@ -2933,6 +3155,8 @@ class NekoPlayer(QMainWindow):
             lay.invalidate()
             lay.activate()
         cw, ch = self.container.width(), self.container.height()
+        # in minimal il naso ha posizione fissa (parte da metà finestra) e la bocca sta a metà strada tra il centro del naso e il bordo inferiore
+        fixed_y = self._minimal_face_layout(ch)
         hint = self.controls_panel.sizeHint()
         h = hint.height()
         if self.isFullScreen() or self.isMaximized():
@@ -2945,10 +3169,83 @@ class NekoPlayer(QMainWindow):
             w = min(max_w, max(240, hint.width()))
             x = (cw - w) // 2
             y = max(8, ch - h - margin_bottom)
-            y = max(8, y - self._overlay_lift(y, h))   # se la corda dell'ellisse è troppo stretta, il pannello sale un poco
+            if fixed_y is None:
+                y = max(8, y - self._overlay_lift(y, h))   # se la corda dell'ellisse è troppo stretta, il pannello sale un poco
+        if fixed_y is None:
+            # la base degli occhi parte da metà finestra e i bottoni stanno subito sotto; se non c'è abbastanza spazio sotto,
+            # il pannello resta dove sarebbe stato (ancorato in basso)
+            mid_y = self._eyes_mid_y(ch)
+            if mid_y is not None: y = max(8, min(y, mid_y))
+        if fixed_y is not None:
+            w = max(1, min(cw, hint.width()))
+            x = (cw - w) // 2
+            self.controls_panel.setGeometry(x, fixed_y, w, h)
+            self.controls_panel.raise_()
+            self._fit_rows_to_ellipse(fixed_y, h)
+            return
         self.controls_panel.setGeometry(x, y, w, min(h, max(0, ch - 16)))
         self.controls_panel.raise_()
         self._fit_rows_to_ellipse(y, min(h, max(0, ch - 16)))
+
+    MINIMAL_REF_W, MINIMAL_REF_H = 203, 179   # dimensioni minimal fino a cui il layout sta nella finestra; sotto, naso e bocca traslano verso l'alto
+
+    def _minimal_numbers(self, ch):
+        """Posizioni del pannello in minimal per una finestra alta ch, senza traslazione:
+        (y del pannello, spaziatura tra naso e bocca, y alta della riga bocca, altezza riga bocca)."""
+        pl = self.controls_panel.layout()
+        hn = self.nose_row.sizeHint().height()
+        hm = self.mouth_row.sizeHint().height()
+        nose_h = self.btn_play_pause.height()
+        sl = self.slider_volume
+        mt = pl.contentsMargins().top()
+        nose_top_in_panel = mt + (hn - nose_h) // 2
+        # il "centro" della bocca: a metà tra il punto centrale (giunzione) e il punto più basso degli archi
+        depth = sl._depth_for_width(sl._mouth_w)
+        mouth_c_in_row = (hm - sl.height()) // 2 + MouthVolumeSlider.JUNCTION_Y + depth / 2.0
+        panel_y = ch // 2 - nose_top_in_panel                 # bordo alto del naso = metà finestra
+        nose_center = ch / 2.0 + nose_h / 2.0
+        mouth_center = (nose_center + ch) / 2.0               # metà strada tra centro naso e bordo inferiore
+        nose_row_bottom = panel_y + mt + hn
+        spacing = max(0, int(round(mouth_center - mouth_c_in_row - nose_row_bottom)))
+        return panel_y, spacing, nose_row_bottom + spacing, hm
+
+    def _minimal_clearance(self, W, H, y_eval):
+        """Margine (px) tra la corda dell'ellisse alla quota della bocca e la larghezza minima della riga bocca."""
+        inset = FRAME_BORDER_WIDTH + ELLIPSE_BAND
+        chord = int(2 * ellipse_half_width(W, H, y_eval, inset)) - 20
+        return chord - (self._mouth_row_base() + 96)
+
+    def _minimal_face_layout(self, ch):
+        """Modalità minimal: il naso (pulsante play) ha posizione fissa, il suo bordo alto sta a metà finestra e scende da lì;
+        la bocca (barra del volume) è centrata a metà strada tra il centro del naso e il bordo inferiore della finestra.
+        Sotto MINIMAL_REF_W x MINIMAL_REF_H, naso e bocca (spaziatura invariata) traslano verso l'alto quanto basta per
+        mantenere lo stesso margine dal bordo dell'ellisse che c'è a quelle dimensioni, così restano nella finestra.
+        Imposta la spaziatura tra le due righe e restituisce la y del pannello (None se minimal è spento)."""
+        cl = self.controls_widget.layout()
+        pl = self.controls_panel.layout()
+        if cl is None or pl is None: return None
+        if not getattr(self, "_minimal_on", False):
+            if cl.spacing() != 4:
+                cl.setSpacing(4)
+                pl.invalidate()
+                pl.activate()
+            return None
+        cl.setSpacing(4)
+        pl.invalidate()
+        pl.activate()
+        panel_y, spacing, mouth_top, hm = self._minimal_numbers(ch)
+        # margine di riferimento: quello che c'è alla dimensione minimal di riferimento
+        _, _, ref_top, _ = self._minimal_numbers(self.MINIMAL_REF_H)
+        ref_clear = self._minimal_clearance(self.MINIMAL_REF_W, self.MINIMAL_REF_H, ref_top + hm - self._mouth_eval_h(hm))
+        y_eval = mouth_top + hm - self._mouth_eval_h(hm)
+        W, H = self.width(), self.height()
+        lift = 0
+        for lift in range(0, max(0, panel_y) + 1):   # il pannello non esce dal bordo alto
+            if self._minimal_clearance(W, H, y_eval - lift) >= ref_clear: break
+        cl.setSpacing(spacing)
+        pl.invalidate()
+        pl.activate()
+        return panel_y - int(lift * 0.6)   # la salita è il 60% di quella calcolata
 
     def _overlay_lift(self, y, h):
         """Di quanti px alzare il pannello perché la riga inferiore (con lo slider volume al minimo) stia nella corda dell'ellisse."""
@@ -2961,7 +3258,7 @@ class NekoPlayer(QMainWindow):
         best = 0
         for lift in range(0, max_lift + 1, 2):
             best = lift
-            if self._ellipse_chord(y - lift + h - 8 - self._row_eval_h(hm)) >= need: break
+            if self._ellipse_chord(y - lift + h - 8 - self._mouth_eval_h(hm)) >= need: break
         return best
 
     def _mouth_target(self):
@@ -2973,6 +3270,11 @@ class NekoPlayer(QMainWindow):
         return self.mouth_row.sizeHint().width() - self.slider_volume.width()
 
     @staticmethod
+    def _mouth_eval_h(row_h):
+        """Come _row_eval_h, per la riga bocca: il punto centrale della bocca sta in alto nel widget."""
+        return max(0.3 * row_h, row_h - 21.0)
+
+    @staticmethod
     def _row_eval_h(row_h):
         """Altezza sopra il bordo inferiore della riga a cui si misura la corda dell'ellisse."""
         return max(0.3 * row_h, 0.5 * row_h - 8)
@@ -2981,6 +3283,52 @@ class NekoPlayer(QMainWindow):
         """Larghezza utile (in px) dell'ellisse visibile alla quota y (coordinate finestra), meno un margine per lato."""
         inset = FRAME_BORDER_WIDTH + ELLIPSE_BAND
         return int(2 * ellipse_half_width(self.width(), self.height(), y, inset)) - 2 * margin
+
+    def _fit_timeline_eyes(self):
+        """Gli occhi (barre a collina) si allargano seguendo la larghezza della finestra fino al limite `larghezza_occhi`
+        (per ciascun occhio), con una distanza tra loro; più sono larghi, più alta è la collina.
+        Ritorna True se larghezza, distanza o altezza sono cambiate (il pannello va ridisposto)."""
+        if getattr(self, "_minimal_on", False) or not hasattr(self, "timeline_widget"): return False
+        pl = self.controls_panel.layout()
+        m = pl.contentsMargins()
+        pad = EyeSlider.PAD
+        inner = self.controls_panel.width() - m.left() - m.right()
+        # larghezza disponibile: corda dell'ellisse alla quota della base degli occhi (metà finestra), nel pannello
+        chord = self._ellipse_chord(self.height() / 2.0)
+        avail = max(60, min(inner, chord))
+        R = EyeSlider.GAP_RATIO
+        e1 = (avail - 4 * pad) / (2.0 * (1.0 + R))                 # larghezza d'arco libera con distanza proporzionale
+        if 2 * R * e1 < EyeSlider.GAP_MIN: e1 = (avail - 4 * pad - EyeSlider.GAP_MIN) / 2.0
+        eye_arc = max(10.0, min(float(larghezza_occhi), e1))       # larghezza di ciascun arco, limitata a larghezza_occhi
+        gap = int(max(EyeSlider.GAP_MIN, 2 * R * eye_arc))         # distanza tra i due occhi
+        ew = int(round(eye_arc + 2 * pad))                         # larghezza del widget di un occhio
+        tw = 2 * ew + gap
+        depth = EyeSlider.depth_for_width(eye_arc)
+        # gli occhi salgono dalla metà finestra: la collina non deve uscire dal bordo alto
+        room = (self.container.height() - 2 * (FRAME_BORDER_WIDTH + ELLIPSE_BAND) - self.controls_widget.sizeHint().height()
+                - m.top() - m.bottom() - pl.spacing() - EyeSlider.TOP - EyeSlider.BOTTOM)
+        depth = max(8.0, min(depth, room))
+        changed = False
+        if self.timeline_widget.width() != tw or self.timeline_widget.minimumWidth() != tw:
+            self.timeline_widget.setFixedWidth(tw)
+            changed = True
+        tl = self.timeline_widget.layout()
+        if tl.spacing() != gap:
+            tl.setSpacing(gap)
+            changed = True
+        for sl in (self.slider, self.slider_b):
+            if sl.minimumWidth() != ew or sl.maximumWidth() != ew:
+                sl.setFixedWidth(ew)
+                changed = True
+            if sl.set_arc_depth(depth): changed = True
+        return changed
+
+    def _eyes_mid_y(self, ch):
+        """y del pannello per cui la base degli occhi sta a metà finestra (i bottoni della riga sotto restano subito sotto di loro);
+        None se la timeline non è visibile (minimal)."""
+        if getattr(self, "_minimal_on", False) or self.timeline_widget.isHidden(): return None
+        mt = self.controls_panel.layout().contentsMargins().top()
+        return int(round(ch // 2 +40 -(mt + self.slider.height() - EyeSlider.BOTTOM)))   # int: setGeometry non accetta float
 
     def _fit_rows_to_ellipse(self, py, ph):
         """Limita le due righe di bottoni alla corda dell'ellisse alla loro quota, così non escono dalla forma
@@ -2995,13 +3343,14 @@ class NekoPlayer(QMainWindow):
             hn = self.nose_row.sizeHint().height()
             yb_m = py + ph - 8          # margine inferiore interno del pannello
             yb_n = yb_m - hm - 4        # spaziatura tra le due righe
-            cap_m = self._ellipse_chord(yb_m - self._row_eval_h(hm))
+            cap_m = self._ellipse_chord(yb_m - self._mouth_eval_h(hm))
             cap_n = self._ellipse_chord(yb_n - self._row_eval_h(hn))
             self.mouth_row.setMaximumWidth(max(120, cap_m))
             self.nose_row.setMaximumWidth(max(120, cap_n))
+        tl_changed = self._fit_timeline_eyes()
         changed = cap_m != getattr(self, "_mouth_row_cap", None)
         self._mouth_row_cap = cap_m
-        if changed and not getattr(self, "_fitting", False):
+        if (changed or tl_changed) and not getattr(self, "_fitting", False):
             self._fitting = True
             try:
                 self._scale_mouth()
@@ -3021,7 +3370,7 @@ class NekoPlayer(QMainWindow):
         if getattr(self, "is_slider_dragged", False):
             self._overlay_hide_timer.start()
             return
-        if self.slider.isSliderDown() or getattr(self.slider_volume, "_dragging", False):
+        if self.slider.isSliderDown() or self.slider_b.isSliderDown() or getattr(self.slider_volume, "_dragging", False):
             self._overlay_hide_timer.start()
             return
         if self._controls_hover:
@@ -3079,16 +3428,49 @@ class NekoPlayer(QMainWindow):
 
     def on_whiskers_clicked(self):
         self.trigger_whiskers_wiggle()
+        self._shake_hold = True   # la testa vibra finché il baffo è tenuto premuto
         self.shake_head()
+
+    def on_whisker_pull_moved(self, w: QPoint):
+        """Baffo tirato oltre il 150%: la finestra (con orecchie e baffi) segue il cursore di `w` px.
+        Se la testa sta vibrando, la vibrazione continua attorno alla nuova posizione."""
+        if self.isFullScreen() or self.isMaximized() or self.isMinimized(): return
+        if not self._drag_active:
+            if self._resize_active: return
+            keep = self._shaking
+            origin = QPoint(self._shake_origin) if keep else None
+            self._arc_drag_start(QCursor.pos(), keep_shake=keep)
+            if not self._drag_active: return
+            if keep:
+                # posizione di partenza = quella senza lo scarto della vibrazione
+                self._drag_fg0 = self._drag_fg0.translated(origin - self.pos())
+                self._drag_pos0 = origin
+                self._drag_fg = QRect(self._drag_fg0)
+        if self._shaking:
+            self._shake_origin = self._drag_pos0 + w
+            self._apply_shake_pos(self._shake_last_off)
+        else:
+            self.move(self._drag_pos0 + w)
+            self._drag_fg = self._drag_fg0.translated(w)
+        self.sync_ears_position()
+        QApplication.flush()
+
+    def on_whisker_pull_ended(self):
+        self._shake_hold = False
+        if self._shaking: self._shake_t0 = time.monotonic()   # da qui la vibrazione si smorza
+        if self._drag_active: self._arc_drag_end()
+        self.trigger_whiskers_wiggle()
 
     def shake_head(self):
         """Fa vibrare la testa (finestra + orecchie + baffi, che la seguono) per un istante."""
         if self.isFullScreen() or self.isMaximized() or self.isMinimized() or not self.isVisible(): return
         if self._drag_active or self._resize_active: return
+        now = time.monotonic()
         if not self._shaking:
             self._shake_origin = QPoint(self.pos())
             self._shaking = True
-        self._shake_t0 = time.monotonic()
+            self._shake_ph0 = now
+        self._shake_t0 = now
         if not self._shake_timer.isActive(): self._shake_timer.start()
 
     def _stop_shake(self, restore=True):
@@ -3099,17 +3481,28 @@ class NekoPlayer(QMainWindow):
         if restore and origin is not None and not (self.isFullScreen() or self.isMaximized()):
             self.move(origin)
 
+    def _apply_shake_pos(self, off: QPoint):
+        self._shake_last_off = QPoint(off)
+        target = self._shake_origin + off
+        self.move(target)
+        if self._drag_active:
+            self._drag_fg = self._drag_fg0.translated(target - self._drag_pos0)   # orecchie e baffi seguono la vibrazione
+
     def _shake_tick(self):
         if not self._shaking: return self._shake_timer.stop()
         if self.isFullScreen() or self.isMaximized() or self.isMinimized():
             return self._stop_shake(restore=False)
-        t = time.monotonic() - self._shake_t0
-        if t >= HEAD_SHAKE_DURATION: return self._stop_shake()
-        damp = (1.0 - t / HEAD_SHAKE_DURATION) ** 2
-        ph = 2.0 * math.pi * HEAD_SHAKE_FREQ * t
+        now = time.monotonic()
+        if self._shake_hold:
+            damp = 1.0   # baffo tenuto premuto: ampiezza costante
+        else:
+            t = now - self._shake_t0
+            if t >= HEAD_SHAKE_DURATION: return self._stop_shake()
+            damp = (1.0 - t / HEAD_SHAKE_DURATION) ** 2
+        ph = 2.0 * math.pi * HEAD_SHAKE_FREQ * (now - self._shake_ph0)
         dx = HEAD_SHAKE_AMPLITUDE * damp * math.sin(ph)
         dy = 0.5 * HEAD_SHAKE_AMPLITUDE * damp * math.sin(ph * 1.3 + 1.0)
-        self.move(self._shake_origin + QPoint(int(round(dx)), int(round(dy))))
+        self._apply_shake_pos(QPoint(int(round(dx)), int(round(dy))))
 
     def isFullScreen(self): return self._fs if BYPASS_WM else super().isFullScreen()
 
@@ -3232,8 +3625,8 @@ class NekoPlayer(QMainWindow):
     def _current_frame_geometry(self):
         return self._drag_fg if self._drag_fg is not None else self.frameGeometry()
 
-    def _arc_drag_start(self, gpos):
-        self._stop_shake()
+    def _arc_drag_start(self, gpos, keep_shake=False):
+        if not keep_shake: self._stop_shake()
         if self.isFullScreen() or self.isMaximized() or self.isMinimized(): return
         self._drag_cursor0 = QPoint(gpos)
         self._drag_pos0 = self.pos()
@@ -3284,7 +3677,7 @@ class NekoPlayer(QMainWindow):
         self._whiskers_key = None
         # A minimal spento, la nuova posizione diventa quella "normale" da ripristinare
         if not getattr(self, "_minimal_on", False):
-            self._normal_pos_before_minimal = QPoint(self.pos())
+            self._normal_pos_before_minimal = QPoint(self._shake_origin) if self._shaking else QPoint(self.pos())
         self.sync_ears_position()
         self.save_settings()
 
@@ -3416,35 +3809,38 @@ class NekoPlayer(QMainWindow):
         ear_h = ear_w * (float(CatEar.BASE_HEIGHT) / float(CatEar.BASE_WIDTH))
         anchor_x = self.ear_left.anchor_x
         anchor_y = self.ear_left.anchor_y
-        def place(c, bc, outer_is_left):
+        def place(c, bc):
             x1, x2 = c
             y1, y2 = top_y(x1), top_y(x2)
-            if outer_is_left: y1 += EARS_OUTER_CORNER_DY    # angolo esterno = quello verso il bordo della finestra
-            else: y2 += EARS_OUTER_CORNER_DY
-            ang = math.degrees(math.atan2(y2 - y1, x2 - x1))
+            # i due angoli della base stanno ESATTAMENTE sull'ellisse: la base segue la corda (phi); l'asse verticale
+            # dell'orecchio ruota invece solo in proporzione all'altezza della finestra: a finestra bassa l'orecchio
+            # resta dritto (la base si inclina senza ruotarlo), da EARS_ROTATION_REF_HEIGHT in su ruota del tutto
+            phi = math.atan2(y2 - y1, x2 - x1)
+            k = max(0.0, min(1.0, h / EARS_ROTATION_REF_HEIGHT))
+            ang = math.degrees(phi) * k
             # punto medio della base visibile nel sistema locale dell'orecchio (origine = ancora)
             mx = ((bc[0] + bc[1]) / 2.0 - 0.5) * ear_w
             my = (bc[2] - 1.0) * ear_h
-            th = math.radians(ang)
-            ax = (x1 + x2) / 2.0 - (mx * math.cos(th) - my * math.sin(th))
-            ay = (y1 + y2) / 2.0 - (mx * math.sin(th) + my * math.cos(th))
-            return ang, ax - anchor_x, ay - anchor_y
-        angle_l, rel_x_l, rel_y_l = place(corners_l, bl, True)
-        angle_r, rel_x_r, rel_y_r = place(corners_r, br, False)
+            sa, ca = math.sin(math.radians(ang)), math.cos(math.radians(ang))
+            ax = (x1 + x2) / 2.0 - (mx * math.cos(phi) - my * sa)
+            ay = (y1 + y2) / 2.0 - (mx * math.sin(phi) + my * ca)
+            return ang, math.degrees(phi), ax - anchor_x, ay - anchor_y
+        angle_l, base_l, rel_x_l, rel_y_l = place(corners_l, bl)
+        angle_r, base_r, rel_x_r, rel_y_r = place(corners_r, br)
         rel_x_l, rel_y_l, rel_x_r, rel_y_r = (int(round(v)) for v in (rel_x_l, rel_y_l, rel_x_r, rel_y_r))
         # Quota (rispetto al bordo superiore della finestra) della punta più alta delle orecchie
-        tip_l = rel_y_l + anchor_y - self.ear_left.top_reach(angle_l, ear_w, ear_h)
-        tip_r = rel_y_r + anchor_y - self.ear_right.top_reach(angle_r, ear_w, ear_h)
+        tip_l = rel_y_l + anchor_y - self.ear_left.top_reach(angle_l, ear_w, ear_h, base_l)
+        tip_r = rel_y_r + anchor_y - self.ear_right.top_reach(angle_r, ear_w, ear_h, base_r)
         return {
-            "angle_l": angle_l, "angle_r": angle_r, "ear_w": ear_w, "ear_h": ear_h,
+            "angle_l": angle_l, "angle_r": angle_r, "base_l": base_l, "base_r": base_r, "ear_w": ear_w, "ear_h": ear_h,
             "rel_l": QPoint(rel_x_l, rel_y_l), "rel_r": QPoint(rel_x_r, rel_y_r),
             "tip_top": min(tip_l, tip_r),
         }
 
     def _recompute_ears_geometry(self, w: float, h: float):
         lay = self._ears_layout(w, h)
-        self.ear_left.set_ear_config(lay["angle_l"], lay["ear_w"], lay["ear_h"])
-        self.ear_right.set_ear_config(lay["angle_r"], lay["ear_w"], lay["ear_h"])
+        self.ear_left.set_ear_config(lay["angle_l"], lay["ear_w"], lay["ear_h"], lay["base_l"])
+        self.ear_right.set_ear_config(lay["angle_r"], lay["ear_w"], lay["ear_h"], lay["base_r"])
         self._ear_rel_l = lay["rel_l"]
         self._ear_rel_r = lay["rel_r"]
 
@@ -3521,6 +3917,16 @@ class NekoPlayer(QMainWindow):
     def fit_width_to_screen(self): self.fit_to_screen(True, False)
     def fit_all_to_screen(self): self.fit_to_screen(True, True)
 
+    def _video_native_ratio(self):
+        """Aspect ratio nativo (larghezza/altezza) del video corrente, o None."""
+        frame = self._last_display_frame
+        vw, vh = (frame.shape[1], frame.shape[0]) if frame is not None else (0, 0)
+        if vw <= 0 or vh <= 0:
+            pm = self.video_display.pixmap()
+            if pm is not None and not pm.isNull(): vw, vh = pm.width(), pm.height()
+        if vw <= 0 or vh <= 0: return None
+        return vw / float(vh)
+
     def show_context_bubble(self, gpos):
         if getattr(self, "_bubble", None) is not None:
             try: self._bubble.close()
@@ -3528,16 +3934,18 @@ class NekoPlayer(QMainWindow):
         can_fit = not (self.isFullScreen() or self.isMaximized() or self.isMinimized())
         has_video = self._has_video()
         self._bubble = BubbleMenu([
+            ("Apri file…", self.select_video, True),
             ("Adatta altezza", self.fit_height_to_screen, can_fit),
             ("Adatta larghezza", self.fit_width_to_screen, can_fit),
             ("Adatta tutto", self.fit_all_to_screen, can_fit),
+            ("Adatta video", lambda: self.set_video_fill_mode("contain"), has_video),
             ("Adatta video L", lambda: self.set_video_fill_mode("width"), has_video),
             ("Adatta video H", lambda: self.set_video_fill_mode("height"), has_video),
             # Toggle: dimensioni separate "minimal" (salvate in config come window_minimal_*)
             ("Minimal", self.toggle_minimal_mode, can_fit, bool(self._minimal_on)),
             self._shaders_menu_item(gpos),
         ])
-        self._bubble.popup_at(gpos)
+        self._bubble.popup_at(gpos, self.frameGeometry().center())
 
     def _shader_files(self):
         try:
@@ -3560,7 +3968,7 @@ class NekoPlayer(QMainWindow):
         files = self._shader_files()
         if not files: return
         self._bubble = BubbleMenu(self._shader_menu_items(), keep_open=True, refresh=self._shader_menu_items)
-        self._bubble.popup_at(gpos)
+        self._bubble.popup_at(gpos, self.frameGeometry().center())
 
     def _shader_menu_items(self):
         items = [("Disattiva tutti", self.clear_shaders, bool(self.active_shaders))]
@@ -3671,6 +4079,8 @@ class NekoPlayer(QMainWindow):
             if restore_pos is not None:
                 self.move(restore_pos)
             self._normal_pos_before_minimal = None
+        self._scale_mouth()
+        self._layout_overlay()
         self.save_settings()
 
     def sync_ears_position(self):
@@ -3732,12 +4142,12 @@ class NekoPlayer(QMainWindow):
         # lunghezza e spaziatura seguono la dimensione "equivalente" della vecchia finestra rettangolare
         eq_w = max(1.0, (fg.width() - 2 * FRAME_BORDER_WIDTH) / LEGACY_SIZE_GROWTH)
         eq_h = max(1.0, (fg.height() - 2 * FRAME_BORDER_WIDTH) / LEGACY_SIZE_GROWTH)
-        sx = eq_w / float(WHISKERS_REF_WIDTH) * WHISKERS_LENGTH_SCALE   # lunghezza: segue la larghezza
-        sy = eq_h / float(WHISKERS_REF_HEIGHT)                          # distanza tra i baffi e spessore: seguono l'altezza
+        sx = max(WHISKERS_MIN_LENGTH_SCALE, eq_w / float(WHISKERS_REF_WIDTH) * WHISKERS_LENGTH_SCALE)   # lunghezza: segue la larghezza (con minimo)
+        sy = max(WHISKERS_MIN_SPACING_SCALE, eq_h / float(WHISKERS_REF_HEIGHT))                          # distanza tra i baffi: segue l'altezza (con minimo); lo spessore ha il suo minimo
         self.whiskers_left.set_scale(sx, sy)
         self.whiskers_right.set_scale(sx, sy)
-        w_w = self.whiskers_left.width()
-        w_h = self.whiskers_left.height()
+        w_w = self.whiskers_left.base_size().width()
+        w_h = self.whiskers_left.base_size().height()
         inset = int(round(15 * sx))
         rel_y = int(fg.height() * 0.58)
         whisker_y = fg.y() + rel_y - (w_h // 2)
@@ -3750,8 +4160,8 @@ class NekoPlayer(QMainWindow):
         if newly_shown:
             self.whiskers_left.show()
             self.whiskers_right.show()
-        pos_l = QPoint(left_x, whisker_y)
-        pos_r = QPoint(right_x, whisker_y)
+        pos_l = QPoint(left_x, whisker_y) - self.whiskers_left.origin_offset()    # in trazione il widget sporge verso l'esterno
+        pos_r = QPoint(right_x, whisker_y) - self.whiskers_right.origin_offset()
         if self.whiskers_left.pos() != pos_l: self.whiskers_left.move(pos_l)
         if self.whiskers_right.pos() != pos_r: self.whiskers_right.move(pos_r)
         if newly_shown or self._ears_force_raise:
@@ -3763,7 +4173,7 @@ class NekoPlayer(QMainWindow):
             scaled = self.bg_pixmap.scaled(self.video_display.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.video_display.setPixmap(scaled)
         else:
-            self.video_display.setText("🐾 Neko Player\nNessun video caricato.\n[Tasto Q = Chiudi | 🎨 = Colore]")
+            self.video_display.clear()   # nessuna scritta nella finestra quando non c'è un video
 
     def _scale_mouth(self):
         if hasattr(self, "slider_volume"):
@@ -3935,7 +4345,7 @@ class NekoPlayer(QMainWindow):
             self.chk_texture.setChecked(saved_texture)
             self.container.set_show_texture(saved_texture)
             saved_fill = config_data.get("video_fill_mode", "height")
-            if saved_fill in ("width", "height"): self._video_fill_mode = saved_fill
+            if saved_fill in ("width", "height", "contain"): self._video_fill_mode = saved_fill
             # Stato e dimensioni separate della modalità "minimal"
             # (le dimensioni minimal sostituiscono window_width/height: verranno salvate
             #  al prossimo write, così le due coppie restano sempre coerenti con lo stato)
@@ -4128,20 +4538,15 @@ class NekoPlayer(QMainWindow):
             self.audio_player.setPosition(target_ms)
             self.worker.request_seek_frame(target_frame)
 
-    def on_slider_moved(self, value):
-        if self.slider.maximum() > 0:
-            ratio = value / self.slider.maximum()
-            cur_sec = ratio * self.total_duration_sec
-            self.lbl_time.setText(f"{format_time(cur_sec)} / {format_time(self.total_duration_sec)}")
-
     def update_timeline(self, cur_frame, total_frames, cur_sec, total_sec):
         self.total_duration_sec = total_sec
         if not self.is_slider_dragged:
-            self.slider.blockSignals(True)
-            self.slider.setMaximum(total_frames)
-            self.slider.setValue(cur_frame)
-            self.slider.blockSignals(False)
-            self.lbl_time.setText(f"{format_time(cur_sec)} / {format_time(total_sec)}")
+            for sl in (self.slider, self.slider_b):
+                sl.blockSignals(True)
+                sl.setMaximum(total_frames)
+                sl.setValue(cur_frame)
+                sl.blockSignals(False)
+                sl.update()
 
     def _remember_current_position(self):
         """Salva il timestamp del video attualmente caricato (per riprenderlo alla riapertura)."""
@@ -4316,8 +4721,8 @@ class NekoPlayer(QMainWindow):
             self.btn_play_pause.set_playing(True)
 
     def set_video_fill_mode(self, mode):
-        """Cambia il riempimento della finestra per il video: "width" o "height"."""
-        if mode not in ("width", "height"): return
+        """Cambia il riempimento della finestra per il video: "width", "height" o "contain"."""
+        if mode not in ("width", "height", "contain"): return
         self._video_fill_mode = mode
         self.save_settings()
         # Ridisegna subito l'ultima cornice con il nuovo riempimento
@@ -4337,12 +4742,30 @@ class NekoPlayer(QMainWindow):
         pixmap = QPixmap.fromImage(q_img)
         target = self.video_display.size()
         tw, th = target.width(), target.height()
-        if getattr(self, "_video_fill_mode", "height") == "width":
+        fill_mode = getattr(self, "_video_fill_mode", "height")
+        if fill_mode == "width":
             # Adatta alla larghezza dell'area centrale; se è più alto, taglia sopra/sotto (centrato)
             if tw > 0 and abs(pixmap.width() - tw) > 1:
                 pixmap = pixmap.scaledToWidth(tw, Qt.FastTransformation)
             if th > 0 and pixmap.height() > th:
                 pixmap = pixmap.copy(0, (pixmap.height() - th) // 2, pixmap.width(), th)
+        elif fill_mode == "contain":
+            # Adatta il video in modo che i 4 angoli siano contenuti nell'ellisse della finestra.
+            # La finestra è un'ellisse x²/a² + y²/b² = 1 con semiassi a=tw/2, b=th/2; il display
+            # è centrato nella finestra, quindi l'ellisse ha gli stessi assi del display.
+            # Il rettangolo video centrato (±W/2, ±H/2), con aspect ratio r=w/h, è inscritto
+            # quando W²/tw² + H²/th² = 1 con W = r·H, da cui:
+            #   H_max = tw·th / sqrt((r·th)² + tw²),  W_max = r · H_max
+            if tw > 0 and th > 0 and w > 0 and h > 0:
+                if self.isFullScreen() or self.isMaximized():
+                    pixmap = pixmap.scaled(tw, th, Qt.KeepAspectRatio, Qt.FastTransformation)
+                else:
+                    r = w / float(h)
+                    denom = math.hypot(r * th, tw)
+                    if denom > 0:
+                        target_h = max(1, int(round((tw * th) / denom)))
+                        target_w = max(1, int(round(r * target_h)))
+                        pixmap = pixmap.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.FastTransformation)
         else:
             # Adatta all'altezza dell'area centrale; se è più largo, taglia i lati (centrato)
             if th > 0 and abs(pixmap.height() - th) > 1:
