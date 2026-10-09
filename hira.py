@@ -145,7 +145,7 @@ STILE = """
 QDialog, QFileDialog { background: %(bg)s; color: %(text)s; }
 QScrollArea { background: transparent; border: none; }
 QWidget { color: %(text)s; font-size: 13px;
-          font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", "Noto Sans CJK JP", "Hiragino Sans", sans-serif; }
+         font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", "Noto Sans CJK JP", "Hiragino Sans", sans-serif; }
 QFrame#card { background: %(card)s; border: 1px solid %(border)s; border-radius: 12px; }
 QLabel { background: transparent; }
 QLabel#titolo { font-size: 22px; font-weight: 700; }
@@ -373,6 +373,120 @@ def distribuisci(testo, t0, t1):
 
 
 # ---------------------------------------------------------------------------
+# Formato karaoke compatto (versione 2)
+#
+# Il formato v1 salvava ogni informazione piu' volte (testo completo, testo
+# hiragana, intervalli di ogni token, token, indice del segmento, tempi con 15+
+# decimali). Nella v2 si salvano solo i token con i loro tempi: testi e intervalli
+# si ricostruiscono al caricamento.
+#   "s": [ [prefisso_segmento, [token, ...]], ... ]
+#   token = [orig, t0, t1]            se hiragana == orig
+#         = [orig, hira, t0, t1]      altrimenti
+# ---------------------------------------------------------------------------
+def testo_righe(righe):
+    """Unisce le righe con a-capo e restituisce (testo, intervalli UTF-16 di ogni riga)."""
+    spans, pos = [], 0
+    for r in righe:
+        n = l16(r)
+        spans.append((pos, pos + n))
+        pos += n + 1
+    return "\n".join(righe), spans
+
+
+def _u16_slice(s, a, b):
+    return s.encode("utf-16-le")[2 * a:2 * b].decode("utf-16-le")
+
+
+def karaoke_espandi(d):
+    """Da formato v2 a v1 (quello usato internamente). I dati v1 passano invariati."""
+    if d.get("versione", 1) < 2:
+        return d
+    if "s" not in d:
+        raise ValueError("File karaoke non valido: manca 's'.")
+
+    orig, hira = [], []
+    span_o, span_h, t0, t1 = [], [], [], []
+    tok_o, tok_h, tok_seg = [], [], []
+    po = ph = 0
+
+    for n, (pre, toks) in enumerate(d["s"]):
+        orig.append(pre)
+        hira.append(pre)
+        po += l16(pre)
+        ph += l16(pre)
+        for e in toks:
+            if len(e) == 3:
+                o, a, b = e
+                h = o
+            else:
+                o, h, a, b = e
+            orig.append(o)
+            hira.append(h)
+            span_o.append((po, po + l16(o)))
+            span_h.append((ph, ph + l16(h)))
+            po += l16(o)
+            ph += l16(h)
+            t0.append(a)
+            t1.append(b)
+            tok_o.append(o)
+            tok_h.append(h)
+            tok_seg.append(n)
+
+    out = {k: v for k, v in d.items() if k not in ("s", "tr")}
+    if d.get("tr"):
+        out["trad"] = dict(
+            righe=[e[0] for e in d["tr"]],
+            t0=[e[1] for e in d["tr"]],
+            t1=[e[2] for e in d["tr"]],
+        )
+    out.update(
+        orig="".join(orig), hira="".join(hira),
+        span_o=span_o, span_h=span_h, t0=t0, t1=t1,
+        tok=dict(o=tok_o, h=tok_h, seg=tok_seg),
+    )
+    return out
+
+
+def karaoke_compatto(r):
+    """Dal risultato della trascrizione al dizionario v2 (senza meta-dati del file).
+    Restituisce None se i dati non sono ricostruibili esattamente: in quel caso
+    il chiamante ricade sul formato v1."""
+    tok = r["tok"]
+    n = len(r["t0"])
+    segs = []
+    fine = 0
+    for i in range(n):
+        a, b = r["span_o"][i]
+        if i == 0 or tok["seg"][i] != tok["seg"][i - 1]:
+            segs.append([_u16_slice(r["orig"], fine, a), []])
+        elif a != fine:
+            return None
+        o, h = tok["o"][i], tok["h"][i]
+        a0, a1 = round(float(r["t0"][i]), 2), round(float(r["t1"][i]), 2)
+        segs[-1][1].append([o, a0, a1] if h == o else [o, h, a0, a1])
+        fine = b
+
+    d = dict(versione=2, s=segs)
+    tr = r.get("trad")
+    if tr and tr.get("righe"):
+        d["tr"] = [[t, round(float(a), 2), round(float(b), 2)]
+                   for t, a, b in zip(tr["righe"], tr["t0"], tr["t1"])]
+
+    # verifica: la ricostruzione deve riprodurre esattamente testi e intervalli
+    try:
+        x = karaoke_espandi(d)
+    except Exception:
+        return None
+    if (x["orig"] != r["orig"] or x["hira"] != r["hira"]
+            or [tuple(v) for v in r["span_o"]] != x["span_o"]
+            or [tuple(v) for v in r["span_h"]] != x["span_h"]
+            or tok["o"] != x["tok"]["o"] or tok["h"] != x["tok"]["h"]
+            or list(tok["seg"]) != x["tok"]["seg"]):
+        return None
+    return d
+
+
+# ---------------------------------------------------------------------------
 # Thread: decodifica audio + calcolo livelli in dB
 # ---------------------------------------------------------------------------
 class Decoder(QThread):
@@ -546,27 +660,35 @@ class Worker(QThread):
 
             model, device, compute_type = self._load_model()
 
-            self.stato.emit("Trascrivo con faster-whisper...")
+            self.stato.emit("Trascrivo con faster-whisper{}...".format(
+                " (passaggio 1/2: giapponese)" if p.get("doppio") and p["lingua"] not in (None, "ja") else ""))
 
             use_words = bool(p["parole"])
 
-            common = dict(
-                language=p["lingua"],
-                task="transcribe",
-                beam_size=5,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500),
-                condition_on_previous_text=False,
-                initial_prompt=(p["prompt_iniziale"] or None),
-                temperature=0.0,
-                compression_ratio_threshold=2.0,
-            )
+            # Lingua diversa dal giapponese + "doppio passaggio": il testo giapponese
+            # (kanji + hiragana, con tempi per parola) si ricava con un passaggio in
+            # giapponese; il testo nella lingua scelta (es. italiano) con un secondo.
+            doppio = bool(p.get("doppio")) and p["lingua"] not in (None, "ja")
+            lingua_jp = "ja" if doppio else p["lingua"]
 
-            def _consume(word_timestamps):
+            def _opzioni(lang, con_prompt):
+                return dict(
+                    language=lang,
+                    task="transcribe",
+                    beam_size=5,
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=500),
+                    condition_on_previous_text=False,
+                    initial_prompt=(p["prompt_iniziale"] or None) if con_prompt else None,
+                    temperature=0.0,
+                    compression_ratio_threshold=2.0,
+                )
+
+            def _consume(lang, word_timestamps, con_prompt=True):
                 segments_iter, info = model.transcribe(
                     path,
                     word_timestamps=word_timestamps,
-                    **common
+                    **_opzioni(lang, con_prompt)
                 )
                 return list(segments_iter), info
 
@@ -574,18 +696,18 @@ class Worker(QThread):
             info = None
 
             try:
-                raw_segments, info = _consume(use_words)
+                raw_segments, info = _consume(lingua_jp, use_words)
             except Exception as e:
                 if use_words:
                     self.stato.emit(
                         "Word timestamps non disponibili: uso sincronizzazione per segmento."
                     )
                     use_words = False
-                    raw_segments, info = _consume(False)
+                    raw_segments, info = _consume(lingua_jp, False)
                 else:
                     raise
 
-            lingua = p["lingua"] or getattr(info, "language", "") or ""
+            lingua = lingua_jp or getattr(info, "language", "") or ""
 
             self.stato.emit("Converto in hiragana e calcolo la sincronizzazione...")
 
@@ -596,6 +718,29 @@ class Worker(QThread):
             except ImportError:
                 kk_ok = False
                 avviso = " (pykakasi mancante: hiragana non convertito)"
+
+            trad = None
+            if doppio:
+                self.stato.emit("Passaggio 2/2: testo in '{}'...".format(p["lingua"]))
+                try:
+                    raw_tr, _ = _consume(p["lingua"], False, False)
+                    righe, tt0, tt1 = [], [], []
+                    prec_t, prev_t = None, 0.0
+                    for seg in raw_tr:
+                        testo = (getattr(seg, "text", "") or "").strip()
+                        if not testo or testo == prec_t:
+                            continue
+                        prec_t = testo
+                        a = max(float(getattr(seg, "start", 0.0)) + p["inizio"], prev_t)
+                        b = max(float(getattr(seg, "end", a)) + p["inizio"], a)
+                        prev_t = a
+                        righe.append(testo.replace("\n", " "))
+                        tt0.append(a)
+                        tt1.append(b)
+                    if righe:
+                        trad = dict(righe=righe, t0=tt0, t1=tt1)
+                except Exception as e:
+                    avviso += " (secondo passaggio non riuscito: {})".format(e)
 
             def hira_di(t):
                 if not kk_ok:
@@ -707,6 +852,7 @@ class Worker(QThread):
                 t1=[t[1] for t in tempi],
                 avviso=avviso,
                 tok=dict(o=tok_o, h=tok_h, seg=tok_seg),
+                trad=trad,
             ))
 
         except FileNotFoundError:
@@ -1048,6 +1194,39 @@ class Evidenziatore:
 
         self.ed.setExtraSelections(sels)
 
+    def aggiorna_frazione(self, idx, f):
+        """Come aggiorna(), ma la riga idx e' illuminata solo per la frazione f (0..1)."""
+        if not self.spans:
+            return
+
+        fine = 0
+        a = 0
+        if idx >= 0:
+            idx = min(idx, len(self.spans) - 1)
+            a, b = self.spans[idx]
+            fine = b if f >= 1.0 else a + int(round((b - a) * max(0.0, f)))
+
+        stato = (idx, fine)
+        if stato == self.ultimo:
+            return
+
+        self.ultimo = stato
+        sels = []
+
+        if fine > 0:
+            s = QTextEdit.ExtraSelection()
+            c = QTextCursor(self.ed.document())
+            c.setPosition(0)
+            c.setPosition(fine, QTextCursor.KeepAnchor)
+            s.cursor = c
+            s.format.setForeground(QBrush(QColor(C_SPOKEN)))
+            sels.append(s)
+
+        if idx >= 0 and f < 1.0:
+            self._scorri(a)
+
+        self.ed.setExtraSelections(sels)
+
     def _scorri(self, pos):
         c = QTextCursor(self.ed.document())
         c.setPosition(pos)
@@ -1072,7 +1251,7 @@ class SliderPos(QSlider):
 
     def _vai(self, x):
         v = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(),
-                                            int(x), max(1, self.width()))
+                                           int(x), max(1, self.width()))
         self.setValue(v)
         self.seek.emit(v / 1000.0)
 
@@ -1274,6 +1453,10 @@ class Finestra(QWidget):
         self._sub_chiave = None
         self.t0 = []
         self.t1 = []
+        self.t0_t = []
+        self.t1_t = []
+        self.trad_righe = []
+        self._cw = [0.0]
         self._prog = False
 
         self.player = QMediaPlayer(None, QMediaPlayer.LowLatency)
@@ -1391,6 +1574,16 @@ class Finestra(QWidget):
 
         l1.addWidget(self.ck_prefisso)
 
+        self.ck_doppio = QCheckBox(
+            "Se la lingua non e' il giapponese: ricava anche kanji + hiragana (2 passaggi, piu' lento)")
+        self.ck_doppio.setChecked(True)
+        self.ck_doppio.setToolTip(
+            "1° passaggio: whisper in giapponese (kanji, hiragana e tempi per parola)\n"
+            "2° passaggio: whisper nella lingua scelta (es. italiano) per il testo tradotto")
+        l1.addWidget(self.ck_doppio)
+        self.cb_lingua.currentIndexChanged.connect(self._lingua_cambiata)
+        self._lingua_cambiata()
+
         self.ed_prompt = QLineEdit()
         self.ed_prompt.setPlaceholderText("Suggerimento iniziale opzionale (nomi propri, termini difficili...)")
         l1.addWidget(self.ed_prompt)
@@ -1489,7 +1682,8 @@ class Finestra(QWidget):
 
         self.lb_sub = QLabel("Sul video")
         self.cb_sub = QComboBox()
-        self.cb_sub.addItems(["Originale + Hiragana", "Solo originale", "Solo hiragana", "Nessun testo"])
+        self.cb_sub.addItems(["Originale + Hiragana", "Solo originale", "Solo hiragana", "Nessun testo",
+                              "Originale + Hiragana + Traduzione", "Solo traduzione"])
         self.cb_sub.currentIndexChanged.connect(self._cambia_sub)
 
         self.b_fs = QPushButton("⛶ Schermo intero")
@@ -1578,10 +1772,32 @@ class Finestra(QWidget):
         l4.addWidget(self.out_hira, 1)
 
         split.addWidget(c4)
+
+        self.c5, l5 = card()
+        h5 = QHBoxLayout()
+        lb5 = QLabel("TRADUZIONE")
+        lb5.setObjectName("sez")
+        self.b_copia_trad = QPushButton("Copia")
+        self.b_copia_trad.setObjectName("piccolo")
+        self.b_copia_trad.clicked.connect(self.copia_traduzione)
+        h5.addWidget(lb5)
+        h5.addStretch(1)
+        h5.addWidget(self.b_copia_trad)
+        l5.addLayout(h5)
+
+        self.out_trad = CasellaTesto()
+        self.out_trad.setPlaceholderText("Il testo nella lingua scelta comparira' qui (una riga per frase).")
+        self.out_trad.doppio_clic.connect(lambda pos: self.salta_a_testo(self.ev_t, pos, self.t0_t))
+        self.out_trad.textChanged.connect(self._testo_t_modificato)
+        l5.addWidget(self.out_trad, 1)
+
+        split.addWidget(self.c5)
+        self.c5.setVisible(False)
         root.addWidget(split, 1)
 
         self.ev_o = Evidenziatore(self.out)
         self.ev_h = Evidenziatore(self.out_hira)
+        self.ev_t = Evidenziatore(self.out_trad)
 
         self._sp_o_orig, self._sp_h_orig, self._hira_orig = [], [], ""
 
@@ -1748,9 +1964,44 @@ class Finestra(QWidget):
 
     def _cambia_sub(self, *_):
         m = self.cb_sub.currentIndex()
-        self._righe_set({0: 4, 1: 2, 2: 2}.get(m, 0))
+        self._righe_set({0: 4, 1: 2, 2: 2, 4: 6, 5: 2}.get(m, 0))
         self._sub_chiave = None
         self.aggiorna_pos(self.player.position())
+
+    def _prog_jp(self, t):
+        """Quantita' (pesata) di giapponese gia' pronunciata al tempo t."""
+        i = bisect_right(self.t0, t) - 1
+        if i < 0:
+            return 0.0
+        d = self.t1[i] - self.t0[i]
+        if t >= self.t1[i] or d <= 0:
+            return self._cw[i + 1]
+        return self._cw[i] + (self._cw[i + 1] - self._cw[i]) * (t - self.t0[i]) / d
+
+    def _frazione_trad(self, i, t):
+        """Frazione (0..1) della riga di traduzione i da illuminare al tempo t:
+        e' la stessa proporzione di giapponese gia' illuminato nell'intervallo
+        della riga. Se non c'e' giapponese in quell'intervallo, va a tempo."""
+        a, b = self.t0_t[i], self.t1_t[i]
+        if t <= a:
+            return 0.0
+        if t >= b or b <= a:
+            return 1.0
+        ca, cb = self._prog_jp(a), self._prog_jp(b)
+        if self.t0 and cb - ca > 1e-9:
+            f = (self._prog_jp(t) - ca) / (cb - ca)
+        else:
+            f = (t - a) / (b - a)
+        return min(1.0, max(0.0, f))
+
+    def _html_trad(self, testo, cut):
+        lit, resto = escape(testo[:cut]), escape(testo[cut:])
+        out = ""
+        if lit:
+            out += '<span style="color:%s;">%s</span>' % (C_SPOKEN, lit)
+        if resto:
+            out += '<span style="color:#bfe3ff;">%s</span>' % resto
+        return '<div style="white-space: pre-wrap;">%s</div>' % out
 
     def _html_riga(self, tok, a, b, idx, in_corso):
         out = []
@@ -1767,13 +2018,28 @@ class Finestra(QWidget):
             return
 
         m = self.cb_sub.currentIndex()
-        idx = bisect_right(self.t0, t) - 1
-        chiave = None
+        mostra_jp = m in (0, 1, 2, 4)
+        mostra_tr = m in (4, 5) and bool(self.t0_t)
 
-        if m != 3 and idx >= 0:
-            in_corso = t <= self.t1[idx]
-            if in_corso or t - self.t1[idx] <= 1.5:
-                chiave = (idx, in_corso, m)
+        idx, in_corso = -1, False
+        chiave_jp, chiave_tr = None, None
+
+        if mostra_jp:
+            idx = bisect_right(self.t0, t) - 1
+            if idx >= 0:
+                in_corso = t <= self.t1[idx]
+                if in_corso or t - self.t1[idx] <= 1.5:
+                    chiave_jp = (idx, in_corso)
+
+        if mostra_tr:
+            it = bisect_right(self.t0_t, t) - 1
+            if it >= 0 and t <= self.t1_t[it] + 1.5:
+                n_car = len(self.trad_righe[it])
+                chiave_tr = (it, int(round(n_car * self._frazione_trad(it, t))))
+
+        chiave = None
+        if chiave_jp is not None or chiave_tr is not None:
+            chiave = (chiave_jp, chiave_tr, m)
 
         if chiave == self._sub_chiave:
             return
@@ -1783,12 +2049,15 @@ class Finestra(QWidget):
             self._sub_set("")
             return
 
-        a, b = self.seg_range[self.tok_sub["seg"][idx]]
         righe = []
-        if m in (0, 1):
-            righe.append(self._html_riga(self.tok_sub["o"], a, b, idx, in_corso))
-        if m in (0, 2):
-            righe.append(self._html_riga(self.tok_sub["h"], a, b, idx, in_corso))
+        if chiave_jp is not None:
+            a, b = self.seg_range[self.tok_sub["seg"][idx]]
+            if m in (0, 1, 4):
+                righe.append(self._html_riga(self.tok_sub["o"], a, b, idx, in_corso))
+            if m in (0, 2, 4):
+                righe.append(self._html_riga(self.tok_sub["h"], a, b, idx, in_corso))
+        if chiave_tr is not None:
+            righe.append(self._html_trad(self.trad_righe[chiave_tr[0]], chiave_tr[1]))
         self._sub_set("".join(righe))
 
     def _errore_player(self, _codice):
@@ -1858,16 +2127,21 @@ class Finestra(QWidget):
             self.ev_o.aggiorna(idx, in_corso)
             self.ev_h.aggiorna(idx, in_corso)
 
+        if self.t0_t:
+            it = bisect_right(self.t0_t, t) - 1
+            self.ev_t.aggiorna_frazione(it, self._frazione_trad(it, t) if it >= 0 else 0.0)
+
         self._aggiorna_sub(t)
 
-    def salta_a_testo(self, ev, pos):
+    def salta_a_testo(self, ev, pos, tempi=None):
         if not ev.attivo or self.wav_tmp is None:
             return
 
+        tempi = self.t0 if tempi is None else tempi
         starts = [s[0] for s in ev.spans]
-        i = max(0, bisect_right(starts, pos) - 1)
+        i = min(max(0, bisect_right(starts, pos) - 1), len(tempi) - 1)
 
-        self.vai_a(self.t0[i])
+        self.vai_a(tempi[i])
 
         if self.player.state() != QMediaPlayer.PlayingState:
             self.player.play()
@@ -1891,6 +2165,7 @@ class Finestra(QWidget):
             a_capo=self.ck_acapo.isChecked(),
             parole=self.ck_parole.isChecked(),
             prefisso=self.ck_prefisso.isChecked(),
+            doppio=self.ck_doppio.isEnabled() and self.ck_doppio.isChecked(),
             prompt_iniziale=self.ed_prompt.text().strip(),
         )
 
@@ -1909,13 +2184,39 @@ class Finestra(QWidget):
         self.barra.setRange(0, 1)
         self.b_avvia.setEnabled(True)
 
-    def _imposta_testi(self, orig, hira, span_o, span_h, t0, t1, tok=None):
+    def _lingua_cambiata(self, *_):
+        cod = LINGUE[self.cb_lingua.currentIndex()][1]
+        self.ck_doppio.setEnabled(cod not in (None, "ja"))
+
+    def _imposta_testi(self, orig, hira, span_o, span_h, t0, t1, tok=None, trad=None):
+        if trad and trad.get("righe"):
+            testo_t, span_t = testo_righe(trad["righe"])
+            self.trad_righe = list(trad["righe"])
+            self.t0_t, self.t1_t = list(trad["t0"]), list(trad["t1"])
+        else:
+            testo_t, span_t = "", []
+            self.trad_righe, self.t0_t, self.t1_t = [], [], []
+
         self._prog = True
         self.out.setPlainText(orig)
         self.out_hira.setPlainText(hira)
+        self.out_trad.setPlainText(testo_t)
         self._prog = False
 
+        self.ev_t.imposta(span_t)
+        self.c5.setVisible(bool(span_t))
+
         self.t0, self.t1 = t0, t1
+
+        # peso cumulato del giapponese (stessa stima di distribuisci()): serve ad
+        # allineare l'illuminazione della traduzione a quella del giapponese
+        if tok:
+            pesi = [float(len(h)) if any(c.isalnum() for c in h) else 0.3 for h in tok["h"]]
+        else:
+            pesi = [1.0] * len(t0)
+        self._cw = [0.0]
+        for w in pesi:
+            self._cw.append(self._cw[-1] + w)
 
         self.ev_o.imposta(span_o)
         self.ev_h.imposta(span_h)
@@ -1934,7 +2235,7 @@ class Finestra(QWidget):
     def fine_ok(self, r):
         self._ripristina()
         self.ultimo_ris = r
-        self._imposta_testi(r["orig"], r["hira"], r["span_o"], r["span_h"], r["t0"], r["t1"], r.get("tok"))
+        self._imposta_testi(r["orig"], r["hira"], r["span_o"], r["span_h"], r["t0"], r["t1"], r.get("tok"), r.get("trad"))
 
         self.lb_stato.setText(
             "Fatto{}. Premi ▶ per vedere le parole colorarsi mentre vengono pronunciate, anche sul video "
@@ -1958,6 +2259,11 @@ class Finestra(QWidget):
             self.ev_h.invalida()
             self.lb_stato.setText("Hiragana modificato: evidenziazione disattivata per questo riquadro.")
 
+    def _testo_t_modificato(self):
+        if not self._prog and self.ev_t.attivo:
+            self.ev_t.invalida()
+            self.lb_stato.setText("Traduzione modificata: evidenziazione disattivata per questo riquadro.")
+
     def aggiorna_hiragana(self):
         if self.ev_o.attivo and self._hira_orig:
             self._prog = True
@@ -1979,51 +2285,29 @@ class Finestra(QWidget):
     def _scrivi_json(self, percorso):
         r = self.ultimo_ris
         media = self.ed_file.text().strip()
-
-        tok = r.get("tok") or {}
-        tokens = []
-        if tok and "o" in tok and "h" in tok:
-            segs = tok.get("seg", [])
-            for i, (o, h, s, e) in enumerate(
-                zip(
-                    tok.get("o", []),
-                    tok.get("h", []),
-                    r.get("t0", []),
-                    r.get("t1", []),
-                )
-            ):
-                tokens.append({
-                    "o": o,
-                    "h": h,
-                    "t": [float(s), float(e)],
-                    "seg": segs[i] if i < len(segs) else 0,
-                })
-
         dati = dict(
-            versione=2,
             file=os.path.basename(media),
             percorso_file=os.path.abspath(media),
-            orig=r["orig"],
-            hira=r["hira"],
-            tokens=tokens,
         )
+        comp = karaoke_compatto(r)
+        if comp is not None:
+            dati.update(comp)
+        else:  # fallback: formato completo v1
+            dati.update(
+                versione=1,
+                orig=r["orig"],
+                hira=r["hira"],
+                span_o=[list(x) for x in r["span_o"]],
+                span_h=[list(x) for x in r["span_h"]],
+                t0=[round(float(t), 2) for t in r["t0"]],
+                t1=[round(float(t), 2) for t in r["t1"]],
+                tok=r["tok"],
+            )
         with open(percorso, "w", encoding="utf-8") as fh:
-            json.dump(dati, fh, ensure_ascii=False)
+            json.dump(dati, fh, ensure_ascii=False, separators=(",", ":"))
 
     @staticmethod
     def _valida_karaoke(d):
-        if "tokens" in d:
-            if not isinstance(d["tokens"], list):
-                raise ValueError("File karaoke non valido: 'tokens' deve essere una lista.")
-            for item in d["tokens"]:
-                if not isinstance(item, dict):
-                    raise ValueError("File karaoke non valido: ogni token deve essere un oggetto JSON.")
-                if set(("o", "h", "t")) - set(item):
-                    raise ValueError("File karaoke non valido: un token manca di 'o', 'h' o 't'.")
-                if not isinstance(item["t"], (list, tuple)) or len(item["t"]) != 2:
-                    raise ValueError("File karaoke non valido: il campo 't' deve essere [inizio, fine].")
-            return
-
         for k in ("orig", "hira", "span_o", "span_h", "t0", "t1", "tok"):
             if k not in d:
                 raise ValueError("File karaoke non valido: manca '{}'.".format(k))
@@ -2033,57 +2317,19 @@ class Finestra(QWidget):
                 and all(len(tok.get(k, [])) == n for k in ("o", "h", "seg"))):
             raise ValueError("File karaoke non valido: dati incoerenti.")
 
-    def _normalizza_karaoke(self, d):
-        if "tokens" in d:
-            tokens = d["tokens"]
-            t0, t1, tok_o, tok_h, tok_seg = [], [], [], [], []
-            span_o, span_h = [], []
-            pos_o = pos_h = 0
-
-            for item in tokens:
-                o = item.get("o", "")
-                h = item.get("h", "")
-                s, e = item["t"]
-                t0.append(float(s))
-                t1.append(float(e))
-                tok_o.append(o)
-                tok_h.append(h)
-                tok_seg.append(item.get("seg", 0))
-
-                span_o.append((pos_o, pos_o + l16(o)))
-                span_h.append((pos_h, pos_h + l16(h)))
-
-                pos_o += l16(o)
-                pos_h += l16(h)
-
-            return dict(
-                orig=d["orig"],
-                hira=d["hira"],
-                span_o=span_o,
-                span_h=span_h,
-                t0=t0,
-                t1=t1,
-                tok={"o": tok_o, "h": tok_h, "seg": tok_seg},
-                avviso="",
-            )
-
-        return dict(
-            orig=d["orig"],
-            hira=d["hira"],
+    def _applica_karaoke(self, d):
+        d = karaoke_espandi(d)
+        self._valida_karaoke(d)
+        r = dict(
+            orig=d["orig"], hira=d["hira"],
             span_o=[tuple(x) for x in d["span_o"]],
             span_h=[tuple(x) for x in d["span_h"]],
-            t0=list(d["t0"]),
-            t1=list(d["t1"]),
-            tok=d["tok"],
-            avviso="",
+            t0=list(d["t0"]), t1=list(d["t1"]),
+            tok=d["tok"], avviso="", trad=d.get("trad"),
         )
-
-    def _applica_karaoke(self, d):
-        self._valida_karaoke(d)
-        r = self._normalizza_karaoke(d)
         self.ultimo_ris = r
         self._imposta_testi(r["orig"], r["hira"], r["span_o"], r["span_h"],
-                            r["t0"], r["t1"], r["tok"])
+                            r["t0"], r["t1"], r["tok"], r["trad"])
         self.aggiorna_pos(self.player.position())
 
     def _cerca_karaoke(self, media):
@@ -2111,7 +2357,7 @@ class Finestra(QWidget):
     def carica_karaoke_json(self, pj):
         try:
             with open(pj, encoding="utf-8") as fh:
-                dati = json.load(fh)
+                dati = karaoke_espandi(json.load(fh))
             self._valida_karaoke(dati)
         except Exception as e:
             QMessageBox.warning(self, "Karaoke", "Impossibile leggere il file:\n{}".format(e))
@@ -2136,6 +2382,10 @@ class Finestra(QWidget):
     def copia(self):
         QApplication.clipboard().setText(self.out.toPlainText())
         self.lb_stato.setText("Trascrizione originale copiata negli appunti.")
+
+    def copia_traduzione(self):
+        QApplication.clipboard().setText(self.out_trad.toPlainText())
+        self.lb_stato.setText("Traduzione copiata negli appunti.")
 
     def copia_hiragana(self):
         QApplication.clipboard().setText(self.out_hira.toPlainText())
@@ -2172,6 +2422,7 @@ class Finestra(QWidget):
         testi = [
             ("_trascrizione.txt", self.out.toPlainText()),
             ("_hiragana.txt", self.out_hira.toPlainText()),
+            ("_traduzione.txt", self.out_trad.toPlainText()),
         ]
 
         testi = [(suff, t) for suff, t in testi if t.strip()]
