@@ -123,7 +123,7 @@ LINGUE = [
 
 EST_AUDIO = "*.wav *.mp3 *.m4a *.flac *.ogg *.opus *.aac *.wma *.aiff *.aif *.amr *.mka"
 EST_VIDEO = ("*.mp4 *.mkv *.webm *.mov *.avi *.flv *.wmv *.m4v *.mpg *.mpeg "
-             "*.ts *.m2ts *.3gp *.ogv *.mts")
+              "*.ts *.m2ts *.3gp *.ogv *.mts")
 FILTRO_FILE = (
     "Audio e video ({a} {v});;Audio ({a});;Video ({v});;Tutti i file (*)"
 ).format(a=EST_AUDIO, v=EST_VIDEO)
@@ -149,7 +149,7 @@ STILE = """
 QDialog, QFileDialog { background: %(bg)s; color: %(text)s; }
 QScrollArea { background: transparent; border: none; }
 QWidget { color: %(text)s; font-size: 13px;
-         font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", "Noto Sans CJK JP", "Hiragino Sans", sans-serif; }
+          font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", "Noto Sans CJK JP", "Hiragino Sans", sans-serif; }
 QFrame#card { background: %(card)s; border: 1px solid %(border)s; border-radius: 12px; }
 QLabel { background: transparent; }
 QLabel#titolo { font-size: 22px; font-weight: 700; }
@@ -768,7 +768,8 @@ class Worker(QThread):
             # attivo ma piu' sensibile, con la musica ancora presente viene disattivato.
             musica = bool(p.get("musica")) or bool(p.get("demucs"))
 
-            def _opzioni(lang, con_prompt):
+            def _opzioni(lang, con_prompt, musica_forzata=None):
+                musica_eff = musica if musica_forzata is None else bool(musica_forzata)
                 o = dict(
                     language=lang,
                     task="transcribe",
@@ -780,7 +781,7 @@ class Worker(QThread):
                     temperature=0.0,
                     compression_ratio_threshold=2.0,
                 )
-                if musica:
+                if musica_eff:
                     o.update(
                         no_speech_threshold=None,
                         compression_ratio_threshold=3.0,
@@ -793,11 +794,11 @@ class Worker(QThread):
                         o.pop("vad_parameters")
                 return o
 
-            def _consume(lang, word_timestamps, con_prompt=True):
+            def _consume(lang, word_timestamps, con_prompt=True, musica_forzata=None):
                 segments_iter, info = model.transcribe(
                     path,
                     word_timestamps=word_timestamps,
-                    **_opzioni(lang, con_prompt)
+                    **_opzioni(lang, con_prompt, musica_forzata)
                 )
                 return list(segments_iter), info
 
@@ -832,7 +833,7 @@ class Worker(QThread):
             if doppio:
                 self.stato.emit("Passaggio 2/2: testo in '{}'...".format(p["lingua"]))
                 try:
-                    raw_tr, _ = _consume(p["lingua"], False, False)
+                    raw_tr, _ = _consume(p["lingua"], False, False, musica_forzata=musica)
                     righe, tt0, tt1 = [], [], []
                     prec_t, prev_t = None, 0.0
                     for seg in raw_tr:
@@ -1362,7 +1363,7 @@ class SliderPos(QSlider):
 
     def _vai(self, x):
         v = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(),
-                                           int(x), max(1, self.width()))
+                                            int(x), max(1, self.width()))
         self.setValue(v)
         self.seek.emit(v / 1000.0)
 
