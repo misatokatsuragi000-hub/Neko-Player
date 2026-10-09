@@ -142,6 +142,7 @@ C_SPOKEN = "#ffb454"      # parte gia' pronunciata
 
 STILE = """
 #finestra, #interno { background: %(bg)s; }
+QDialog, QFileDialog { background: %(bg)s; color: %(text)s; }
 QScrollArea { background: transparent; border: none; }
 QWidget { color: %(text)s; font-size: 13px;
          font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", "Noto Sans CJK JP", "Hiragino Sans", sans-serif; }
@@ -158,7 +159,7 @@ QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus { border: 1px solid %(acc
 QComboBox::drop-down { border: none; width: 22px; }
 QComboBox QAbstractItemView { background: %(card)s; border: 1px solid %(border)s;
                               selection-background-color: %(accent)s; outline: none; }
-QPushButton { background: #2a2d40; border: none; border-radius: 8px; padding: 8px 14px; }
+QPushButton { background: #2a2d40; border: none; border-radius: 8px; padding: 8px 14px; color: %(text)s; }
 QPushButton:hover { background: #34384f; }
 QPushButton:pressed { background: #3d4260; }
 QPushButton:disabled { color: #5b6078; background: #20222f; }
@@ -185,9 +186,93 @@ QSlider::handle:horizontal { width: 12px; height: 12px; margin: -4px 0; border-r
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: #3a3e57; border-radius: 4px; min-height: 30px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
+QScrollBar::handle:horizontal { background: #3a3e57; border-radius: 4px; min-width: 30px; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 QSplitter::handle { background: transparent; }
 QToolTip { background: %(card)s; color: %(text)s; border: 1px solid %(border)s; padding: 4px; }
+
+/* Stile menu, viste ad albero e lista del selettore file */
+QListView, QTreeView, QTableView {
+    background: #12131a;
+    alternate-background-color: %(card)s;
+    border: 1px solid %(border)s;
+    border-radius: 8px;
+    color: %(text)s;
+    selection-background-color: %(accent)s;
+    selection-color: #ffffff;
+    outline: none;
+    padding: 4px;
+}
+QListView::item, QTreeView::item {
+    padding: 4px 6px;
+    border-radius: 4px;
+}
+QListView::item:hover, QTreeView::item:hover {
+    background: #252838;
+}
+QListView::item:selected, QTreeView::item:selected {
+    background: %(accent)s;
+    color: #ffffff;
+}
+QHeaderView::section {
+    background: %(card)s;
+    color: %(muted)s;
+    padding: 5px 8px;
+    border: none;
+    border-right: 1px solid %(border)s;
+    border-bottom: 1px solid %(border)s;
+    font-weight: 600;
+}
+QToolButton {
+    background: #2a2d40;
+    border: 1px solid %(border)s;
+    border-radius: 6px;
+    padding: 5px;
+    color: %(text)s;
+}
+QToolButton:hover {
+    background: #34384f;
+}
+QToolButton:pressed {
+    background: #3d4260;
+}
+QMenu {
+    background: %(card)s;
+    border: 1px solid %(border)s;
+    border-radius: 8px;
+    padding: 4px;
+}
+QMenu::item {
+    padding: 6px 20px 6px 12px;
+    border-radius: 4px;
+    color: %(text)s;
+}
+QMenu::item:selected {
+    background: %(accent)s;
+    color: #ffffff;
+}
 """ % dict(bg=C_BG, card=C_CARD, border=C_BORDER, text=C_TEXT, muted=C_MUTED, accent=C_ACCENT)
+
+
+def imposta_palette_scura(app):
+    """Imposta una palette scura di default a livello di applicazione
+    per evitare contrasti errati o pannelli bianchi nei dialoghi nativi."""
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor(C_BG))
+    palette.setColor(QPalette.WindowText, QColor(C_TEXT))
+    palette.setColor(QPalette.Base, QColor("#12131a"))
+    palette.setColor(QPalette.AlternateBase, QColor(C_CARD))
+    palette.setColor(QPalette.ToolTipBase, QColor(C_CARD))
+    palette.setColor(QPalette.ToolTipText, QColor(C_TEXT))
+    palette.setColor(QPalette.Text, QColor(C_TEXT))
+    palette.setColor(QPalette.Button, QColor(C_CARD))
+    palette.setColor(QPalette.ButtonText, QColor(C_TEXT))
+    palette.setColor(QPalette.BrightText, Qt.red)
+    palette.setColor(QPalette.Link, QColor(C_ACCENT))
+    palette.setColor(QPalette.Highlight, QColor(C_ACCENT))
+    palette.setColor(QPalette.HighlightedText, Qt.white)
+    app.setPalette(palette)
 
 
 # cache del modello faster-whisper caricato
@@ -348,9 +433,6 @@ class Worker(QThread):
         attempts = []
 
         if requested in ("auto", "cuda"):
-            # int8_float16: buon compromesso VRAM/qualità
-            # float16: classico
-            # int8: fallback
             attempts.extend([
                 ("cuda", "int8_float16"),
                 ("cuda", "float16"),
@@ -360,8 +442,6 @@ class Worker(QThread):
         if requested in ("auto", "cpu"):
             attempts.append(("cpu", "int8"))
 
-        # Se l'utente ha chiesto esplicitamente CUDA ma non funziona,
-        # permette comunque un fallback CPU.
         if requested == "cuda":
             attempts.append(("cpu", "int8"))
 
@@ -411,9 +491,6 @@ class Worker(QThread):
             except Exception as e:
                 msg = str(e)
                 if "libcublas" in msg or "cannot be loaded" in msg:
-                    # Mancano le librerie CUDA: potrebbe essere un problema di
-                    # percorso di ricerca (DLL su Windows, .so via
-                    # LD_LIBRARY_PATH su Linux) dei pacchetti pip nel venv.
                     _aggiungi_path_librerie_cuda()
                 last_error = e
                 self.stato.emit(f"Tentativo {device}/{compute_type} fallito: {e}")
@@ -455,7 +532,6 @@ class Worker(QThread):
             p = self.p
             path = p["file"]
 
-            # Estrazione eventuale del segmento Da/A
             if p["inizio"] > 0 or p["fine"] > 0:
                 self.stato.emit("Estraggo il segmento con ffmpeg...")
                 tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
@@ -497,8 +573,6 @@ class Worker(QThread):
             raw_segments = None
             info = None
 
-            # Primo tentativo con word_timestamps.
-            # Se fallisce, riprova senza word_timestamps.
             try:
                 raw_segments, info = _consume(use_words)
             except Exception as e:
@@ -573,7 +647,6 @@ class Worker(QThread):
 
                 segmenti.append((s0, s1, toks))
 
-            # tempi monotoni (necessari per la ricerca binaria durante la riproduzione)
             prev = 0.0
             for n, (s0, s1, toks) in enumerate(segmenti):
                 nuovi = []
@@ -584,7 +657,6 @@ class Worker(QThread):
                     nuovi.append((o, h, a, b))
                 segmenti[n] = (s0, s1, nuovi)
 
-            # costruzione dei due testi + posizioni (UTF-16) di ogni token
             sep = "\n" if (p["timestamp"] or p["a_capo"]) else ("" if lingua in ("ja", "zh") else " ")
 
             po, ph = [], []
@@ -712,7 +784,6 @@ class Forma(QWidget):
         self.msg = "Carica un file per vedere la forma d'onda"
         self._drag = False
 
-    # --- dati ---
     def pulisci(self, msg):
         self.db = None
         self.n = 0
@@ -745,7 +816,6 @@ class Forma(QWidget):
 
         self.update()
 
-    # --- geometria ---
     def _plot(self):
         return QRectF(58, 12, max(10, self.width() - 58 - 14), max(10, self.height() - 12 - 28))
 
@@ -762,7 +832,6 @@ class Forma(QWidget):
         self.v0 = max(0.0, min(self.v0, self.durata - span))
         self.v1 = self.v0 + span
 
-    # --- disegno ---
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -777,7 +846,6 @@ class Forma(QWidget):
         f.setPointSizeF(8.5)
         p.setFont(f)
 
-        # griglia dB (asse Y)
         for d in self.DB_TICKS:
             y = r.top() + (-d) / 60.0 * r.height()
             p.setPen(QPen(QColor("#262a3b"), 1))
@@ -790,7 +858,6 @@ class Forma(QWidget):
             p.drawText(r, Qt.AlignCenter, self.msg)
             return
 
-        # griglia tempo (asse X)
         span = self.v1 - self.v0
         step = self.STEPS[-1]
 
@@ -812,7 +879,6 @@ class Forma(QWidget):
             p.drawText(QRectF(x - 32, r.bottom() + 6, 64, 16), Qt.AlignCenter, etichetta_tempo(t, step))
             t += step
 
-        # intervallo "Da/A"
         a, b = self.sel
         if b > a:
             xa, xb = self._x(a), self._x(b)
@@ -826,7 +892,6 @@ class Forma(QWidget):
                 QColor(255, 255, 255, 20)
             )
 
-        # forma d'onda: massimo per ogni colonna di pixel
         w = int(r.width())
         e = np.linspace(self.v0 / self.hop, self.v1 / self.hop, w + 1).astype(np.int64)
         e = np.clip(e, 0, self.n)
@@ -866,7 +931,6 @@ class Forma(QWidget):
 
         p.restore()
 
-        # cursore di riproduzione
         if self.v0 <= self.pos <= self.v1:
             p.setPen(QPen(QColor("#ffffff"), 1.6))
             p.drawLine(QPointF(xp, r.top()), QPointF(xp, r.bottom()))
@@ -881,7 +945,6 @@ class Forma(QWidget):
             p.setBrush(QColor("#ffffff"))
             p.drawPolygon(tri)
 
-    # --- mouse ---
     def _seek_x(self, x):
         t = min(max(self._t(x), 0.0), self.durata)
         self.seek.emit(t)
@@ -1027,9 +1090,7 @@ class SliderPos(QSlider):
 
 
 class VideoSchermo(QGraphicsView):
-    """Visualizzatore video basato su QGraphicsVideoItem: viene disegnato da Qt
-    come un normale widget (niente finestra nativa sovrapposta), quindi non si
-    blocca nel passaggio a schermo intero."""
+    """Visualizzatore video basato su QGraphicsVideoItem."""
     doppio_clic = pyqtSignal()
 
     def __init__(self, sorgente=None):
@@ -1043,8 +1104,6 @@ class VideoSchermo(QGraphicsView):
         self.setRenderHint(QPainter.SmoothPixmapTransform)
 
         if sorgente is not None:
-            # seconda vista sulla STESSA scena (usata per lo schermo intero):
-            # il video del player non viene mai spostato ne' riagganciato
             self._scena = sorgente._scena
             self.item = sorgente.item
         else:
@@ -1070,7 +1129,6 @@ class VideoSchermo(QGraphicsView):
     def mouseDoubleClickEvent(self, e):
         self.doppio_clic.emit()
 
-    # --- sottotitoli sovrapposti al video (testo colorato con contorno nero)
     def imposta_sub(self, html):
         self._sub_html = html
         self._sub_cache = None
@@ -1173,7 +1231,6 @@ class ContenitoreVideo(QWidget):
             super().keyPressEvent(e)
 
     def closeEvent(self, e):
-        # chiusura (Alt+F4) da schermo intero: esce solo dal fullscreen
         e.ignore()
         self.esci.emit()
 
@@ -1205,19 +1262,19 @@ class Finestra(QWidget):
 
         self.worker = None
         self.decoder = None
-        self._vecchi = []              # thread in chiusura (evita distruzione prematura)
+        self._vecchi = []
         self.wav_tmp = None
         self.file_corrente = ""
-        self.modo_video = False        # True se il player riproduce il video originale
-        self._fs = False               # True se il video e' a schermo intero
-        self.cont_fs = None            # finestra a schermo intero (creata alla prima richiesta)
-        self.ultimo_ris = None         # ultimo risultato di trascrizione (dati del karaoke)
-        self.tok_sub = None            # token per i sottotitoli karaoke sul video
+        self.modo_video = False
+        self._fs = False
+        self.cont_fs = None
+        self.ultimo_ris = None
+        self.tok_sub = None
         self.seg_range = {}
         self._sub_chiave = None
         self.t0 = []
         self.t1 = []
-        self._prog = False             # True mentre il testo viene impostato da codice
+        self._prog = False
 
         self.player = QMediaPlayer(None, QMediaPlayer.LowLatency)
         self.player.setVolume(80)
@@ -1226,8 +1283,6 @@ class Finestra(QWidget):
         self.timer.setInterval(30)
         self.timer.timeout.connect(self._tick)
 
-        # tutto il contenuto sta dentro una scroll area: se lo schermo e'
-        # piccolo si scorre invece di uscire dai bordi
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         scroll = QScrollArea()
@@ -1393,8 +1448,6 @@ class Finestra(QWidget):
         self.player.setVideoOutput(self.video.item)
         l2.addWidget(self.cont_video, 1)
 
-        # il grafico dell'audio non e' piu' mostrato (resta solo come contenitore
-        # dei dati): al suo posto c'e' una barra di posizione
         self.forma = Forma()
         self.sl_pos = SliderPos()
         self.sl_pos.setRange(0, 0)
@@ -1556,7 +1609,8 @@ class Finestra(QWidget):
     def scegli_file(self):
         f, _ = QFileDialog.getOpenFileName(
             self, "Scegli un file", "",
-            FILTRO_FILE
+            FILTRO_FILE,
+            options=QFileDialog.DontUseNativeDialog
         )
         if f:
             self.imposta_file(f)
@@ -1601,7 +1655,7 @@ class Finestra(QWidget):
         self.decoder.start()
 
     def _audio_pronto(self, path, wav, db, hop, durata, ha_video):
-        if path != self.file_corrente:       # nel frattempo e' stato scelto un altro file
+        if path != self.file_corrente:
             try:
                 os.remove(wav)
             except OSError:
@@ -1612,8 +1666,6 @@ class Finestra(QWidget):
         self.durata = durata
         self.forma.imposta(db, hop, durata)
 
-        # Video: il player riproduce il file originale (immagine + audio
-        # sincronizzati). Audio: riproduce il wav decodificato.
         self.modo_video = bool(ha_video)
         self._mostra_video(self.modo_video)
         sorgente = path if self.modo_video else wav
@@ -1631,7 +1683,6 @@ class Finestra(QWidget):
             QMessageBox.warning(self, "Audio", msg)
 
     def _mostra_video(self, on):
-        """Mostra/nasconde il riquadro video e i suoi controlli."""
         self.modo_video = bool(on)
         if not on:
             self._fullscreen(False)
@@ -1644,7 +1695,6 @@ class Finestra(QWidget):
         self._sub_chiave = None
 
     def _tasto_f(self):
-        # non rubare la lettera "f" mentre si scrive in una casella
         w = QApplication.focusWidget()
         if isinstance(w, (QLineEdit, QTextEdit, QDoubleSpinBox)):
             return
@@ -1671,9 +1721,6 @@ class Finestra(QWidget):
             self.cont_fs.imposta_righe(n)
 
     def _fullscreen(self, on):
-        """Schermo intero: una seconda finestra mostra la STESSA scena del
-        video. Il video del player non viene toccato (spostarlo/riagganciarlo
-        mentre e' in riproduzione causava 'Internal data stream error')."""
         if on == self._fs:
             return
         self._fs = on
@@ -1716,8 +1763,6 @@ class Finestra(QWidget):
         return '<div style="white-space: pre-wrap;">%s</div>' % "".join(out)
 
     def _aggiorna_sub(self, t):
-        """Sottotitoli karaoke sul video: la frase corrente, con le parole
-        gia' pronunciate colorate e quella in corso evidenziata."""
         if not self.modo_video or not self.tok_sub or not self.t0:
             return
 
@@ -1747,8 +1792,6 @@ class Finestra(QWidget):
         self._sub_set("".join(righe))
 
     def _errore_player(self, _codice):
-        """Il backend multimediale non riesce a riprodurre il video (codec
-        mancanti): ripiega sul solo audio gia' decodificato."""
         if self.modo_video and self.wav_tmp and os.path.exists(self.wav_tmp):
             self._mostra_video(False)
             self.player.setMedia(QMediaContent(QUrl.fromLocalFile(self.wav_tmp)))
@@ -1818,7 +1861,6 @@ class Finestra(QWidget):
         self._aggiorna_sub(t)
 
     def salta_a_testo(self, ev, pos):
-        """Doppio clic su una parola: riproduce da li'."""
         if not ev.attivo or self.wav_tmp is None:
             return
 
@@ -1853,7 +1895,7 @@ class Finestra(QWidget):
         )
 
         self.b_avvia.setEnabled(False)
-        self.barra.setRange(0, 0)   # barra indeterminata
+        self.barra.setRange(0, 0)
         self.ultimo_ris = None
         self._imposta_testi("", "", [], [], [], [])
 
@@ -1906,8 +1948,6 @@ class Finestra(QWidget):
         self.lb_stato.setText("Errore.")
         QMessageBox.critical(self, "Errore", msg)
 
-    # Se l'utente modifica a mano un riquadro, le posizioni salvate non valgono piu':
-    # l'evidenziazione di quel riquadro viene disattivata.
     def _testo_o_modificato(self):
         if not self._prog and self.ev_o.attivo:
             self.ev_o.invalida()
@@ -1919,9 +1959,7 @@ class Finestra(QWidget):
             self.lb_stato.setText("Hiragana modificato: evidenziazione disattivata per questo riquadro.")
 
     def aggiorna_hiragana(self):
-        """Riconverte in hiragana il testo del riquadro superiore."""
         if self.ev_o.attivo and self._hira_orig:
-            # testo originale intatto: ripristina l'hiragana sincronizzato
             self._prog = True
             self.out_hira.setPlainText(self._hira_orig)
             self._prog = False
@@ -1939,7 +1977,6 @@ class Finestra(QWidget):
     # --------------------------------------------------------------- azioni
     # ------------------------------------------------------- karaoke (.json)
     def _scrivi_json(self, percorso):
-        """Salva i dati per rivedere il karaoke senza trascrivere di nuovo."""
         r = self.ultimo_ris
         media = self.ed_file.text().strip()
         dati = dict(
@@ -1983,7 +2020,6 @@ class Finestra(QWidget):
         self.aggiorna_pos(self.player.position())
 
     def _cerca_karaoke(self, media):
-        """Se accanto al file c'e' un _karaoke.json lo carica al posto della trascrizione."""
         pj = os.path.splitext(media)[0] + "_karaoke.json"
         if not os.path.isfile(pj):
             return
@@ -1999,7 +2035,9 @@ class Finestra(QWidget):
     def scegli_karaoke(self):
         f, _ = QFileDialog.getOpenFileName(
             self, "Carica karaoke", os.path.dirname(self.ed_file.text().strip()),
-            "Karaoke (*.json);;Tutti i file (*)")
+            "Karaoke (*.json);;Tutti i file (*)",
+            options=QFileDialog.DontUseNativeDialog
+        )
         if f:
             self.carica_karaoke_json(f)
 
@@ -2038,7 +2076,10 @@ class Finestra(QWidget):
 
     def salva(self):
         base = os.path.splitext(self.ed_file.text().strip())[0] or "trascrizione"
-        f, _ = QFileDialog.getSaveFileName(self, "Salva testo", base + ".txt", "Testo (*.txt)")
+        f, _ = QFileDialog.getSaveFileName(
+            self, "Salva testo", base + ".txt", "Testo (*.txt)",
+            options=QFileDialog.DontUseNativeDialog
+        )
 
         if f:
             with open(f, "w", encoding="utf-8") as fh:
@@ -2055,7 +2096,6 @@ class Finestra(QWidget):
             self.lb_stato.setText(msg)
 
     def salva_accanto(self):
-        """Salva trascrizione e hiragana nella stessa cartella dell'audio originale."""
         audio = self.ed_file.text().strip()
 
         if not audio or not os.path.isfile(audio):
@@ -2128,6 +2168,7 @@ class Finestra(QWidget):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    imposta_palette_scura(app)
     app.setStyleSheet(STILE)
 
     w = Finestra()
