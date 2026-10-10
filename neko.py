@@ -2,6 +2,8 @@ import sys
 import os
 import glob
 import json
+from bisect import bisect_right
+from html import escape
 import ctypes
 import math
 import sysconfig
@@ -41,6 +43,7 @@ HW_SKIP_MAX = 90                 # seek in avanti entro N frame: si scartano i f
 
 larghezza_occhi = 500            # larghezza massima (px, da un estremo all'altro dell'arco) di ciascun occhio: seguono la larghezza della finestra fino a questo limite
 FRAME_COLOR = "#0f0c12"
+MINIMAL_CLOCK = True              # in minimal, senza video e con il mouse lontano dai controlli: menu nascosto e orologio al suo posto
 FRAME_BORDER_WIDTH = 10          # spessore del bordo nero della finestra ellittica
 ELLIPSE_BAND = 0                 # fascia a tinta unita (colore tema) tra bordo nero e video; 0 = nessuna
 EARS_X_FRACTION = 0.27           # posizione orizzontale del centro delle orecchie (frazione della larghezza)
@@ -65,7 +68,28 @@ UI_FONT_FAMILY = "Nunito"
 UI_FONT_FALLBACKS = ("Nunito", "Nunito Sans", "Quicksand", "Comfortaa", "sans-serif")
 
 FREE_WINDOW_MOVE = True
-BYPASS_WM = FREE_WINDOW_MOVE and sys.platform.startswith("linux")
+
+
+def _config_bool_precoce(chiave, default):
+    """Legge un booleano dal config prima della creazione dei widget (le impostazioni vere si caricano piu' tardi)."""
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f: return bool(json.load(f).get(chiave, default))
+    except Exception: return default
+
+
+# Sempre in primo piano (spunta nel menu): su Linux la finestra senza window manager (override-redirect) sta
+# nel livello piu' alto e copre le altre app. Togliendo la spunta diventa una finestra normale, gestita dal WM.
+ALWAYS_ON_TOP = _config_bool_precoce("always_on_top", True)
+BYPASS_WM = FREE_WINDOW_MOVE and sys.platform.startswith("linux") and ALWAYS_ON_TOP
+
+
+def _imposta_bypass_overlay(w, on):
+    """Orecchie e baffi (finestre separate): con o senza flag di bypass del window manager."""
+    flags = Qt.FramelessWindowHint | Qt.WindowDoesNotAcceptFocus | Qt.Tool
+    if on: flags |= Qt.X11BypassWindowManagerHint
+    visibile = w.isVisible()
+    w.setWindowFlags(flags)
+    if visibile: w.show()
 
 if USE_NATIVE_FILE_DIALOG:
     os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal"
@@ -91,13 +115,20 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import (
     QImage, QPixmap, QKeyEvent, QMouseEvent, QWheelEvent,
     QPainter, QColor, QPen, QBrush, QTransform, QRegion, QPainterPath,
-    QPainterPathStroker, QIcon, QFont, QCursor, QFontMetrics, QLinearGradient, QPolygon
+    QPainterPathStroker, QIcon, QFont, QCursor, QFontMetrics, QLinearGradient, QPolygon,
+    QTextDocument, QTextOption
 )
 from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint, QPointF, QRect, QRectF, QSize, QEvent,
-    QFileInfo, QStandardPaths, QStorageInfo, QTranslator, QLocale, QLibraryInfo, QMimeDatabase
+    QFileInfo, QStandardPaths, QStorageInfo, QTranslator, QLocale, QLibraryInfo, QMimeDatabase, QTime
 )
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
+try:
+    from PyQt5.QtWidgets import QOpenGLWidget
+    from PyQt5.QtGui import QSurfaceFormat
+except Exception:
+    QOpenGLWidget = None
+    QSurfaceFormat = None
 
 TORCH_AVAILABLE = False
 TORCH_CUDA = False
@@ -263,8 +294,14 @@ def make_osd_style(r: int, g: int, b: int) -> str:
     )
 
 VIDEO_EXTS = {"mp4", "mkv", "avi", "webm", "mov", "m4v", "ts", "flv", "wmv", "mpg", "mpeg"}
+AUDIO_EXTS = {"mp3", "wav", "flac", "m4a", "aac", "ogg", "oga", "opus", "wma", "mka", "aif", "aiff"}
 MODEL_EXTS = {"onnx", "pt", "pth"}
-VIDEO_FILTERS = ["Video (" + "  ".join("*." + e for e in sorted(VIDEO_EXTS)) + ")", "Tutti i file (*)"]
+VIDEO_FILTERS = [
+    "Video e audio (" + "  ".join("*." + e for e in sorted(VIDEO_EXTS | AUDIO_EXTS)) + ")",
+    "Video (" + "  ".join("*." + e for e in sorted(VIDEO_EXTS)) + ")",
+    "Audio (" + "  ".join("*." + e for e in sorted(AUDIO_EXTS)) + ")",
+    "Tutti i file (*)",
+]
 MODEL_FILTERS = [
     "Tutti i Modelli (*.onnx *.pt *.pth)",
     "Modelli ONNX (*.onnx)",
@@ -341,6 +378,7 @@ class NekoIconProvider(QFileIconProvider):
         self._dir = themed(["folder"], QStyle.SP_DirIcon)
         self._drive = themed(["drive-harddisk"], QStyle.SP_DriveHDIcon)
         self._video = themed(["video-x-generic"], QStyle.SP_FileIcon)
+        self._audio = themed(["audio-x-generic"], QStyle.SP_FileIcon)
         self._model = themed(["package-x-generic", "application-x-executable"], QStyle.SP_FileIcon)
         self._file = themed(["text-x-generic", "application-x-executable"], QStyle.SP_FileIcon)
     def icon(self, arg):
@@ -348,6 +386,7 @@ class NekoIconProvider(QFileIconProvider):
             if arg.isDir(): return self._dir
             ext = arg.suffix().lower()
             if ext in VIDEO_EXTS: return self._video
+            if ext in AUDIO_EXTS: return self._audio
             if ext in MODEL_EXTS: return self._model
             return self._file
         if arg == QFileIconProvider.Folder: return self._dir
@@ -412,7 +451,7 @@ class CatEar(QWidget):
     BOX_HEIGHT = 500
     def __init__(self, is_left=True, parent=None):
         flags = Qt.FramelessWindowHint | Qt.WindowDoesNotAcceptFocus | Qt.Tool
-        if sys.platform.startswith("linux"): flags |= Qt.X11BypassWindowManagerHint
+        if BYPASS_WM: flags |= Qt.X11BypassWindowManagerHint
         super().__init__(parent, flags)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
@@ -529,7 +568,7 @@ class CatWhiskers(QWidget):
     DOT_R = 5.0     # raggio puntino alla base
     def __init__(self, is_left=True, parent=None):
         flags = Qt.FramelessWindowHint | Qt.WindowDoesNotAcceptFocus | Qt.Tool
-        if sys.platform.startswith("linux"): flags |= Qt.X11BypassWindowManagerHint
+        if BYPASS_WM: flags |= Qt.X11BypassWindowManagerHint
         super().__init__(parent, flags)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
@@ -1212,6 +1251,241 @@ class VideoDisplayLabel(QLabel):
         else: super().mouseDoubleClickEvent(event)
     def wheelEvent(self, event: QWheelEvent): event.ignore()
 
+if QOpenGLWidget is not None:
+    class VideoDisplayGL(QOpenGLWidget):
+        """Stessa interfaccia di VideoDisplayLabel, ma il frame viene composto in una superficie OpenGL con
+        swap sincronizzato al refresh del monitor (V-Sync): ogni frame compare per intero, senza strappi.
+        Un QLabel passa invece dal backing store raster, che scrive i pixel in qualunque momento."""
+        double_clicked = pyqtSignal()
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            fmt = QSurfaceFormat(QSurfaceFormat.defaultFormat())
+            fmt.setSwapInterval(1)          # 1 = attendi il refresh verticale prima di mostrare il frame
+            fmt.setAlphaBufferSize(8)
+            self.setFormat(fmt)
+            self._pm = None
+            self._align = Qt.AlignCenter
+            self._bg = QColor(15, 12, 18, 217)
+            self._radius = 0.0
+
+        def setAlignment(self, a): self._align = a; self.update()
+        def pixmap(self): return self._pm
+        def setPixmap(self, pm): self._pm = pm; self.update()
+        def clear(self): self._pm = None; self.update()
+
+        def setStyleSheet(self, css):
+            # un QOpenGLWidget ignora il foglio di stile: ne leggiamo solo sfondo e raggio e li disegniamo noi
+            m = re.search(r"background-color:\s*([^;]+);?", css)
+            if m:
+                v = m.group(1).strip()
+                if v.lower().startswith("rgba"):
+                    n = [x.strip() for x in v[v.index("(") + 1:v.rindex(")")].split(",")]
+                    self._bg = QColor(int(float(n[0])), int(float(n[1])), int(float(n[2])),
+                                      int(round(float(n[3]) * 255)))
+                else:
+                    self._bg = QColor(v)
+            m = re.search(r"border-radius:\s*([\d.]+)", css)
+            self._radius = float(m.group(1)) if m else 0.0
+            self.update()
+
+        def paintGL(self):
+            p = QPainter(self)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setCompositionMode(QPainter.CompositionMode_Source)
+            p.fillRect(self.rect(), Qt.transparent)
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(self.rect()), self._radius, self._radius)
+            p.fillPath(path, self._bg)
+            p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            pm = self._pm
+            if pm is not None and not pm.isNull():
+                dpr = pm.devicePixelRatio() or 1.0
+                pw, ph = pm.width() / dpr, pm.height() / dpr
+                x = (self.width() - pw) / 2.0
+                y = (self.height() - ph) / 2.0
+                p.setClipPath(path)
+                p.drawPixmap(QPointF(x, y), pm)
+            p.end()
+
+        def mouseDoubleClickEvent(self, event):
+            if event.button() == Qt.LeftButton:
+                self.double_clicked.emit()
+                event.accept()
+            else: super().mouseDoubleClickEvent(event)
+
+        def wheelEvent(self, event): event.ignore()
+
+# ---------------------------------------------------------------------------
+# File solo audio: schermo nero con i sottotitoli karaoke e una sinusoide la cui ampiezza
+# segue il livello in decibel nel tempo (inviluppo calcolato da ffmpeg in un thread).
+# ---------------------------------------------------------------------------
+ENV_RATE = 50            # campioni di inviluppo al secondo (uno ogni 20 ms)
+ENV_SR = 8000            # frequenza di campionamento a cui ffmpeg decodifica per l'analisi
+WAVE_FLOOR_DB = -60.0    # sotto questo livello la sinusoide e' piatta
+WAVE_SPAN = 8.0          # secondi visibili nella finestra (la testina e' al centro)
+WAVE_CYCLES = 18         # oscillazioni della sinusoide visibili in tutta la finestra
+
+
+def compute_audio_db(path, should_stop=None):
+    """Livello RMS in dB (rispetto al fondo scala) ogni 1/ENV_RATE s, o None se ffmpeg fallisce."""
+    ff = shutil.which("ffmpeg")
+    if not ff: return None
+    hop = ENV_SR // ENV_RATE
+    proc = subprocess.Popen(
+        [ff, "-v", "error", "-nostdin", "-i", path, "-vn", "-ac", "1", "-ar", str(ENV_SR),
+         "-f", "s16le", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    out, rest = [], b""
+    try:
+        while True:
+            if should_stop and should_stop(): return None
+            data = proc.stdout.read(hop * 2 * ENV_RATE * 10)
+            if not data: break
+            data = rest + data
+            n = (len(data) // (2 * hop)) * (2 * hop)
+            rest = data[n:]
+            if n:
+                x = np.frombuffer(data[:n], dtype="<i2").astype(np.float32) / 32768.0
+                rms = np.sqrt(np.mean(x.reshape(-1, hop) ** 2, axis=1))
+                out.append(20.0 * np.log10(np.maximum(rms, 1e-6)))
+    finally:
+        if proc.poll() is None: proc.kill()
+        try: proc.stdout.close()
+        except Exception: pass
+        proc.wait()
+    if not out: return None
+    return np.concatenate(out).astype(np.float32)
+
+
+class AudioEnvelopeThread(QThread):
+    ready = pyqtSignal(str, object)
+    def __init__(self, path, parent=None):
+        super().__init__(parent)
+        self.path = path
+        self._stop = False
+    def stop(self): self._stop = True
+    def run(self):
+        try: db = compute_audio_db(self.path, lambda: self._stop)
+        except Exception: db = None
+        if db is not None and not self._stop:
+            self.ready.emit(self.path, db)
+
+
+class AudioWaveOverlay(QWidget):
+    """Sfondo nero con una sinusoide che scorre: ampiezza = livello in dB al tempo corrente.
+    A sinistra della testina (gia' riprodotto) e' arancione-rossa, a destra azzurra e piu' tenue."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setFocusPolicy(Qt.NoFocus)
+        self._db = None
+        self._amp = None
+        self._times = None
+        self._t = 0.0
+        parent.installEventFilter(self)
+        self.setGeometry(parent.rect())
+        self.hide()
+
+    def eventFilter(self, obj, ev):
+        if obj is self.parent() and ev.type() == QEvent.Resize:
+            self.setGeometry(self.parent().rect())
+        return False
+
+    def set_envelope(self, db):
+        if db is None or len(db) == 0:
+            self._db = self._amp = self._times = None
+            self.update()
+            return
+        db = np.asarray(db, dtype=np.float32)
+        hi = max(float(np.percentile(db, 99.5)), WAVE_FLOOR_DB + 12.0)
+        amp = np.clip((db - WAVE_FLOOR_DB) / (hi - WAVE_FLOOR_DB), 0.0, 1.0)
+        amp = np.convolve(amp, np.array([0.25, 0.5, 0.25], dtype=np.float32), mode="same")
+        self._db = db
+        self._amp = amp.astype(np.float32)
+        self._times = np.arange(len(db), dtype=np.float32) / float(ENV_RATE)
+        self.update()
+
+    def set_time(self, t):
+        self._t = float(t)
+        if self.isVisible(): self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(0, 0, 0))
+        w, h = self.width(), self.height()
+        if w < 40 or h < 40:
+            return
+        cx, cy = w / 2.0, h * 0.40
+        amp_px = h * 0.20
+        lw = max(1.5, h * 0.006)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QPen(QColor(255, 255, 255, 28), 1))
+        p.drawLine(QPointF(w * 0.04, cy), QPointF(w * 0.96, cy))
+        if self._amp is None:
+            p.end()
+            return
+
+        t = self._t
+        step = max(2, int(w / 360))
+        xs = np.arange(0, w + 1, step, dtype=np.float64)
+        u = (xs - cx) / (w * 0.47)
+        taper = np.sqrt(np.clip(1.0 - u * u, 0.0, 1.0))     # niente picchi fuori dall'ellisse
+        tx = t + (xs - cx) / w * WAVE_SPAN
+        a = np.interp(tx, self._times, self._amp, left=0.0, right=0.0)
+        period = WAVE_SPAN / WAVE_CYCLES
+        ys = cy - a * amp_px * taper * np.sin(2.0 * np.pi * tx / period)
+
+        path = QPainterPath()
+        path.moveTo(float(xs[0]), float(ys[0]))
+        for x, y in zip(xs[1:], ys[1:]):
+            path.lineTo(float(x), float(y))
+
+        past = QLinearGradient(cx - w * 0.40, 0, cx, 0)
+        past.setColorAt(0.0, QColor(255, 180, 84, 40))
+        past.setColorAt(0.6, QColor(SUB_SPOKEN))
+        past.setColorAt(1.0, QColor(SUB_CURRENT))
+        fut = QLinearGradient(cx, 0, w, 0)
+        fut.setColorAt(0.0, QColor(130, 170, 220, 170))
+        fut.setColorAt(1.0, QColor(130, 170, 220, 30))
+        for clip, grad in ((QRectF(0, 0, cx, h), past), (QRectF(cx, 0, w - cx, h), fut)):
+            p.save()
+            p.setClipRect(clip)
+            glow = QPen(QBrush(grad), lw * 4.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            c = QColor(255, 255, 255)
+            p.setOpacity(0.18)
+            p.setPen(glow)
+            p.drawPath(path)
+            p.setOpacity(1.0)
+            p.setPen(QPen(QBrush(grad), lw, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.drawPath(path)
+            p.restore()
+
+        # testina: linea verticale, punto sulla sinusoide e livello in dB
+        a0 = float(np.interp(t, self._times, self._amp, left=0.0, right=0.0))
+        y0 = cy - a0 * amp_px * math.sin(2.0 * math.pi * t / period)
+        p.setPen(QPen(QColor(255, 255, 255, 70), 1))
+        p.drawLine(QPointF(cx, cy - amp_px * 1.1), QPointF(cx, cy + amp_px * 1.1))
+        r = max(3.0, h * 0.014)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 42, 42, 90))
+        p.drawEllipse(QPointF(cx, y0), r * 1.9, r * 1.9)
+        p.setBrush(QColor(SUB_CURRENT))
+        p.drawEllipse(QPointF(cx, y0), r, r)
+
+        i = int(min(len(self._db) - 1, max(0, round(t * ENV_RATE))))
+        val = float(self._db[i])
+        txt = "-inf dB" if val < -80 else "%d dB" % round(val)
+        f = QFont(self.font())
+        f.setPixelSize(max(10, int(h * 0.034)))
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor(255, 255, 255, 150))
+        p.drawText(QRectF(cx - 70, cy - amp_px * 1.1 - h * 0.06, 140, h * 0.05), Qt.AlignCenter, txt)
+        p.end()
+
+
 class FFmpegCapture:
     """Sostituto minimale di cv2.VideoCapture: ffmpeg decodifica (NVDEC) e manda frame BGR24 su una pipe."""
     _FAIL_RE = re.compile(r"failed setup|initialisation returned error|cannot load|device creation failed|no device", re.I)
@@ -1807,6 +2081,8 @@ class VideoProcessorThread(QThread):
         self.last_frame_time = 0.0
         self.real_fps = 0.0
         self.video_fps = 25.0
+        self._fps_ready = False        # True quando video_fps e' quello reale del file aperto
+        self._pending_seek_sec = None  # salto in secondi richiesto prima che l'fps reale sia noto
         self.audio_clock = None
         self._seek_gen = 0
         self._shown_pos = 0
@@ -1966,8 +2242,15 @@ class VideoProcessorThread(QThread):
                 return bool(torch.isfinite(model(probe)).all().item())
         except Exception: return False
 
-    def set_video(self, video_path): self.video_path = video_path
+    def set_video(self, video_path):
+        self.video_path = video_path
+        self._fps_ready = False
+        self._pending_seek_sec = None
     def request_seek_frame(self, frame_no: int): self.seek_target_frame = frame_no
+    def request_seek_time(self, sec: float):
+        """Salto a un istante assoluto: il frame si calcola con l'fps reale del file (non con quello di default)."""
+        if self._fps_ready: self.seek_target_frame = int(max(0.0, sec) * self.video_fps)
+        else: self._pending_seek_sec = sec
     def request_seek_seconds(self, delta_seconds: float): self.seek_delta_sec = delta_seconds
 
     def run(self):
@@ -1978,6 +2261,10 @@ class VideoProcessorThread(QThread):
         video_fps = cap.get(cv2.CAP_PROP_FPS)
         if not video_fps or video_fps <= 0 or video_fps > 120: video_fps = 25.0
         self.video_fps = video_fps
+        self._fps_ready = True
+        if self._pending_seek_sec is not None:
+            self.seek_target_frame = int(max(0.0, self._pending_seek_sec) * video_fps)
+            self._pending_seek_sec = None
         frame_interval = 1.0 / video_fps
         duration_sec = total_frames / video_fps
         vid_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -2696,6 +2983,544 @@ class RestoreStub(QWidget):
             self.restore_requested.emit()
         super().changeEvent(event)
 
+# ---------------------------------------------------------------------------
+# Sottotitoli karaoke: legge il <video>_karaoke.json prodotto da hira.py (trascrivi)
+# e mostra sul video kanji, hiragana e traduzione, illuminati man mano che si parla.
+# ---------------------------------------------------------------------------
+SUB_SPOKEN = "#ffb454"   # parte gia' pronunciata
+SUB_UNSPOKEN = "#ffffff"  # parte non ancora pronunciata
+SUB_CURRENT = "#ff2a2a"   # picco di rosso della lettera/token pronunciato in questo istante
+SUB_TRAD_CURRENT = "#00b0ff"   # azzurro intenso: parte della traduzione che corrisponde al token rosso
+SUB_TRAD = "#bfe3ff"     # traduzione non ancora illuminata
+
+
+_RE_TS_SUB = re.compile(
+    r"^\s*\[\s*\d+\s*[|\uff5c:/]\s*[\d:.,]+\s*\]\s*"
+    r"|^\s*\[\s*[\d:.,]+\s*(?:->|-->|\u2192)\s*\[?\s*[\d:.,]+\s*\]\s*")
+
+
+def mix_colore(c1, c2, t):
+    """Interpola linearmente due colori '#rrggbb' (t=0 -> c1, t=1 -> c2)."""
+    t = min(1.0, max(0.0, t))
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(int(round(x + (y - x) * t)) for x, y in zip(a, b))
+
+
+def l16(s):
+    """Lunghezza in unita' UTF-16 (le posizioni di QTextCursor usano queste)."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def allinea_traduzione(t0, t1, trad):
+    """Riallinea i tempi delle righe tradotte a quelli dei token giapponesi.
+
+    Le righe nascono da un secondo passaggio di whisper con tempi propri (di solito
+    in anticipo rispetto alle parole giapponesi). Ogni token giapponese viene
+    assegnato alla riga con cui si sovrappone di piu' (o alla piu' vicina) e la riga
+    appare quando parte il suo primo token e scompare quando finisce l'ultimo.
+    Righe senza token vicini: tempi originali. Ripetibile senza effetti collaterali."""
+    if not trad or not trad.get("righe") or not t0:
+        return trad
+    if trad.get("fissa"):      # tempi decisi dall'utente in hira (timestamp nel testo): non toccarli
+        return trad
+    ta, tb = list(trad["t0"]), list(trad["t1"])
+    n = len(ta)
+    if n == 0 or not (len(tb) == n == len(trad["righe"])):
+        return trad
+
+    assegn = [[] for _ in range(n)]
+    for j in range(len(t0)):
+        a, b = t0[j], t1[j]
+        m = (a + b) / 2.0
+        k = bisect_right(ta, m) - 1
+        cand = range(max(0, k - 2), min(n, k + 3))
+        best, best_ov = None, 0.0
+        for i in cand:
+            ov = min(b, tb[i]) - max(a, ta[i])
+            if ov > best_ov:
+                best, best_ov = i, ov
+        if best is None:
+            best = min(cand, key=lambda i: 0.0 if ta[i] <= m <= tb[i] else min(abs(m - ta[i]), abs(m - tb[i])))
+        assegn[best].append(j)
+
+    na, nb = list(ta), list(tb)
+    for i in range(n):
+        if assegn[i]:
+            na[i] = t0[assegn[i][0]]
+            nb[i] = t1[assegn[i][-1]]
+    prev = 0.0
+    for i in range(n):
+        na[i] = max(na[i], prev)
+        nb[i] = max(nb[i], na[i])
+        prev = na[i]
+
+    out = dict(trad)
+    out["t0"], out["t1"] = na, nb
+    return out
+
+
+def karaoke_espandi(d):
+    """Da formato v2 a v1 (quello usato internamente). I dati v1 passano invariati."""
+    if d.get("versione", 1) < 2:
+        return d
+    if "s" not in d:
+        raise ValueError("File karaoke non valido: manca 's'.")
+
+    orig, hira = [], []
+    span_o, span_h, t0, t1 = [], [], [], []
+    tok_o, tok_h, tok_seg = [], [], []
+    po = ph = 0
+
+    for n, (pre, toks) in enumerate(d["s"]):
+        orig.append(pre)
+        hira.append(pre)
+        po += l16(pre)
+        ph += l16(pre)
+        for e in toks:
+            if len(e) == 3:
+                o, a, b = e
+                h = o
+            else:
+                o, h, a, b = e
+            orig.append(o)
+            hira.append(h)
+            span_o.append((po, po + l16(o)))
+            span_h.append((ph, ph + l16(h)))
+            po += l16(o)
+            ph += l16(h)
+            t0.append(a)
+            t1.append(b)
+            tok_o.append(o)
+            tok_h.append(h)
+            tok_seg.append(n)
+
+    out = {k: v for k, v in d.items() if k not in ("s", "tr", "trf", "trn")}
+    if d.get("tr"):
+        out["trad"] = dict(
+            righe=[e[0] for e in d["tr"]],
+            t0=[e[1] for e in d["tr"]],
+            t1=[e[2] for e in d["tr"]],
+        )
+        if d.get("trf"):
+            out["trad"]["fissa"] = True
+        if d.get("trn"):
+            out["trad"]["num"] = True
+    if out.get("trad"):
+        out["trad"] = allinea_traduzione(t0, t1, out["trad"])
+    out.update(
+        orig="".join(orig), hira="".join(hira),
+        span_o=span_o, span_h=span_h, t0=t0, t1=t1,
+        tok=dict(o=tok_o, h=tok_h, seg=tok_seg),
+    )
+    return out
+
+
+class KaraokeSubs:
+    """Dati del karaoke: token giapponesi (kanji + hiragana) con tempi, e righe tradotte."""
+
+    def __init__(self, d):
+        for k in ("t0", "t1", "tok"):
+            if k not in d:
+                raise ValueError("manca '{}'".format(k))
+        self.t0 = [float(x) for x in d["t0"]]
+        self.t1 = [float(x) for x in d["t1"]]
+        tok = d["tok"]
+        self.o, self.h, self.seg = list(tok["o"]), list(tok["h"]), list(tok["seg"])
+        n = len(self.t0)
+        if not (n and len(self.t1) == len(self.o) == len(self.h) == len(self.seg) == n):
+            raise ValueError("dati incoerenti")
+
+        self.seg_range = {}
+        for i, sg in enumerate(self.seg):
+            r = self.seg_range.setdefault(sg, [i, i + 1])
+            r[1] = i + 1
+
+        # peso cumulato del giapponese: serve ad allineare l'illuminazione della traduzione
+        self.cw = [0.0]
+        for h in self.h:
+            self.cw.append(self.cw[-1] + (float(len(h)) if any(c.isalnum() for c in h) else 0.3))
+
+        tr = d.get("trad") or {}
+        self.tr = list(tr.get("righe", []))
+        self.t0_t = [float(x) for x in tr.get("t0", [])]
+        self.t1_t = [float(x) for x in tr.get("t1", [])]
+        if not (len(self.tr) == len(self.t0_t) == len(self.t1_t)):
+            self.tr, self.t0_t, self.t1_t = [], [], []
+        # il testo mostrato non deve contenere timestamp ([N|tempo] o [inizio -> fine])
+        self.tr = [_RE_TS_SUB.sub("", t).strip() for t in self.tr]
+        # la ricerca per tempo (bisect) richiede inizi non decrescenti
+        prev = 0.0
+        for i in range(len(self.t0_t)):
+            self.t0_t[i] = max(self.t0_t[i], prev)
+            self.t1_t[i] = max(self.t1_t[i], self.t0_t[i])
+            prev = self.t0_t[i]
+
+    @classmethod
+    def from_file(cls, path):
+        with open(path, encoding="utf-8") as fh:
+            return cls(karaoke_espandi(json.load(fh)))
+
+    def _prog_jp(self, t):
+        i = bisect_right(self.t0, t) - 1
+        if i < 0:
+            return 0.0
+        d = self.t1[i] - self.t0[i]
+        if t >= self.t1[i] or d <= 0:
+            return self.cw[i + 1]
+        return self.cw[i] + (self.cw[i + 1] - self.cw[i]) * (t - self.t0[i]) / d
+
+    def _frazione_trad(self, i, t):
+        """Frazione della riga tradotta i da illuminare: stessa proporzione di giapponese
+        illuminato nell'intervallo della riga (a tempo se non c'e' giapponese)."""
+        a, b = self.t0_t[i], self.t1_t[i]
+        if t <= a:
+            return 0.0
+        if t >= b or b <= a:
+            return 1.0
+        ca, cb = self._prog_jp(a), self._prog_jp(b)
+        f = (self._prog_jp(t) - ca) / (cb - ca) if cb - ca > 1e-9 else (t - a) / (b - a)
+        return min(1.0, max(0.0, f))
+
+    def _intervallo_trad(self, i, idx):
+        """Intervallo [c0, c1) di caratteri della riga tradotta i che corrisponde al token giapponese
+        idx (stessa proporzione usata per l'illuminazione); esteso a parole intere se il testo ha spazi."""
+        testo = self.tr[i]
+        n = len(testo)
+        a, b = self.t0_t[i], self.t1_t[i]
+        ca, cb = self._prog_jp(a), self._prog_jp(b)
+        if cb - ca > 1e-9:
+            f0 = (self.cw[idx] - ca) / (cb - ca)
+            f1 = (self.cw[idx + 1] - ca) / (cb - ca)
+        elif b > a:
+            f0 = (self.t0[idx] - a) / (b - a)
+            f1 = (self.t1[idx] - a) / (b - a)
+        else:
+            return 0, 0
+        c0 = int(round(n * min(1.0, max(0.0, f0))))
+        c1 = int(round(n * min(1.0, max(0.0, f1))))
+        if c1 <= c0:
+            return c0, c0
+        if " " in testo:
+            while 0 < c0 < n and not testo[c0 - 1].isspace() and not testo[c0].isspace():
+                c0 -= 1
+            while 0 < c1 < n and not testo[c1 - 1].isspace() and not testo[c1].isspace():
+                c1 += 1
+            if c1 > c0 and testo[c1 - 1].isspace():
+                c1 -= 1                   # niente spazio finale evidenziato
+        return c0, c1
+
+    ZOOM_PASSI = 16      # a quanti passi si divide la durata di un token (ridisegni di zoom e colore)
+    ZOOM_AMPIEZZA = 0.25  # ingrandimento massimo: +25%
+
+    @staticmethod
+    def _liscia(x):
+        x = min(1.0, max(0.0, x))
+        return x * x * (3.0 - 2.0 * x)
+
+    def _env(self, passo):
+        """Intensita' 0..1 al passo 'passo': sale in fretta, tiene, poi scende."""
+        u = (passo + 0.5) / self.ZOOM_PASSI
+        return self._liscia(u / 0.25) if u < 0.5 else self._liscia((1.0 - u) / 0.25)
+
+    def _scala_zoom(self, passo):
+        """Scala della lettera al passo 'passo': sale in fretta, tiene, poi torna normale."""
+        return 1.0 + self.ZOOM_AMPIEZZA * self._env(passo)
+
+    def _colore_traduzione(self, passo):
+        """Azzurro intenso del tratto di traduzione in corso: stessa curva del rosso dei kanji."""
+        u = (passo + 0.5) / self.ZOOM_PASSI
+        base = SUB_TRAD if u < 0.5 else SUB_SPOKEN
+        return mix_colore(base, SUB_TRAD_CURRENT, self._env(passo))
+
+    def _colore_corrente(self, passo):
+        """Colore del token in riproduzione: dal bianco sale al rosso, poi si raffredda
+        verso l'arancione dei token gia' pronunciati (nessun salto di colore agli estremi)."""
+        u = (passo + 0.5) / self.ZOOM_PASSI
+        base = SUB_UNSPOKEN if u < 0.5 else SUB_SPOKEN
+        return mix_colore(base, SUB_CURRENT, self._env(passo))
+
+    def chiave(self, t, zoom=False):
+        """Stato dei sottotitoli al tempo t (serve a ridisegnare solo quando cambia)."""
+        k_jp = k_tr = k_z = k_c = None
+        idx = bisect_right(self.t0, t) - 1
+        if idx >= 0:
+            in_corso = t <= self.t1[idx]
+            if in_corso or t - self.t1[idx] <= 1.5:
+                k_jp = (idx, in_corso)
+            if in_corso and self.o[idx].strip():
+                d = self.t1[idx] - self.t0[idx]
+                u = (t - self.t0[idx]) / d if d > 0 else 0.5
+                k_c = (idx, min(self.ZOOM_PASSI - 1, max(0, int(u * self.ZOOM_PASSI))))
+                if zoom:
+                    k_z = k_c
+        if self.tr:
+            it = bisect_right(self.t0_t, t) - 1
+            if it >= 0 and t <= self.t1_t[it] + 1.5:
+                c0 = c1 = 0
+                if k_c is not None:
+                    c0, c1 = self._intervallo_trad(it, k_c[0])
+                if c1 > c0:
+                    k_tr = (it, c0, c1)       # tratto azzurro = dove i kanji sono rossi
+                else:
+                    k_tr = (it, int(round(len(self.tr[it]) * self._frazione_trad(it, t))), None)
+        return (k_jp, k_tr, k_z, k_c)
+
+    def _riga(self, tok, a, b, idx, nascondi=None, corrente=None):
+        out = []
+        for i in range(a, b):
+            col = SUB_SPOKEN if i <= idx else SUB_UNSPOKEN
+            if i == idx and corrente:
+                col = corrente           # token in riproduzione: sfumatura verso il rosso
+            if i == nascondi and tok[i].strip():
+                col = "transparent"      # la lettera in zoom la disegna l'overlay
+            out.append('<span style="color:%s;">%s</span>' % (col, escape(tok[i])))
+        return '<div style="white-space: pre-wrap;">%s</div>' % "".join(out)
+
+    def html(self, k):
+        k_jp, k_tr, k_z, k_c = k
+        nascondi = k_z[0] if k_z else None
+        corrente = self._colore_corrente(k_c[1]) if k_c else None
+        righe = []
+        if k_jp is not None:
+            idx = k_jp[0]
+            a, b = self.seg_range[self.seg[idx]]
+            righe.append(self._riga(self.o, a, b, idx, nascondi, corrente))
+            if self.h[a:b] != self.o[a:b]:   # niente riga hiragana se identica al testo
+                righe.append(self._riga(self.h, a, b, idx, nascondi, corrente))
+        if k_tr is not None:
+            testo = self.tr[k_tr[0]]
+            out = ""
+            if k_tr[2] is not None and k_c:
+                c0, c1 = k_tr[1], k_tr[2]
+                parti = ((testo[:c0], SUB_SPOKEN),
+                         (testo[c0:c1], self._colore_traduzione(k_c[1])),
+                         (testo[c1:], SUB_TRAD))
+            else:
+                cut = k_tr[1]
+                parti = ((testo[:cut], SUB_SPOKEN), (testo[cut:], SUB_TRAD))
+            for frag, col in parti:
+                if frag:
+                    out += '<span style="color:%s;">%s</span>' % (col, escape(frag))
+            righe.append('<div style="white-space: pre-wrap;">%s</div>' % out)
+        return "".join(righe)
+
+    def zoom_tokens(self, k):
+        """Lettere da disegnare ingrandite: [(blocco, posizione UTF-16 nel blocco, testo, scala)].
+        I blocchi sono le righe del html(): kanji, poi (se diversa) hiragana."""
+        k_z = k[2]
+        if not k_z or k[0] is None:
+            return ()
+        idx, passo = k_z
+        a, b = self.seg_range[self.seg[idx]]
+        sc = self._scala_zoom(passo)
+        col = self._colore_corrente(passo)
+        out = [(0, l16("".join(self.o[a:idx])), self.o[idx], sc, col)]
+        if self.h[a:b] != self.o[a:b]:
+            out.append((1, l16("".join(self.h[a:idx])), self.h[idx], sc, col))
+        return tuple(out)
+
+
+class SubtitleOverlay(QWidget):
+    """Strato trasparente sopra il video (ignora il mouse) che disegna i sottotitoli con contorno nero."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setFocusPolicy(Qt.NoFocus)
+        self._html = ""
+        self._zoom = ()
+        self._cache = None
+        parent.installEventFilter(self)
+        self.setGeometry(parent.rect())
+        self.hide()
+
+    def eventFilter(self, obj, ev):
+        if obj is self.parent() and ev.type() == QEvent.Resize:
+            self.setGeometry(self.parent().rect())
+        return False
+
+    def set_html(self, html, zoom=()):
+        if html == self._html and zoom == self._zoom:
+            return
+        if html != self._html:
+            self._cache = None
+        self._html = html
+        self._zoom = tuple(zoom)
+        self.setVisible(bool(html))
+        if html:
+            self.raise_()
+        self.update()
+
+    def _doc(self, html, larg, px):
+        d = QTextDocument()
+        f = QFont(self.font())
+        f.setPixelSize(px)
+        f.setBold(True)
+        d.setDefaultFont(f)
+        o = QTextOption(Qt.AlignHCenter)
+        o.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        d.setDefaultTextOption(o)
+        d.setTextWidth(larg)
+        d.setHtml(html)
+        return d
+
+    def paintEvent(self, event):
+        if not self._html:
+            return
+        w, h = self.width(), self.height()
+        win = self.window()
+        rect_mode = win.isFullScreen() or win.isMaximized()
+        px = max(13, min(int(h * 0.05), 46))
+        y_bottom = h * (0.95 if rect_mode else 0.86)
+        # nella finestra ellittica il testo sta dentro la corda dell'ellisse all'altezza dell'ultima riga
+        larg = int(w * 0.92) if rect_mode else int(2 * ellipse_half_width(w, h, y_bottom) * 0.9)
+        if larg < 40:
+            return
+        chiave = (self._html, larg, px)
+        if self._cache is None or self._cache[0] != chiave:
+            nero = re.sub(r"color:\s*#[0-9a-fA-F]{6}", "color:#000000", self._html)
+            self._cache = (chiave, self._doc(self._html, larg, px), self._doc(nero, larg, px))
+        _, doc, doc_nero = self._cache
+        x = (w - larg) / 2.0
+        y = y_bottom - doc.size().height()
+        r = max(2, px // 12)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        for dx in (-r, 0, r):
+            for dy in (-r, 0, r):
+                if dx or dy:
+                    p.save()
+                    p.translate(x + dx, y + dy)
+                    doc_nero.drawContents(p)
+                    p.restore()
+        p.translate(x, y)
+        doc.drawContents(p)
+        p.translate(-x, -y)
+        if self._zoom:
+            self._disegna_zoom(p, doc, x, y, px, r)
+        p.end()
+
+    def _disegna_zoom(self, p, doc, x, y, px, r):
+        """Disegna ingrandita (con contorno nero) la lettera in riproduzione: nel testo e' trasparente."""
+        f = QFont(self.font())
+        f.setPixelSize(px)
+        f.setBold(True)
+        p.setRenderHint(QPainter.Antialiasing)
+        for blocco, off, testo, sc, col in self._zoom:
+            b = doc.findBlockByNumber(blocco)
+            lay = b.layout() if b.isValid() else None
+            if lay is None or lay.lineCount() == 0 or not testo.strip():
+                continue
+            pos = min(off, max(0, b.length() - 1))
+            riga = lay.lineForTextPosition(pos)
+            if not riga.isValid():
+                continue
+            fine = min(pos + l16(testo), riga.textStart() + riga.textLength())
+            x0 = riga.cursorToX(pos)[0]
+            x1 = riga.cursorToX(fine)[0]
+            base = QPointF(x + lay.position().x() + x0, y + lay.position().y() + riga.y() + riga.ascent())
+            cx = base.x() + (x1 - x0) / 2.0
+            cy = base.y() - riga.ascent() * 0.4
+            path = QPainterPath()
+            path.addText(QPointF(0, 0), f, testo)
+            p.save()
+            p.translate(cx, cy)
+            p.scale(sc, sc)
+            p.translate(-cx, -cy)
+            p.translate(base)
+            p.strokePath(path, QPen(QColor("#000000"), 2 * r + 1, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.fillPath(path, QColor(col))
+            p.restore()
+
+
+class ClockOverlay(QWidget):
+    """Orologio (ora digitale con quadrante e lancette) mostrato sul video in modalita' minimal quando non c'e' nessun video e il mouse e' lontano
+    dai controlli. Ignora il mouse; si aggiorna ogni secondo solo mentre e' visibile."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.active = False
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self.update)
+        parent.installEventFilter(self)
+        self.setGeometry(parent.rect())
+        self.hide()
+
+    def eventFilter(self, obj, ev):
+        if obj is self.parent() and ev.type() == QEvent.Resize:
+            self.setGeometry(self.parent().rect())
+        return False
+
+    def set_active(self, on):
+        self.active = bool(on)
+        if self.active:
+            self.setGeometry(self.parent().rect())
+            self.show()
+            self.raise_()
+            self._timer.start()
+        else:
+            self._timer.stop()
+            self.hide()
+
+    def paintEvent(self, event):
+        w, h = self.width(), self.height()
+        if w < 40 or h < 30: return
+        adesso = QTime.currentTime()
+        ora = adesso.toString("HH:mm")
+        px = max(14, int(min(w * 0.28, h * 0.34)))
+        f = QFont(resolve_ui_font_family())
+        f.setBold(True)
+        f.setPixelSize(px)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        p.setRenderHint(QPainter.Antialiasing)
+        # quadrante: tacche delle ore e lancette (ore, minuti, secondi) che girano con l'ora; le tacche stanno dietro le cifre, le lancette sopra
+        cx, cy = w / 2.0, h / 2.0
+        R = min(w, h) / 2.0 * 0.86
+        for i in range(12):
+            a = math.radians(i * 30)
+            dx, dy = math.sin(a), -math.cos(a)
+            r1 = R * (0.86 if i % 3 == 0 else 0.92)
+            p.setPen(QPen(QColor(255, 255, 255, 120 if i % 3 == 0 else 70), max(1.2, R * (0.028 if i % 3 == 0 else 0.018)),
+                          Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(cx + dx * r1, cy + dy * r1), QPointF(cx + dx * R, cy + dy * R))
+        sec = adesso.second()
+        ang_s = sec * 6.0
+        ang_m = (adesso.minute() + sec / 60.0) * 6.0
+        ang_h = ((adesso.hour() % 12) + adesso.minute() / 60.0) * 30.0
+
+        def lancetta(ang, lung, spess, col, coda=0.0):
+            a = math.radians(ang)
+            dx, dy = math.sin(a), -math.cos(a)
+            a0 = QPointF(cx - dx * coda, cy - dy * coda)
+            a1 = QPointF(cx + dx * lung, cy + dy * lung)
+            o = max(1.0, R * 0.03)
+            p.setPen(QPen(QColor(0, 0, 0, 110), spess, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(a0 + QPointF(o, o), a1 + QPointF(o, o))
+            p.setPen(QPen(col, spess, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(a0, a1)
+
+        p.setFont(f)
+        # centratura sull'inchiostro reale delle cifre (non sul riquadro del font, che ha spazio sopra e sotto)
+        tr = QFontMetrics(f).tightBoundingRect(ora)
+        x = w / 2.0 - (tr.left() + tr.right()) / 2.0
+        y = h / 2.0 - (tr.top() + tr.bottom()) / 2.0      # y della linea di base
+        off = max(1, px // 22)
+        p.setPen(QColor(0, 0, 0, 150))
+        p.drawText(QPointF(x + off, y + off), ora)
+        p.setPen(QColor(255, 255, 255, 235))
+        p.drawText(QPointF(x, y), ora)
+        # le lancette stanno sopra le cifre
+        lancetta(ang_h, R * 0.50, max(2.0, R * 0.075), QColor(0, 0, 255, 185))
+        lancetta(ang_m, R * 0.76, max(1.6, R * 0.05), QColor(0, 0, 255, 185))
+        lancetta(ang_s, R * 0.84, max(1.0, R * 0.02), QColor(255, 42, 42, 230), coda=R * 0.15)
+        p.end()
+
+
 class NekoPlayer(QMainWindow):
     _fs = False
     _normal_geo = None
@@ -2712,6 +3537,17 @@ class NekoPlayer(QMainWindow):
         self.is_muted = False
         self.current_volume = 80
         self.show_osd = False
+        self.subs = None            # KaraokeSubs del video corrente (se esiste il _karaoke.json)
+        self.subs_enabled = True    # spunta nel menu contestuale
+        self.sub_zoom = True        # zoom leggero sulla lettera in riproduzione (spunta nel menu)
+        self.always_on_top = ALWAYS_ON_TOP     # spunta nel menu: finestra sopra tutte le altre
+        self.vsync_enabled = self._leggi_config_bool("vsync_display", True)   # anti-tearing (spunta nel menu, al riavvio)
+        self._audio_only = False    # file solo audio: schermo nero + onda dei dB + karaoke
+        self._audio_path = None
+        self._env_threads = []
+        self._wave_anchor = None
+        self._wave_last_t = 0.0
+        self._sub_key = None
         self.show_bg_texture = True
         self._last_hud_update = 0.0
         self._audio_last_pos = None
@@ -2791,6 +3627,7 @@ class NekoPlayer(QMainWindow):
         self.ear_timer.timeout.connect(self.sync_ears_position)
         self.ear_timer.start()
         self.audio_player = QMediaPlayer(self)
+        self.audio_player.mediaStatusChanged.connect(self._on_audio_status)
         self.worker = VideoProcessorThread()
         self.worker.frame_ready.connect(self.update_video_frame)
         self.worker.position_changed.connect(self.update_timeline)
@@ -2810,11 +3647,11 @@ class NekoPlayer(QMainWindow):
         self._mouse_poll_timer.timeout.connect(self._update_overlay_visibility)
         self._mouse_poll_timer.start()
         QApplication.instance().installEventFilter(self)
+        self._restore_stub = RestoreStub()     # serve solo senza window manager, ma esiste sempre (la spunta cambia a runtime)
+        self._restore_stub.restore_requested.connect(self._restore_from_stub)
         if BYPASS_WM:
             area = QApplication.primaryScreen().availableGeometry()
             self.move(area.center() - QPoint(self.width() // 2, self.height() // 2))
-            self._restore_stub = RestoreStub()
-            self._restore_stub.restore_requested.connect(self._restore_from_stub)
         if initial_video and os.path.isfile(initial_video):
             self.play_video_file(initial_video)
 
@@ -2822,7 +3659,16 @@ class NekoPlayer(QMainWindow):
         self.main_layout = QVBoxLayout()
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
-        self.video_display = VideoDisplayLabel(self.container)
+        # V-Sync anti-tearing: il valore salvato decide quale display creare (si applica all'avvio)
+        self._vsync_active = False
+        if self.vsync_enabled and QOpenGLWidget is not None:
+            try:
+                self.video_display = VideoDisplayGL(self.container)
+                self._vsync_active = True
+            except Exception as e:
+                print(f"[Neko Player] V-Sync non disponibile, uso il display classico: {e}")
+        if not self._vsync_active:
+            self.video_display = VideoDisplayLabel(self.container)
         self.video_display.setAlignment(Qt.AlignCenter)
         self.video_display.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         # Nessun minimo fisso sul video: la finestra deve potersi rimpicciolire liberamente
@@ -2837,6 +3683,15 @@ class NekoPlayer(QMainWindow):
         self.main_layout.addWidget(self.video_display, stretch=1)
         self.osd_label = QLabel(self.video_display)
         self.osd_label.hide()
+        self.wave_overlay = AudioWaveOverlay(self.video_display)
+        self._wave_timer = QTimer(self)
+        self._wave_timer.setInterval(33)
+        self._wave_timer.timeout.connect(self._tick_audio_mode)
+        self.sub_overlay = SubtitleOverlay(self.video_display)
+        self.clock_overlay = ClockOverlay(self.video_display)
+        self._sub_timer = QTimer(self)
+        self._sub_timer.setInterval(40)
+        self._sub_timer.timeout.connect(self._update_subtitles)
         self.timeline_widget = QWidget()
         timeline_layout = QHBoxLayout()
         timeline_layout.setContentsMargins(0, 0, 0, 0)
@@ -3063,6 +3918,16 @@ class NekoPlayer(QMainWindow):
         if getattr(self, "_minimal_on", False):
             top = max(0, ch // 2 - 30)   # in minimal il pannello parte da metà finestra
             return QRect(0, top, cw, ch - top)
+        if self.isFullScreen() or self.isMaximized():
+            # a tutto schermo il pannello e' stretto e centrato: la zona sensibile segue la sua posizione reale
+            # (prima era una fascia larga quanto lo schermo, quindi il pannello non spariva finche' il mouse
+            # restava nella parte bassa, anche lontano da esso)
+            g = self.controls_panel.geometry()
+            if g.width() > 0 and g.height() > 0:
+                left = max(0, g.left() - 80)
+                right = min(cw, g.right() + 80)
+                top = max(0, g.top() - 40)
+                return QRect(left, top, max(1, right - left + 1), max(1, ch - top))
         ph = self.controls_panel.sizeHint().height()
         band = max(120, ph + 46)
         top = max(0, ch - band)
@@ -3091,16 +3956,38 @@ class NekoPlayer(QMainWindow):
             except Exception:
                 pass
 
+    def _set_clock(self, on):
+        co = getattr(self, "clock_overlay", None)
+        if co is not None and co.active != bool(on): co.set_active(on)
+
     def _update_overlay_visibility(self):
         if not hasattr(self, "controls_panel"): return
+        self._set_clock(False)      # l'orologio compare solo nel ramo minimal senza video, piu' sotto
         # In modalità minimal: pannello compatto (solo play + volume), mostrato
-        # all'hover come di consueto; senza video resta sempre visibile
+        # all'hover come di consueto; senza video resta visibile finche' il mouse e' vicino
+        # (se MINIMAL_CLOCK: lontano dal mouse il pannello sparisce e compare l'orologio)
         if getattr(self, "_minimal_on", False):
             self._set_minimal_compact(True)
             if not self._has_video():
-                self._controls_hover = True
-                if not self._controls_visible or not self.controls_panel.isVisible():
-                    self._show_overlay()
+                near = True
+                if MINIMAL_CLOCK and not (self._drag_active or self._resize_active):
+                    try:
+                        local = self.container.mapFromGlobal(QCursor.pos())
+                        zone = self._overlay_zone_rect()
+                        near = (zone.contains(local) or
+                                self.controls_panel.geometry().adjusted(-30, -30, 30, 30).contains(local))
+                    except Exception: near = True
+                if near:
+                    self._controls_hover = True
+                    if not self._controls_visible or not self.controls_panel.isVisible():
+                        self._show_overlay()
+                else:
+                    self._controls_hover = False
+                    if self._controls_visible or self.controls_panel.isVisible():
+                        self._controls_visible = False
+                        self.controls_panel.hide()
+                        self.video_display.update()
+                    self._set_clock(True)
                 self._overlay_hide_timer.stop()
                 return
             gp = QCursor.pos()
@@ -3362,6 +4249,8 @@ class NekoPlayer(QMainWindow):
     def _hide_overlay(self):
         if not hasattr(self, "controls_panel"): return
         if not self._has_video():
+            if MINIMAL_CLOCK and getattr(self, "_minimal_on", False) and not self._controls_hover:
+                return      # minimal senza video e mouse lontano: i controlli restano nascosti (c'e' l'orologio)
             if not self._controls_visible: self._show_overlay()
             return
         if self._drag_active or self._resize_active:
@@ -3575,7 +4464,8 @@ class NekoPlayer(QMainWindow):
             p = url.toLocalFile()
             if not os.path.isfile(p): continue
             ext = os.path.splitext(p)[1].lower().lstrip(".")
-            if ext in VIDEO_EXTS or db.mimeTypeForFile(p).name().startswith("video/"):
+            if (ext in VIDEO_EXTS or ext in AUDIO_EXTS
+                    or db.mimeTypeForFile(p).name().startswith(("video/", "audio/"))):
                 return p
         return None
 
@@ -3943,9 +4833,101 @@ class NekoPlayer(QMainWindow):
             ("Adatta video H", lambda: self.set_video_fill_mode("height"), has_video),
             # Toggle: dimensioni separate "minimal" (salvate in config come window_minimal_*)
             ("Minimal", self.toggle_minimal_mode, can_fit, bool(self._minimal_on)),
+            ("Sottotitoli" if self.subs is not None else "Sottotitoli (nessun karaoke)",
+             self.toggle_subtitles, self.subs is not None, bool(self.subs_enabled and self.subs is not None)),
+            ("Zoom sulla lettera", self.toggle_sub_zoom, self.subs is not None, bool(self.sub_zoom)),
+            ("Sempre in primo piano", self.toggle_always_on_top,
+             can_fit and FREE_WINDOW_MOVE and sys.platform.startswith("linux"), bool(self.always_on_top)),
+            ("V-Sync anti-tearing" + (" (al riavvio)" if self.vsync_enabled != self._vsync_active else ""),
+             self.toggle_vsync, QOpenGLWidget is not None, bool(self.vsync_enabled)),
             self._shaders_menu_item(gpos),
         ])
         self._bubble.popup_at(gpos, self.frameGeometry().center())
+
+    # ------------------------------------------------------------ sottotitoli karaoke
+    def _load_subtitles(self, video_path):
+        """Cerca <video>_karaoke.json accanto al video e, se c'e', lo carica."""
+        self.subs = None
+        self._sub_key = None
+        pj = os.path.splitext(video_path)[0] + "_karaoke.json"
+        if os.path.isfile(pj):
+            try:
+                self.subs = KaraokeSubs.from_file(pj)
+            except Exception as e:
+                print(f"[Sottotitoli] {os.path.basename(pj)} non utilizzabile: {e}")
+        self._sync_sub_timer()
+        return self.subs is not None
+
+    def _sync_sub_timer(self):
+        if self.subs is not None and self.subs_enabled:
+            self._sub_timer.start()
+        else:
+            self._sub_timer.stop()
+            self._sub_key = None
+            self.sub_overlay.set_html("")
+
+    def _update_subtitles(self):
+        if (self.subs is None or not self.subs_enabled
+                or self.audio_player.state() == QMediaPlayer.StoppedState):
+            if self._sub_key is not None:
+                self._sub_key = None
+                self.sub_overlay.set_html("")
+            return
+        k = self.subs.chiave(self.audio_player.position() / 1000.0, self.sub_zoom)
+        if k == self._sub_key: return
+        self._sub_key = k
+        if k == (None, None, None, None):
+            self.sub_overlay.set_html("")
+        else:
+            self.sub_overlay.set_html(self.subs.html(k), self.subs.zoom_tokens(k) if self.sub_zoom else ())
+
+    @staticmethod
+    def _leggi_config_bool(chiave, default):
+        """Legge un booleano dal config prima che le impostazioni vengano caricate (serve alla creazione dei widget)."""
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f: return bool(json.load(f).get(chiave, default))
+        except Exception: return default
+
+    def toggle_always_on_top(self):
+        """Con la spunta la finestra e' senza window manager e resta sopra le altre; senza, e' una finestra normale."""
+        global BYPASS_WM
+        if self.isFullScreen() or self.isMaximized() or self.isMinimized() or getattr(self, "_min", False):
+            self.status.showMessage("Esci da schermo intero/riduzione a icona per cambiare 'Sempre in primo piano'")
+            return
+        self.always_on_top = not self.always_on_top
+        BYPASS_WM = FREE_WINDOW_MOVE and sys.platform.startswith("linux") and self.always_on_top
+        geo = QRect(self.geometry())
+        flags = Qt.Window | Qt.FramelessWindowHint
+        if BYPASS_WM: flags |= Qt.X11BypassWindowManagerHint
+        self.setWindowFlags(flags)            # ricrea la finestra nativa (la nasconde)
+        self.setGeometry(geo)
+        self.show()
+        for w in (self.ear_left, self.ear_right, self.whiskers_left, self.whiskers_right):
+            _imposta_bypass_overlay(w, BYPASS_WM)
+        self._ears_key = None
+        self._whiskers_key = None
+        self._ears_force_raise = True
+        self._last_size_key = None
+        self._update_shape()
+        self.sync_ears_position()
+        self.activateWindow()
+        self.save_settings()
+
+    def toggle_vsync(self):
+        self.vsync_enabled = not self.vsync_enabled
+        self.save_settings()
+        self.status.showMessage("V-Sync anti-tearing " + ("attivo" if self.vsync_enabled else "disattivato")
+                                + ": si applica al prossimo avvio di Neko Player")
+
+    def toggle_sub_zoom(self):
+        self.sub_zoom = not self.sub_zoom
+        self._sub_key = None
+        self.save_settings()
+
+    def toggle_subtitles(self):
+        self.subs_enabled = not self.subs_enabled
+        self._sync_sub_timer()
+        self.save_settings()
 
     def _shader_files(self):
         try:
@@ -4274,6 +5256,10 @@ class NekoPlayer(QMainWindow):
             "volume": self.slider_volume.value(),
             "muted": self.is_muted,
             "show_osd": self.show_osd,
+            "vsync_display": self.vsync_enabled,
+            "always_on_top": self.always_on_top,
+            "subtitles_enabled": bool(self.subs_enabled),
+            "subtitles_zoom": bool(self.sub_zoom),
             "show_bg_texture": self.chk_texture.isChecked(),
             "video_fill_mode": getattr(self, "_video_fill_mode", "height"),
             "minimal_mode": bool(getattr(self, "_minimal_on", False)),
@@ -4360,6 +5346,9 @@ class NekoPlayer(QMainWindow):
             # minimo della finestra (serve anche per aprire dimensioni < 320x200)
             self._apply_minimal_size_limits(self._minimal_on)
             self.show_osd = config_data.get("show_osd", False)
+            self.subs_enabled = bool(config_data.get("subtitles_enabled", True))
+            self.sub_zoom = bool(config_data.get("subtitles_zoom", True))
+            self.vsync_enabled = bool(config_data.get("vsync_display", True))
             self.last_video_dir = config_data.get("last_video_dir", "")
             self.last_model_dir = config_data.get("last_model_dir", "")
             # Timestamp di ripresa salvati per i video già visti
@@ -4479,7 +5468,7 @@ class NekoPlayer(QMainWindow):
             self.ear_left.trigger_twitch()
             self.ear_right.trigger_twitch()
             self.trigger_whiskers_wiggle()
-            if self.worker.running: self.toggle_play_pause()
+            if self.worker.running or self._audio_only: self.toggle_play_pause()
             event.accept()
         elif key == Qt.Key_W:
             self.trigger_whiskers_wiggle()
@@ -4526,12 +5515,16 @@ class NekoPlayer(QMainWindow):
         cur_pos_ms = self.audio_player.position()
         target_ms = max(0, cur_pos_ms + int(delta_sec * 1000))
         self.audio_player.setPosition(target_ms)
+        if self._audio_only: return       # nessun decoder video da riposizionare
         self.worker.request_seek_seconds(delta_sec)
 
     def on_slider_pressed(self): self.is_slider_dragged = True
     def on_slider_released(self):
         self.is_slider_dragged = False
         target_frame = self.slider.value()
+        if self._audio_only:              # nel modo audio lo slider e' in millisecondi
+            self.audio_player.setPosition(int(target_frame))
+            return
         if self.worker.video_path:
             fps = self.worker.video_fps or 25.0
             target_ms = int((target_frame / fps) * 1000.0)
@@ -4551,10 +5544,10 @@ class NekoPlayer(QMainWindow):
     def _remember_current_position(self):
         """Salva il timestamp del video attualmente caricato (per riprenderlo alla riapertura)."""
         try:
-            path = self.worker.video_path
+            path = self._audio_path if self._audio_only else self.worker.video_path
             if not path: return
             # frame mostrati dal worker; eventuale fallback: posizione dell'audio player
-            pos_ms = int(self.worker._shown_pos * 1000.0 / max(1.0, self.worker.video_fps))
+            pos_ms = 0 if self._audio_only else int(self.worker._shown_pos * 1000.0 / max(1.0, self.worker.video_fps))
             if self.audio_player.isAvailable():
                 ap = self.audio_player.position()
                 if ap and ap > 0: pos_ms = ap
@@ -4570,19 +5563,24 @@ class NekoPlayer(QMainWindow):
         except Exception: pass
 
     def play_video_file(self, file_path):
+        if os.path.splitext(file_path)[1].lower().lstrip(".") in AUDIO_EXTS:
+            return self.play_audio_file(file_path)
         # prima di cambiare video, ricorda dove eravamo arrivati nel precedente
-        if self.worker.video_path: self._remember_current_position()
+        if self.worker.video_path or self._audio_only: self._remember_current_position()
+        self._leave_audio_mode()
         self.worker.stop()
         self.audio_player.stop()
         self.worker.paused = False
         self.worker.audio_clock = None
         self._audio_last_pos = None
+        has_subs = self._load_subtitles(file_path)
         url = QUrl.fromLocalFile(file_path)
         self.audio_player.setMedia(QMediaContent(url))
         self.worker.set_video(file_path)
         self.btn_play_pause.setEnabled(True)
         self.btn_play_pause.set_playing(True)
-        self.status.showMessage(f"In riproduzione: {os.path.basename(file_path)}")
+        self.status.showMessage(f"In riproduzione: {os.path.basename(file_path)}"
+                                + ("  ·  sottotitoli karaoke caricati" if has_subs else ""))
         self._update_display_target()
         self.audio_player.play()
         self.worker.start()
@@ -4596,11 +5594,112 @@ class NekoPlayer(QMainWindow):
                 if dur and target >= dur - 2000: target = 0   # era alla fine: riparti da capo
                 if target <= 0: return
                 self.audio_player.setPosition(target)
-                target_frame = int(target / 1000.0 * max(1, int(self.worker.video_fps)))
-                self.worker.request_seek_frame(target_frame)
+                self.worker.request_seek_time(target / 1000.0)
                 self.status.showMessage(
                     f"Ripresa da {format_time(target / 1000.0)}: {os.path.basename(file_path)}")
             QTimer.singleShot(400, _resume_at_saved)
+
+    # ------------------------------------------------------------ file solo audio
+    def play_audio_file(self, file_path):
+        """File solo audio: schermo nero, karaoke e sinusoide dei dB al posto del video."""
+        if self.worker.video_path or self._audio_only: self._remember_current_position()
+        self.worker.stop()
+        self.worker.set_video(None)
+        self._stop_envelope_threads()
+        self.audio_player.stop()
+        self.worker.paused = False
+        self.worker.audio_clock = None
+        self._audio_last_pos = None
+        self._audio_only = True
+        self._audio_path = file_path
+        self._wave_anchor = None
+        self._wave_last_t = 0.0
+        has_subs = self._load_subtitles(file_path)
+        self.audio_player.setMedia(QMediaContent(QUrl.fromLocalFile(file_path)))
+        self.btn_play_pause.setEnabled(True)
+        self.btn_play_pause.set_playing(True)
+        self.osd_label.hide()
+        self.wave_overlay.set_envelope(None)
+        self.wave_overlay.show()
+        self.wave_overlay.lower()
+        th = AudioEnvelopeThread(file_path, self)
+        th.ready.connect(self._on_envelope_ready)
+        th.finished.connect(lambda t=th: self._env_threads.remove(t) if t in self._env_threads else None)
+        self._env_threads.append(th)
+        th.start()
+        self._wave_timer.start()
+        self.status.showMessage(f"In riproduzione (audio): {os.path.basename(file_path)}"
+                                + ("  ·  sottotitoli karaoke caricati" if has_subs else ""))
+        self.audio_player.play()
+        saved_ms = self.resume_positions.get(file_path, 0)
+        if saved_ms > 2000:
+            def _resume_at_saved():
+                if self._audio_path != file_path: return
+                dur = self.audio_player.duration()
+                target = saved_ms
+                if dur and target >= dur - 2000: target = 0
+                if target <= 0: return
+                self.audio_player.setPosition(target)
+                self.status.showMessage(
+                    f"Ripresa da {format_time(target / 1000.0)}: {os.path.basename(file_path)}")
+            QTimer.singleShot(400, _resume_at_saved)
+        self._update_overlay_visibility()
+
+    def _leave_audio_mode(self):
+        if not self._audio_only: return
+        self._audio_only = False
+        self._audio_path = None
+        self._wave_timer.stop()
+        self._stop_envelope_threads()
+        self.wave_overlay.set_envelope(None)
+        self.wave_overlay.hide()
+
+    def _stop_envelope_threads(self):
+        for th in list(self._env_threads):
+            th.stop()
+            try: th.ready.disconnect(self._on_envelope_ready)
+            except TypeError: pass
+
+    def _on_envelope_ready(self, path, db):
+        if self._audio_only and path == self._audio_path:
+            self.wave_overlay.set_envelope(db)
+
+    def _tick_audio_mode(self):
+        """Ogni ~33 ms: tempo di riproduzione (interpolato) per l'onda e avanzamento della timeline."""
+        if not self._audio_only: return
+        ap = self.audio_player
+        pos = ap.position() / 1000.0
+        now = time.perf_counter()
+        playing = ap.state() == QMediaPlayer.PlayingState
+        a = self._wave_anchor
+        if a is None or pos != a[0]:
+            self._wave_anchor = a = (pos, now)
+        t = pos + min(now - a[1], 1.0) if playing else pos
+        if playing and 0.0 < self._wave_last_t - t < 0.3:
+            t = self._wave_last_t          # niente piccoli passi indietro dovuti al campionamento
+        self._wave_last_t = t
+        self.wave_overlay.set_time(t)
+        dur = ap.duration()
+        if dur > 0:
+            self.total_duration_sec = dur / 1000.0
+            if not self.is_slider_dragged:
+                for sl in (self.slider, self.slider_b):
+                    sl.blockSignals(True)
+                    sl.setMaximum(int(dur))
+                    sl.setValue(int(pos * 1000.0))
+                    sl.blockSignals(False)
+                    sl.update()
+
+    def _on_audio_status(self, status):
+        if not self._audio_only or status != QMediaPlayer.EndOfMedia: return
+        if LOOP_VIDEO:
+            self._wave_anchor = None
+            self._wave_last_t = 0.0
+            self.audio_player.setPosition(0)
+            self.audio_player.play()
+        else:
+            self._leave_audio_mode()
+            self.on_video_finished()
 
     def _update_audio_clock(self):
         if self.audio_player.state() != QMediaPlayer.PlayingState:
@@ -4816,13 +5915,17 @@ class NekoPlayer(QMainWindow):
         self.btn_play_pause.setEnabled(False)
         self.btn_play_pause.set_playing(False)
         self.audio_player.stop()
+        self._sub_key = None
+        self.sub_overlay.set_html("")
         self.show_default_background()
         self._update_overlay_visibility()
 
     def closeEvent(self, event):
         self._save_timer.stop()
         # prima di chiudere, ricorda il timestamp del video in riproduzione/pausa
-        if self.worker.video_path: self._remember_current_position()
+        if self.worker.video_path or self._audio_only: self._remember_current_position()
+        self._stop_envelope_threads()
+        for th in list(self._env_threads): th.wait(1500)
         self._write_settings()
         if getattr(self, "_bubble", None) is not None:
             try: self._bubble.close()
@@ -4833,7 +5936,7 @@ class NekoPlayer(QMainWindow):
         self.ear_right.close()
         self.whiskers_left.close()
         self.whiskers_right.close()
-        if BYPASS_WM: self._restore_stub.close()
+        self._restore_stub.close()
         event.accept()
 
 if __name__ == '__main__':
