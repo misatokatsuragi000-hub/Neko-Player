@@ -3438,17 +3438,37 @@ class ClockOverlay(QWidget):
     """Orologio (ora digitale con quadrante e lancette) mostrato sul video in modalita' minimal quando non c'e' nessun video e il mouse e' lontano
     dai controlli. Ignora il mouse; si aggiorna ogni secondo solo mentre e' visibile."""
 
+    minute_rolled_over = None      # callback impostata in NekoPlayer dopo la creazione (richiama on_clock_minute)
+
     def __init__(self, parent):
         super().__init__(parent)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setFocusPolicy(Qt.NoFocus)
         self.active = False
+        self._last_minute = QTime.currentTime().minute()   # per rilevare il passaggio al minuto nuovo (baffi che tremano)
+        self._fired_minute = None    # ultimo minuto su cui ha gia' tremato (None = non ancora tremato in questo accensione)
+        self.minute_rolled_over = None
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
-        self._timer.timeout.connect(self.update)
+        self._timer.timeout.connect(self._on_tick)
         parent.installEventFilter(self)
         self.setGeometry(parent.rect())
         self.hide()
+
+    def _on_tick(self):
+        adesso = QTime.currentTime()
+        m = adesso.minute()
+        # il cambio di minuto viene colto al primo tick del minuto nuovo:
+        # notifica la callback (baffi che tremano) una sola volta per minuto
+        fired = getattr(self, "_fired_minute", None)
+        if fired != m:
+            self._fired_minute = m
+            self._last_minute = m
+            cb = self.minute_rolled_over
+            if callable(cb):
+                try: cb()
+                except Exception: pass
+        self.update()
 
     def eventFilter(self, obj, ev):
         if obj is self.parent() and ev.type() == QEvent.Resize:
@@ -3456,15 +3476,33 @@ class ClockOverlay(QWidget):
         return False
 
     def set_active(self, on):
-        self.active = bool(on)
-        if self.active:
+        on = bool(on)
+        was = self.active
+        self.active = on
+        if on:
+            if not was:
+                # all'accensione l'orologio parte 'fresco': non si trema finche'
+                # il minuto non cambia davvero
+                self._last_minute = QTime.currentTime().minute()
+                self._fired_minute = self._last_minute
             self.setGeometry(self.parent().rect())
             self.show()
             self.raise_()
-            self._timer.start()
+            if not was:
+                # ripartenza del timer allineata a inizio secondo: il tick successivo
+                # cadera' subito dopo il cambio di minuto (non a meta' del minuto vecchio)
+                self._timer.stop()
+                ms = QTime.currentTime().msec()
+                delay = 1000 - ms if ms > 5 else 1000 - (ms - 5)
+                QTimer.singleShot(max(16, min(1000, delay)), self._start_tick_timer)
         else:
             self._timer.stop()
             self.hide()
+
+    def _start_tick_timer(self):
+        if self.active:
+            self._on_tick()          # dipinge subito e sincronizza i minuti
+            self._timer.start()
 
     def paintEvent(self, event):
         w, h = self.width(), self.height()
@@ -3689,6 +3727,7 @@ class NekoPlayer(QMainWindow):
         self._wave_timer.timeout.connect(self._tick_audio_mode)
         self.sub_overlay = SubtitleOverlay(self.video_display)
         self.clock_overlay = ClockOverlay(self.video_display)
+        self.clock_overlay.minute_rolled_over = self.on_clock_minute
         self._sub_timer = QTimer(self)
         self._sub_timer.setInterval(40)
         self._sub_timer.timeout.connect(self._update_subtitles)
@@ -4319,6 +4358,17 @@ class NekoPlayer(QMainWindow):
         self.trigger_whiskers_wiggle()
         self._shake_hold = True   # la testa vibra finché il baffo è tenuto premuto
         self.shake_head()
+
+    def on_clock_minute(self):
+        """Orologio attivo: al minuto nuovo i baffi tremano come quando si clicca sulla finestra."""
+        if not getattr(self, "clock_overlay", None) or not self.clock_overlay.active: return
+        # identico al click sul baffo: orecchie + baffi + vibrazione della testa
+        self.ear_left.trigger_twitch()
+        self.ear_right.trigger_twitch()
+        self.trigger_whiskers_wiggle()
+        self._shake_hold = True   # ampiezza costante per un istante...
+        self.shake_head()
+        self._shake_hold = False  # ...poi la vibrazione si smorza da sola (niente mouse premuto)
 
     def on_whisker_pull_moved(self, w: QPoint):
         """Baffo tirato oltre il 150%: la finestra (con orecchie e baffi) segue il cursore di `w` px.
