@@ -6,6 +6,7 @@ from bisect import bisect_right
 from html import escape
 import ctypes
 import math
+import random
 import sysconfig
 import subprocess
 import re
@@ -51,6 +52,8 @@ EARS_ROTATION_REF_HEIGHT = 520.0  # altezza finestra (px) a cui le orecchie ruot
 HEAD_SHAKE_AMPLITUDE = 6.0       # vibrazione della testa quando si clicca un baffo: ampiezza massima (px)
 HEAD_SHAKE_DURATION = 0.45       # durata (s)
 HEAD_SHAKE_FREQ = 13.0           # oscillazioni al secondo
+HEAD_WANDER_DURATION = 5.0       # play senza video: la testa gira per lo schermo per questi secondi (s)
+HEAD_WANDER_SPEED = (200.0, 320.0)   # velocita' iniziale (px/s) scelta a caso; poi resta costante (moto a palla da biliardo)
 WHISKER_PULL_MAX_STRETCH = 1.5   # tenendo premuto e tirando un baffo si allunga fino a questa frazione della sua lunghezza (1.5 = 150%); oltre, la finestra inizia a seguire il cursore
 # Le dimensioni salvate dalle versioni a 5 finestre erano quelle del solo rettangolo centrale: gli archi
 # lo ingrandivano di questo fattore (più il bordo) su ogni asse. Serve a convertirle alla prima apertura.
@@ -1119,6 +1122,7 @@ class NosePlayButton(QPushButton):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._playing = True
+        self.idle = False      # nessun video: aspetto spento, ma il pulsante resta cliccabile
         self.setFixedSize(64, 40)
         self.setMask(QRegion(0, 0, 64, 40, QRegion.Ellipse))   # fuori dall'ellisse il widget non esiste
         self.setCursor(Qt.PointingHandCursor)
@@ -1129,6 +1133,9 @@ class NosePlayButton(QPushButton):
     def minimumSizeHint(self): return QSize(64, 40)
     def set_playing(self, playing):
         self._playing = bool(playing)
+        self.update()
+    def set_idle(self, idle):
+        self.idle = bool(idle)
         self.update()
     def hitButton(self, pos):
         r = QRectF(self.rect())
@@ -1145,7 +1152,8 @@ class NosePlayButton(QPushButton):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
         rect = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
-        if not self.isEnabled():
+        dim = self.idle or not self.isEnabled()
+        if dim:
             fill, glyph = QColor("#313244"), QColor("#6c7086")
         elif self.isDown():
             if self._playing: fill, glyph = QColor("#16233f"), QColor("#c3d4ff")
@@ -1160,7 +1168,7 @@ class NosePlayButton(QPushButton):
         p.setPen(Qt.NoPen)            # nessun bordo
         p.setBrush(QBrush(fill))
         p.drawEllipse(rect)
-        if self.isEnabled():
+        if not dim:
             shine = QRectF(rect.left() + rect.width() * 0.20, rect.top() + rect.height() * 0.14,
                            rect.width() * 0.26, rect.height() * 0.18)
             p.setBrush(QColor(255, 255, 255, 95))
@@ -3434,6 +3442,27 @@ class SubtitleOverlay(QWidget):
             p.restore()
 
 
+# Colore delle cifre dell'orologio: gradiente lineare di hue che si ripete ogni giorno e si aggiorna ogni minuto.
+#   06:00 rosso (0 gradi) -> hue che cresce in modo lineare (giallo, verde, ciano...) -> 24:00 blu (240 gradi);
+#   da mezzanotte alle 06:00 prosegue (viola, magenta) fino a tornare al rosso: nessun salto, il ciclo si chiude.
+# La luminosita' segue la notte: scurissima a mezzanotte (blu quasi nero), piena dalle 06:00 alle 18:00.
+CLOCK_RED_HOUR = 6.0            # ora a cui l'hue e' rosso
+CLOCK_BLUE_HUE = 240.0          # hue raggiunto a mezzanotte (blu)
+CLOCK_MIN_VALUE = 90            # luminosita' (0-255) a mezzanotte: blu scurissimo
+CLOCK_FULL_VALUE_HOURS = 6.0    # a questa distanza (in ore) da mezzanotte la luminosita' e' gia' piena
+
+def clock_color_for_hour(hour: float, alpha: int = 235) -> QColor:
+    """Colore delle cifre per l'ora frazionaria `hour` (0-24): hue lineare, rosso alle 06:00 e blu a mezzanotte."""
+    hour = hour % 24.0
+    if hour >= CLOCK_RED_HOUR:      # 06:00 -> 24:00: da 0 gradi a CLOCK_BLUE_HUE
+        hue = CLOCK_BLUE_HUE * (hour - CLOCK_RED_HOUR) / (24.0 - CLOCK_RED_HOUR)
+    else:                           # 00:00 -> 06:00: da CLOCK_BLUE_HUE a 360 (di nuovo rosso)
+        hue = CLOCK_BLUE_HUE + (360.0 - CLOCK_BLUE_HUE) * hour / CLOCK_RED_HOUR
+    d = min(hour, 24.0 - hour)      # ore di distanza da mezzanotte
+    val = CLOCK_MIN_VALUE + (255 - CLOCK_MIN_VALUE) * min(1.0, d / CLOCK_FULL_VALUE_HOURS)
+    return QColor.fromHsvF((hue % 360.0) / 360.0, 1.0, val / 255.0, alpha / 255.0)
+
+
 class ClockOverlay(QWidget):
     """Orologio (ora digitale con quadrante e lancette) mostrato sul video in modalita' minimal quando non c'e' nessun video e il mouse e' lontano
     dai controlli. Ignora il mouse; si aggiorna ogni secondo solo mentre e' visibile."""
@@ -3445,6 +3474,7 @@ class ClockOverlay(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setFocusPolicy(Qt.NoFocus)
         self.active = False
+        self.bg_color = QColor(FRAME_COLOR)    # sfondo dell'orologio: segue il colore scelto col color picker
         self._last_minute = QTime.currentTime().minute()   # per rilevare il passaggio al minuto nuovo (baffi che tremano)
         self._fired_minute = None    # ultimo minuto su cui ha gia' tremato (None = non ancora tremato in questo accensione)
         self.minute_rolled_over = None
@@ -3454,6 +3484,12 @@ class ClockOverlay(QWidget):
         parent.installEventFilter(self)
         self.setGeometry(parent.rect())
         self.hide()
+
+    def set_bg_color(self, hex_color):
+        c = QColor(hex_color)
+        if c.isValid():
+            self.bg_color = c
+            self.update()
 
     def _on_tick(self):
         adesso = QTime.currentTime()
@@ -3510,20 +3546,21 @@ class ClockOverlay(QWidget):
         adesso = QTime.currentTime()
         ora = adesso.toString("HH:mm")
         px = max(14, int(min(w * 0.28, h * 0.34)))
-        f = QFont(resolve_ui_font_family())
+        f = QFont("Orbitron")
         f.setBold(True)
         f.setPixelSize(px)
         p = QPainter(self)
         p.setRenderHint(QPainter.TextAntialiasing)
         p.setRenderHint(QPainter.Antialiasing)
-        # quadrante: tacche delle ore e lancette (ore, minuti, secondi) che girano con l'ora; le tacche stanno dietro le cifre, le lancette sopra
+        p.fillRect(self.rect(), self.bg_color)    # sfondo a tinta unita del colore tema (copre la texture sfondo.png)
+        # quadrante: tacche delle ore e lancette (ore, minuti, secondi) che girano con l'ora; tacche e lancette stanno dietro le cifre
         cx, cy = w / 2.0, h / 2.0
         R = min(w, h) / 2.0 * 0.86
         for i in range(12):
             a = math.radians(i * 30)
             dx, dy = math.sin(a), -math.cos(a)
-            r1 = R * (0.86 if i % 3 == 0 else 0.92)
-            p.setPen(QPen(QColor(255, 255, 255, 120 if i % 3 == 0 else 70), max(1.2, R * (0.028 if i % 3 == 0 else 0.018)),
+            r1 = R * (0.80 if i % 3 == 0 else 0.89)     # le tacche delle ore 12/3/6/9 sono piu' lunghe
+            p.setPen(QPen(QColor(0, 0, 0, 255 if i % 3 == 0 else 230), max(2.0, R * (0.050 if i % 3 == 0 else 0.036)),
                           Qt.SolidLine, Qt.RoundCap))
             p.drawLine(QPointF(cx + dx * r1, cy + dy * r1), QPointF(cx + dx * R, cy + dy * R))
         sec = adesso.second()
@@ -3537,10 +3574,36 @@ class ClockOverlay(QWidget):
             a0 = QPointF(cx - dx * coda, cy - dy * coda)
             a1 = QPointF(cx + dx * lung, cy + dy * lung)
             o = max(1.0, R * 0.03)
-            p.setPen(QPen(QColor(0, 0, 0, 110), spess, Qt.SolidLine, Qt.RoundCap))
-            p.drawLine(a0 + QPointF(o, o), a1 + QPointF(o, o))
-            p.setPen(QPen(col, spess, Qt.SolidLine, Qt.RoundCap))
-            p.drawLine(a0, a1)
+            # punta ad uncino come quella della coda dei diavoli: freccia con due alette rivolte all'indietro
+            hl = max(spess * 2.4, R * 0.09)          # lunghezza della punta
+            hw = hl * 0.62                           # semilarghezza massima (alette)
+            def pt(u, v): return QPointF(v, -u)      # riferimento locale: u lungo la lancetta (punta = 0, indietro < 0), v di lato
+            punta = QPainterPath()
+            punta.moveTo(pt(0, 0))
+            punta.cubicTo(pt(-hl * 0.15, hw * 0.55), pt(-hl * 0.60, hw * 1.10), pt(-hl, hw))
+            punta.quadTo(pt(-hl * 0.95, hw * 0.35), pt(-hl * 0.55, hw * 0.12))
+            punta.lineTo(pt(-hl * 0.55, -hw * 0.12))
+            punta.quadTo(pt(-hl * 0.95, -hw * 0.35), pt(-hl, -hw))
+            punta.cubicTo(pt(-hl * 0.60, -hw * 1.10), pt(-hl * 0.15, -hw * 0.55), pt(0, 0))
+            punta.closeSubpath()
+            base = QPointF(cx + dx * (lung - hl * 0.55), cy + dy * (lung - hl * 0.55))   # il gambo finisce dove inizia il collo della punta
+            def disegna(off, pen_col, fill_col):
+                p.setPen(QPen(pen_col, spess, Qt.SolidLine, Qt.RoundCap))
+                p.drawLine(a0 + off, base + off)
+                p.save()
+                p.translate(a1 + off)
+                p.rotate(ang)
+                p.setPen(Qt.NoPen)
+                p.setBrush(fill_col)
+                p.drawPath(punta)
+                p.restore()
+            disegna(QPointF(o, o), QColor(0, 0, 0, 110), QColor(0, 0, 0, 110))
+            disegna(QPointF(0, 0), col, col)
+
+        # le lancette stanno sotto le cifre (disegnate prima)
+        lancetta(ang_h, R * 0.50, max(2.0, R * 0.075), QColor(0, 0, 255, 185))
+        lancetta(ang_m, R * 0.76, max(1.6, R * 0.05), QColor(0, 0, 255, 185))
+        lancetta(ang_s, R * 0.84, max(1.0, R * 0.02), QColor(255, 42, 42, 230), coda=R * 0.15)
 
         p.setFont(f)
         # centratura sull'inchiostro reale delle cifre (non sul riquadro del font, che ha spazio sopra e sotto)
@@ -3548,14 +3611,25 @@ class ClockOverlay(QWidget):
         x = w / 2.0 - (tr.left() + tr.right()) / 2.0
         y = h / 2.0 - (tr.top() + tr.bottom()) / 2.0      # y della linea di base
         off = max(1, px // 22)
-        p.setPen(QColor(0, 0, 0, 150))
-        p.drawText(QPointF(x + off, y + off), ora)
-        p.setPen(QColor(255, 255, 255, 235))
-        p.drawText(QPointF(x, y), ora)
-        # le lancette stanno sopra le cifre
-        lancetta(ang_h, R * 0.50, max(2.0, R * 0.075), QColor(0, 0, 255, 185))
-        lancetta(ang_m, R * 0.76, max(1.6, R * 0.05), QColor(0, 0, 255, 185))
-        lancetta(ang_s, R * 0.84, max(1.0, R * 0.02), QColor(255, 42, 42, 230), coda=R * 0.15)
+        testo = QPainterPath()
+        testo.addText(QPointF(x, y), f, ora)
+        # il tratto e' centrato sul bordo delle lettere: meta' resta sotto il riempimento, quindi lo spessore visibile
+        # all'esterno e' la meta' di questo valore
+        spess_contorno = max(1.5, px * 0.05)
+        spess_ombra = max(2.5, px * 0.09)     # base dell'ombra (indipendente dal contorno)
+        # ombra morbida sotto la scritta: piu' passate nere trasparenti, sempre piu' larghe, spostate verso il basso
+        sx, sy = max(1.0, px * 0.02), max(2.0, px * 0.06)
+        p.save()
+        p.translate(sx, sy)
+        for i in range(5):
+            w_ombra = spess_ombra + i * max(1.5, px * 0.025)
+            p.strokePath(testo, QPen(QColor(0, 0, 0, 38), w_ombra, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.fillPath(testo, QColor(0, 0, 0, 90))
+        p.restore()
+        # contorno bianco
+        p.strokePath(testo, QPen(QColor(255, 255, 255, 255), spess_contorno, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        # riempimento col colore del ciclo giornaliero (hue aggiornato ogni minuto), opaco per non alterarsi sul contorno
+        p.fillPath(testo, clock_color_for_hour(adesso.hour() + adesso.minute() / 60.0, 255))
         p.end()
 
 
@@ -3563,6 +3637,8 @@ class NekoPlayer(QMainWindow):
     _fs = False
     _normal_geo = None
     _min = False
+    _media_loaded = False   # c'e' un video/audio caricato (il pulsante play e' 'attivo')
+    _wandering = False      # la testa sta girando per lo schermo (play senza video)
     def __init__(self, initial_video=None):
         super().__init__()
         flags = Qt.Window | Qt.FramelessWindowHint
@@ -3656,6 +3732,9 @@ class NekoPlayer(QMainWindow):
         self._shake_timer = QTimer(self)
         self._shake_timer.setInterval(8)
         self._shake_timer.timeout.connect(self._shake_tick)
+        self._wander_timer = QTimer(self)
+        self._wander_timer.setInterval(16)
+        self._wander_timer.timeout.connect(self._wander_tick)
         # Trascina e rilascia: finestra principale + overlay (sono finestre separate e intercetterebbero il drop)
         self.setAcceptDrops(True)
         for w in (self.ear_left, self.ear_right):
@@ -3728,6 +3807,7 @@ class NekoPlayer(QMainWindow):
         self.sub_overlay = SubtitleOverlay(self.video_display)
         self.clock_overlay = ClockOverlay(self.video_display)
         self.clock_overlay.minute_rolled_over = self.on_clock_minute
+        self.clock_overlay.set_bg_color(self.theme_color)
         self._sub_timer = QTimer(self)
         self._sub_timer.setInterval(40)
         self._sub_timer.timeout.connect(self._update_subtitles)
@@ -3825,7 +3905,7 @@ class NekoPlayer(QMainWindow):
         self.btn_color.clicked.connect(self.choose_theme_color)
 
         self.btn_play_pause = NosePlayButton()
-        self.btn_play_pause.setEnabled(False)
+        self._set_media_loaded(False)
         self.btn_play_pause.clicked.connect(self.toggle_play_pause)
 
         self.btn_mute = QPushButton("🔊")
@@ -3977,7 +4057,7 @@ class NekoPlayer(QMainWindow):
         try:
             if getattr(self.worker, "running", False): return True
             if self.audio_player.state() == QMediaPlayer.PlayingState: return True
-            if self.btn_play_pause.isEnabled(): return True
+            if self._media_loaded: return True
             return False
         except Exception: return False
 
@@ -4001,7 +4081,8 @@ class NekoPlayer(QMainWindow):
 
     def _update_overlay_visibility(self):
         if not hasattr(self, "controls_panel"): return
-        self._set_clock(False)      # l'orologio compare solo nel ramo minimal senza video, piu' sotto
+        # l'orologio compare in minimal senza video, anche quando il menu e' visibile (il pannello sta sopra l'orologio)
+        self._set_clock(bool(MINIMAL_CLOCK and getattr(self, "_minimal_on", False) and not self._has_video()))
         # In modalità minimal: pannello compatto (solo play + volume), mostrato
         # all'hover come di consueto; senza video resta visibile finche' il mouse e' vicino
         # (se MINIMAL_CLOCK: lontano dal mouse il pannello sparisce e compare l'orologio)
@@ -4026,7 +4107,6 @@ class NekoPlayer(QMainWindow):
                         self._controls_visible = False
                         self.controls_panel.hide()
                         self.video_display.update()
-                    self._set_clock(True)
                 self._overlay_hide_timer.stop()
                 return
             gp = QCursor.pos()
@@ -4083,6 +4163,7 @@ class NekoPlayer(QMainWindow):
         cw, ch = self.container.width(), self.container.height()
         # in minimal il naso ha posizione fissa (parte da metà finestra) e la bocca sta a metà strada tra il centro del naso e il bordo inferiore
         fixed_y = self._minimal_face_layout(ch)
+        if fixed_y is None: self._apply_face_spacing(ch)
         hint = self.controls_panel.sizeHint()
         h = hint.height()
         if self.isFullScreen() or self.isMaximized():
@@ -4101,7 +4182,11 @@ class NekoPlayer(QMainWindow):
             # la base degli occhi parte da metà finestra e i bottoni stanno subito sotto; se non c'è abbastanza spazio sotto,
             # il pannello resta dove sarebbe stato (ancorato in basso)
             mid_y = self._eyes_mid_y(ch)
-            if mid_y is not None: y = max(8, min(y, mid_y))
+            if mid_y is not None:
+                mb = 8 if (self.isFullScreen() or self.isMaximized()) else FRAME_BORDER_WIDTH + ELLIPSE_BAND + 8
+                # se il pannello sta nella finestra parte esattamente da mid_y (occhi a metà, naso a 1/3 dal basso);
+                # altrimenti (finestra minuscola) resta ancorato come prima
+                y = max(8, mid_y if mid_y + h <= ch - mb else min(y, mid_y))
         if fixed_y is not None:
             w = max(1, min(cw, hint.width()))
             x = (cw - w) // 2
@@ -4231,8 +4316,7 @@ class NekoPlayer(QMainWindow):
         tw = 2 * ew + gap
         depth = EyeSlider.depth_for_width(eye_arc)
         # gli occhi salgono dalla metà finestra: la collina non deve uscire dal bordo alto
-        room = (self.container.height() - 2 * (FRAME_BORDER_WIDTH + ELLIPSE_BAND) - self.controls_widget.sizeHint().height()
-                - m.top() - m.bottom() - pl.spacing() - EyeSlider.TOP - EyeSlider.BOTTOM)
+        room = self.container.height() / 2.0 - (FRAME_BORDER_WIDTH + ELLIPSE_BAND) - EyeSlider.TOP   # la base sta a metà finestra
         depth = max(8.0, min(depth, room))
         changed = False
         if self.timeline_widget.width() != tw or self.timeline_widget.minimumWidth() != tw:
@@ -4254,7 +4338,33 @@ class NekoPlayer(QMainWindow):
         None se la timeline non è visibile (minimal)."""
         if getattr(self, "_minimal_on", False) or self.timeline_widget.isHidden(): return None
         mt = self.controls_panel.layout().contentsMargins().top()
-        return int(round(ch // 2 +40 -(mt + self.slider.height() - EyeSlider.BOTTOM)))   # int: setGeometry non accetta float
+        return int(round(ch // 2 -(mt + self.slider.height() - EyeSlider.BOTTOM)))   # int: setGeometry non accetta float
+
+    NOSE_FROM_BOTTOM = 1.0 / 3.0      # fuori da minimal: il centro del naso sta a questa frazione dell'altezza, misurata dal bordo inferiore
+
+    def _apply_face_spacing(self, ch):
+        """Fuori da minimal la base degli occhi sta a metà finestra (vedi _eyes_mid_y) e il naso (centro) a 1/3 dell'altezza
+        dal bordo inferiore: la spaziatura del pannello tra occhi e righe dei bottoni viene calcolata di conseguenza
+        (ridotta solo se il pannello altrimenti uscirebbe dal fondo della finestra)."""
+        pl = self.controls_panel.layout()
+        if pl is None or getattr(self, "_minimal_on", False) or self.timeline_widget.isHidden(): return
+        hn = self.nose_row.sizeHint().height()
+        # y finestra del centro del naso = ch/2 + BOTTOM + spaziatura + hn/2  ->  spaziatura per portarlo a (1 - NOSE_FROM_BOTTOM) * ch
+        sp = int(round(ch * (1.0 - self.NOSE_FROM_BOTTOM) - ch / 2.0 - EyeSlider.BOTTOM - hn / 2.0))
+        sp = max(4, sp)
+        fs = self.isFullScreen() or self.isMaximized()
+        mb = 8 if fs else FRAME_BORDER_WIDTH + ELLIPSE_BAND + 8
+        if pl.spacing() != sp:
+            pl.setSpacing(sp)
+            pl.invalidate()
+            pl.activate()
+        mid_y = self._eyes_mid_y(ch)
+        if mid_y is None: return
+        over = mid_y + self.controls_panel.sizeHint().height() - (ch - mb)
+        if over > 0 and sp > 4:
+            pl.setSpacing(max(4, sp - over))
+            pl.invalidate()
+            pl.activate()
 
     def _fit_rows_to_ellipse(self, py, ph):
         """Limita le due righe di bottoni alla corda dell'ellisse alla loro quota, così non escono dalla forma
@@ -4315,6 +4425,13 @@ class NekoPlayer(QMainWindow):
     def toggle_bg_texture(self, state):
         self.show_bg_texture = (state == Qt.Checked)
         self.container.set_show_texture(self.show_bg_texture)
+        # senza video il display mostra la texture come pixmap: va ridisegnato subito, altrimenti la finestra
+        # continua a mostrare il vecchio sfondo (texture o colore tema) fino al prossimo ridimensionamento
+        if not self.worker.running and not self._audio_only: self.show_default_background()
+        self.video_display.update()
+        if hasattr(self, "clock_overlay"): self.clock_overlay.update()
+        self.container.update()
+        self.update()
         self.save_settings()
 
     def choose_theme_color(self):
@@ -4344,6 +4461,7 @@ class NekoPlayer(QMainWindow):
         self._ears_force_raise = True
         self.sync_ears_position()
         if hasattr(self, "container"): self.container.set_color(hex_color)
+        if hasattr(self, "clock_overlay"): self.clock_overlay.set_bg_color(hex_color)
         if hasattr(self, "video_display") and not self.isFullScreen():
             self.video_display.setStyleSheet(
                 f"background-color: rgba({r}, {g}, {b}, 0.85); border: none; border-radius: 8px;"
@@ -4403,7 +4521,7 @@ class NekoPlayer(QMainWindow):
     def shake_head(self):
         """Fa vibrare la testa (finestra + orecchie + baffi, che la seguono) per un istante."""
         if self.isFullScreen() or self.isMaximized() or self.isMinimized() or not self.isVisible(): return
-        if self._drag_active or self._resize_active: return
+        if self._drag_active or self._resize_active or self._wandering: return
         now = time.monotonic()
         if not self._shaking:
             self._shake_origin = QPoint(self.pos())
@@ -4442,6 +4560,100 @@ class NekoPlayer(QMainWindow):
         dx = HEAD_SHAKE_AMPLITUDE * damp * math.sin(ph)
         dy = 0.5 * HEAD_SHAKE_AMPLITUDE * damp * math.sin(ph * 1.3 + 1.0)
         self._apply_shake_pos(QPoint(int(round(dx)), int(round(dy))))
+
+    def start_head_wander(self):
+        """Play senza video: la testa (finestra + orecchie + baffi) si muove per HEAD_WANDER_DURATION secondi
+        in direzioni casuali e rimbalza sui bordi dello schermo."""
+        if self._wandering or not self.isVisible(): return
+        if self.isFullScreen() or self.isMaximized() or self.isMinimized(): return
+        if self._drag_active or self._resize_active: return
+        self._stop_shake()
+        fg = self.frameGeometry()
+        self._wander_ext = self._visible_head_extent()
+        self._wander_x, self._wander_y = float(fg.x()), float(fg.y())
+        now = time.monotonic()
+        self._wander_end = now + HEAD_WANDER_DURATION
+        self._wander_last = now
+        # direzione e velocita' iniziali casuali (non troppo vicine agli assi, altrimenti rimbalzerebbe su una sola linea)
+        ang = random.uniform(0.0, 2.0 * math.pi)
+        while min(abs(math.cos(ang)), abs(math.sin(ang))) < 0.2: ang = random.uniform(0.0, 2.0 * math.pi)
+        sp = random.uniform(*HEAD_WANDER_SPEED)
+        self._wander_vx, self._wander_vy = sp * math.cos(ang), sp * math.sin(ang)
+        self._wandering = True
+        self._wander_timer.start()
+
+    @staticmethod
+    def _alpha_bounds(w):
+        """Rettangolo (coordinate del widget) che contiene i pixel realmente visibili di una finestra trasparente
+        (orecchie, baffi): i loro widget sono molto piu' grandi di quello che disegnano."""
+        try:
+            pm = w.grab()
+            dpr = pm.devicePixelRatio() or 1.0
+            img = pm.toImage().convertToFormat(QImage.Format_ARGB32)
+            iw, ih = img.width(), img.height()
+            ptr = img.constBits()
+            ptr.setsize(img.byteCount())
+            arr = np.frombuffer(ptr, np.uint8).reshape(ih, img.bytesPerLine() // 4, 4)[:, :iw]
+            ys, xs = np.nonzero(arr[:, :, 3] > 24)
+            if not len(xs): return None
+            x0, x1, y0, y1 = xs.min() / dpr, (xs.max() + 1) / dpr, ys.min() / dpr, (ys.max() + 1) / dpr
+            return QRect(int(math.floor(x0)), int(math.floor(y0)), int(math.ceil(x1 - x0)), int(math.ceil(y1 - y0)))
+        except Exception:
+            return None
+
+    def _visible_head_extent(self):
+        """Ingombro VISIBILE della testa rispetto all'angolo alto-sinistro della finestra: ellisse + parti disegnate di
+        orecchie e baffi (non i rettangoli trasparenti dei loro widget). Ritorna un QRect (puo' avere x/y negativi)."""
+        fg = self.frameGeometry()
+        m = self.mask()
+        ext = QRect(m.boundingRect()) if not m.isEmpty() else QRect(0, 0, fg.width(), fg.height())
+        for w in (self.ear_left, self.ear_right, self.whiskers_left, self.whiskers_right):
+            if not w.isVisible(): continue
+            b = self._alpha_bounds(w)
+            if b is None: continue
+            ext = ext.united(b.translated(w.geometry().topLeft() - fg.topLeft()))
+        return ext
+
+    def _stop_wander(self):
+        if not self._wandering: return
+        self._wandering = False
+        self._wander_timer.stop()
+        if not getattr(self, "_minimal_on", False): self._normal_pos_before_minimal = QPoint(self.pos())
+        self._ears_key = None
+        self._whiskers_key = None
+        self.sync_ears_position()
+        self.save_settings()
+
+    def _wander_tick(self):
+        if not self._wandering: return self._wander_timer.stop()
+        if (self._drag_active or self._resize_active or not self.isVisible()
+                or self.isFullScreen() or self.isMaximized() or self.isMinimized()):
+            return self._stop_wander()
+        now = time.monotonic()
+        if now >= self._wander_end: return self._stop_wander()
+        dt = max(0.0, min(0.05, now - self._wander_last))
+        self._wander_last = now
+        # i bordi sono quelli dello schermo intero; l'ingombro e' quello VISIBILE di finestra, orecchie e baffi
+        ext = self._wander_ext
+        center = QPoint(int(self._wander_x) + ext.center().x(), int(self._wander_y) + ext.center().y())
+        screen = QApplication.screenAt(center) or QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
+        sg = screen.geometry()
+        xmin, ymin = sg.left() - ext.left(), sg.top() - ext.top()
+        xmax = max(xmin, sg.right() - ext.right())
+        ymax = max(ymin, sg.bottom() - ext.bottom())
+        x = self._wander_x + self._wander_vx * dt
+        y = self._wander_y + self._wander_vy * dt
+        # rimbalzo elastico: sul bordo la componente della velocita' si inverte, l'altra non cambia
+        if x < xmin and self._wander_vx < 0:
+            x = xmin + (xmin - x); self._wander_vx = -self._wander_vx
+        elif x > xmax and self._wander_vx > 0:
+            x = xmax - (x - xmax); self._wander_vx = -self._wander_vx
+        if y < ymin and self._wander_vy < 0:
+            y = ymin + (ymin - y); self._wander_vy = -self._wander_vy
+        elif y > ymax and self._wander_vy > 0:
+            y = ymax - (y - ymax); self._wander_vy = -self._wander_vy
+        self._wander_x, self._wander_y = x, y
+        self.move(int(round(self._wander_x)), int(round(self._wander_y)))
 
     def isFullScreen(self): return self._fs if BYPASS_WM else super().isFullScreen()
 
@@ -4566,6 +4778,7 @@ class NekoPlayer(QMainWindow):
         return self._drag_fg if self._drag_fg is not None else self.frameGeometry()
 
     def _arc_drag_start(self, gpos, keep_shake=False):
+        self._stop_wander()
         if not keep_shake: self._stop_shake()
         if self.isFullScreen() or self.isMaximized() or self.isMinimized(): return
         self._drag_cursor0 = QPoint(gpos)
@@ -5068,6 +5281,13 @@ class NekoPlayer(QMainWindow):
         self.video_display.setMinimumSize(
             self._VIDEO_MIN_MINIMAL if on else self._VIDEO_MIN_NORMAL)
 
+    def _refresh_window_min_size(self):
+        """Ricalcola subito (non in modo differito) il minimo della finestra dai layout, dopo un cambio dei minimi dei figli."""
+        for lay in (self.container.layout(), self.layout()):
+            if lay is not None:
+                lay.invalidate()
+                lay.activate()
+
     def toggle_minimal_mode(self):
         """Attiva/disattiva la modalità 'minimal': dimensioni della finestra separate,
         salvate in config (window_minimal_w/h) e modificabili ridimensionando la finestra
@@ -5086,7 +5306,14 @@ class NekoPlayer(QMainWindow):
             self._apply_minimal_size_limits(True)
             self._set_minimal_compact(True)   # in basso restano solo Play + barra volume
             old_geo = QRect(self.geometry())
-            self.resize(*self._minimal_size)
+            target = tuple(self._minimal_size)
+            # il minimo della finestra deriva dal layout, che si aggiorna in modo differito: senza questo passaggio il resize
+            # verrebbe limitato al vecchio minimo (320x200 + margini) e le dimensioni minimal piu' piccole andrebbero perse
+            self._refresh_window_min_size()
+            self.resize(*target)
+            if (self.width(), self.height()) != target:
+                self._refresh_window_min_size()
+                self.resize(*target)
             new_geo = QRect(self.geometry())
             # Mantieni fisso il centro della finestra durante il passaggio a minimal
             center = old_geo.center() - QPoint(new_geo.width() // 2, new_geo.height() // 2)
@@ -5248,7 +5475,7 @@ class NekoPlayer(QMainWindow):
     def moveEvent(self, event):
         super().moveEvent(event)
         self.sync_ears_position()
-        if not (self._drag_active or self._resize_active or self._shaking): QApplication.processEvents()
+        if not (self._drag_active or self._resize_active or self._shaking or self._wandering): QApplication.processEvents()
 
     def changeEvent(self, event):
         if event.type() == QEvent.ActivationChange:
@@ -5627,7 +5854,7 @@ class NekoPlayer(QMainWindow):
         url = QUrl.fromLocalFile(file_path)
         self.audio_player.setMedia(QMediaContent(url))
         self.worker.set_video(file_path)
-        self.btn_play_pause.setEnabled(True)
+        self._set_media_loaded(True)
         self.btn_play_pause.set_playing(True)
         self.status.showMessage(f"In riproduzione: {os.path.basename(file_path)}"
                                 + ("  ·  sottotitoli karaoke caricati" if has_subs else ""))
@@ -5666,7 +5893,7 @@ class NekoPlayer(QMainWindow):
         self._wave_last_t = 0.0
         has_subs = self._load_subtitles(file_path)
         self.audio_player.setMedia(QMediaContent(QUrl.fromLocalFile(file_path)))
-        self.btn_play_pause.setEnabled(True)
+        self._set_media_loaded(True)
         self.btn_play_pause.set_playing(True)
         self.osd_label.hide()
         self.wave_overlay.set_envelope(None)
@@ -5860,7 +6087,14 @@ class NekoPlayer(QMainWindow):
         if not self.worker.paused and self.audio_player.state() != QMediaPlayer.PlayingState:
             self.audio_player.play()
 
+    def _set_media_loaded(self, on):
+        self._media_loaded = bool(on)
+        self.btn_play_pause.set_idle(not on)
+
     def toggle_play_pause(self):
+        if not self._has_video():
+            self.start_head_wander()      # nessun video: il play fa girare la testa per lo schermo
+            return
         self.worker.paused = not self.worker.paused
         if self.worker.paused:
             self.audio_player.pause()
@@ -5962,7 +6196,7 @@ class NekoPlayer(QMainWindow):
         else: self.osd_label.hide()
 
     def on_video_finished(self):
-        self.btn_play_pause.setEnabled(False)
+        self._set_media_loaded(False)
         self.btn_play_pause.set_playing(False)
         self.audio_player.stop()
         self._sub_key = None
