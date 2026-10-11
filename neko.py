@@ -52,6 +52,7 @@ EARS_ROTATION_REF_HEIGHT = 520.0  # altezza finestra (px) a cui le orecchie ruot
 HEAD_SHAKE_AMPLITUDE = 6.0       # vibrazione della testa quando si clicca un baffo: ampiezza massima (px)
 HEAD_SHAKE_DURATION = 0.45       # durata (s)
 HEAD_SHAKE_FREQ = 13.0           # oscillazioni al secondo
+SHADER_MENU_MAX_ROWS = 6        # voci visibili contemporaneamente nel menu degli shader (le altre si scorrono con la rotella)
 HEAD_WANDER_DURATION = 5.0       # play senza video: la testa gira per lo schermo per questi secondi (s)
 HEAD_WANDER_SPEED = (200.0, 320.0)   # velocita' iniziale (px/s) scelta a caso; poi resta costante (moto a palla da biliardo)
 WHISKER_PULL_MAX_STRETCH = 1.5   # tenendo premuto e tirando un baffo si allunga fino a questa frazione della sua lunghezza (1.5 = 150%); oltre, la finestra inizia a seguire il cursore
@@ -2700,16 +2701,21 @@ class VideoProcessorThread(QThread):
         self.wait()
 
 class BubbleMenu(QWidget):
-    """Menu contestuale a forma di nuvoletta di pensiero: al posto della codina, due cerchi (uno grande e uno piccolo) che
-    scendono verso il cursore, come se il gatto stesse pensando il menu."""
-    TAIL_H = 24          # altezza riservata ai due cerchi del pensiero
-    DOT_R1, DOT_R2 = 5.5, 3.5   # raggio del cerchio vicino al fumetto e di quello vicino al cursore
+    """Menu contestuale a forma di nuvola dei pensieri di un fumetto: il profilo e' fatto di lobi tondeggianti e, al posto
+    della codina, due cerchi (uno grande e uno piccolo) scendono verso il cursore, come se il gatto stesse pensando il menu."""
+    BUMP_R = 84.0        # raggio ORIZZONTALE dei lobi (centrati sul perimetro dell'ellisse di base); regola anche la distanza tra i lobi
+    BUMP_RY = 80.0       # raggio VERTICALE dei lobi: abbassalo per lobi piu' bassi, senza cambiarne la larghezza
+    BUMP_STEP = 1.5      # distanza tra i centri dei lobi lungo l'ellisse, in raggi: piu' e' basso, piu' i lobi sono fitti
+    ELL_K = 1.25         # semiassi dell'ellisse di base = ELL_K x meta' del rettangolo delle voci (le voci restano dentro)
+    PEN = 3.0            # margine per il contorno
+    DOTS_H = 35.0        # ingombro della coppia di cerchi del pensiero (32) piu' la distanza dal bordo della nuvola (3)
+    DOT_R1, DOT_R2 = 9.0, 5.5   # raggio del cerchio vicino al fumetto e di quello vicino al cursore
     DOT_GAP = 3.0        # distanza tra i cerchi e tra il cerchio grande e il fumetto
-    PAD = 8
+    PAD = 10
     ROW_H = 30
-    RADIUS = 16
-    MARGIN = 3
-    def __init__(self, items, parent=None, keep_open=False, refresh=None):
+    last_closed = 0.0      # time.monotonic() dell'ultima chiusura di un qualunque BubbleMenu
+    def __init__(self, items, parent=None, keep_open=False, refresh=None, max_rows=None):
+        # max_rows: numero massimo di voci visibili (le altre si scorrono con la rotella); None = quanto ne sta nello schermo
         # items: lista di (testo, callback, abilitata) oppure (testo, callback, abilitata, checked) per i toggle
         # keep_open: i toggle non chiudono il menu; il loro callback riceve il nuovo stato (bool)
         # refresh: funzione che restituisce le voci aggiornate (stesso numero), richiamata dopo ogni toggle
@@ -2719,10 +2725,15 @@ class BubbleMenu(QWidget):
         self.setMouseTracking(True)
         self.items = [tuple(it[:3]) + tuple(it[3:]) if len(it) > 3 else tuple(it[:3]) for it in items]
         self._hover = -1
-        self._tail_top = True
+        self._press_row = -1       # voce su cui e' stato premuto un tasto DENTRO questo menu (-1 = nessuna)
+        self._tail_dir = 'down'     # 'down': nuvola sotto il cursore (cerchi sopra); 'up': sopra; 'right'/'left': nuvola a destra/sinistra del punto di aggancio
         self._tail_x = 24
+        self._tail_y = 0.0
+        self._tip_x = 0.0
+        self._cloud_x0 = 0.0
+        self._linked = None        # menu collegato (menu contestuale <-> sotto-menu): si chiudono insieme
         self._from_center = None   # (dx, dy): posizione del cursore rispetto al centro della finestra del gatto
-        self._font = QFont(resolve_ui_font_family(), 10)
+        self._font = QFont(resolve_ui_font_family(), 14)
         self._font.setBold(True)
         fm = QFontMetrics(self._font)
         # le voci possono avere 3 elementi (testo, callback, abilitata) o 4 (toggle con checked)
@@ -2732,35 +2743,90 @@ class BubbleMenu(QWidget):
         self._body_w = max(fm.horizontalAdvance(it[0]) + (50 if len(it) > 3 else 28) for it in items) + num_w + 2 * self.PAD
         # troppe voci per lo schermo: se ne mostra solo una parte e si scorre con la rotella
         scr = QApplication.primaryScreen()
-        self._max_rows = max(4, ((scr.geometry().height() if scr else 800) - 160) // self.ROW_H)
+        # la nuvola e' piu' alta del rettangolo delle voci (ellisse + lobi): il numero di righe visibili tiene conto del suo ingombro
+        fixed = 2 * self.BUMP_RY + 2 * self.PEN + self.DOTS_H + 60
+        avail_body = ((scr.geometry().height() if scr else 800) - fixed) / self.ELL_K
+        self._max_rows = max(4, int((avail_body - 2 * self.PAD) // self.ROW_H))
+        if max_rows: self._max_rows = max(3, min(self._max_rows, int(max_rows)))
         self._rows = min(len(self.items), self._max_rows)
         self._scroll = 0
         self._body_h = self._rows * self.ROW_H + 2 * self.PAD
-        self.resize(self._body_w + 2 * self.MARGIN, self._body_h + self.TAIL_H + 2 * self.MARGIN)
+        # geometria della nuvola (coordinate locali, origine nell'angolo alto-sinistro della nuvola, senza la zona dei cerchi)
+        self._ell_a = self.ELL_K * self._body_w / 2.0
+        self._ell_b = self.ELL_K * self._body_h / 2.0
+        self._cloud_w = 2 * (self._ell_a + self.BUMP_R + self.PEN)
+        self._cloud_h = 2 * (self._ell_b + self.BUMP_RY + self.PEN)
+        self._cloud_local = self._build_cloud()
+        self._cloud_y0 = 0.0       # posizione verticale della nuvola nella finestra: DOTS_H se i cerchi stanno sopra, 0 se sotto
+        self._tip_y = 0.0          # y (nella finestra) del cerchio piu' vicino al cursore
+        self.resize(int(math.ceil(self._cloud_w)), int(math.ceil(self._cloud_h + self.DOTS_H)))
+    def _build_cloud(self):
+        """Nuvola in coordinate locali: ellisse di base piena + lobi (cerchi) centrati sul suo perimetro a distanza regolare
+        (misurata sulla lunghezza d'arco); l'unione (simplified) da' il profilo a scalloppe con le rientranze tra i lobi."""
+        a, b, r = self._ell_a, self._ell_b, self.BUMP_R
+        cx, cy = self._cloud_w / 2.0, self._cloud_h / 2.0
+        cloud = QPainterPath()
+        cloud.setFillRule(Qt.WindingFill)
+        cloud.addEllipse(QPointF(cx, cy), a, b)
+        # lunghezza d'arco dell'ellisse, partendo dal punto piu' alto e girando in senso orario
+        N = 720
+        pts = [(cx + a * math.cos(-math.pi / 2 + 2 * math.pi * k / N), cy + b * math.sin(-math.pi / 2 + 2 * math.pi * k / N)) for k in range(N + 1)]
+        cum = [0.0]
+        for k in range(1, len(pts)):
+            cum.append(cum[-1] + math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1]))
+        per = cum[-1]
+        n = max(6, int(round(per / (self.BUMP_STEP * r))))
+        n += n % 2                                   # numero pari: la nuvola resta simmetrica
+        k = 0
+        for i in range(n):
+            target = per * i / n
+            while k < len(cum) - 2 and cum[k + 1] < target: k += 1
+            seg = cum[k + 1] - cum[k]
+            u = 0.0 if seg <= 0 else (target - cum[k]) / seg
+            x = pts[k][0] + (pts[k + 1][0] - pts[k][0]) * u
+            y = pts[k][1] + (pts[k + 1][1] - pts[k][1]) * u
+            cloud.addEllipse(QPointF(x, y), r, self.BUMP_RY)   # lobo ellittico: largo r, alto BUMP_RY
+        return cloud.simplified()
+    def _silhouette(self, x):
+        """(alto, basso) del profilo della nuvola alla coordinata x locale."""
+        strip = QPainterPath()
+        strip.addRect(x - 1.0, 0.0, 2.0, self._cloud_h)
+        bb = self._cloud_local.intersected(strip).boundingRect()
+        return (bb.top(), bb.bottom()) if not bb.isEmpty() else (0.0, self._cloud_h)
     def popup_at(self, gpos, center=None):
         # center: centro (globale) della finestra del gatto. I cerchi del pensiero sono orientati verso di esso: partono
-        # dal fumetto, che sta dal lato del cursore opposto al centro, e puntano al centro della finestra.
+        # dalla nuvola, che sta dal lato del cursore opposto al centro, e puntano al centro della finestra.
         self._from_center = (gpos.x() - center.x(), gpos.y() - center.y()) if center is not None else None
         screen = QApplication.screenAt(gpos) or QApplication.primaryScreen()
         sg = screen.geometry()
-        W, H, M = self.width(), self.height(), self.MARGIN
-        inset = M + self.RADIUS + 8
-        x = gpos.x() - inset
-        if x + W > sg.right() + 1: x = gpos.x() - (W - inset)
-        x = max(sg.left(), min(x, sg.right() + 1 - W))
-        self._tail_x = max(M + self.RADIUS, min(gpos.x() - x, W - M - self.RADIUS))
-        below = True if self._from_center is None else self._from_center[1] >= 0   # fumetto sotto il cursore se questo sta nella metà bassa
-        fits_below = gpos.y() + H <= sg.bottom() + 1
-        fits_above = gpos.y() - H + M >= sg.top()
+        W, H = self.width(), self.height()
+        cxl = W / 2.0
+        lim = 0.5 * self._ell_a      # i cerchi partono dalla zona centrale della nuvola, dove il bordo e' vicino alla verticale del cursore
+        # finestra centrata sul cursore, ma spostata quanto serve per restare nello schermo e per tenere il cursore nella zona centrale
+        lo = max(sg.left(), gpos.x() - (cxl + lim))
+        hi = min(sg.right() + 1 - W, gpos.x() - (cxl - lim))
+        pref = gpos.x() - cxl
+        x = int(round(min(max(pref, lo), hi))) if lo <= hi else int(max(sg.left(), min(pref, sg.right() + 1 - W)))
+        self._tail_x = max(cxl - lim, min(gpos.x() - x, cxl + lim))
+        top_sil, bot_sil = self._silhouette(self._tail_x)
+        tip_below = top_sil                        # cerchi sopra la nuvola (la nuvola sta sotto il cursore): nuvola a y0 = DOTS_H
+        tip_above = bot_sil + self.DOTS_H          # cerchi sotto la nuvola (la nuvola sta sopra il cursore): nuvola a y0 = 0
+        below = True if self._from_center is None else self._from_center[1] >= 0   # nuvola sotto il cursore se questo sta nella meta' bassa
+        fits_below = gpos.y() - tip_below + H <= sg.bottom() + 1
+        fits_above = gpos.y() - tip_above >= sg.top()
         if below and not fits_below: below = False
         elif not below and not fits_above and fits_below: below = True
-        self._tail_top = below
-        y = (gpos.y() - M) if below else (gpos.y() - H + M)
-        self.move(x, max(sg.top(), y))
+        self._tail_dir = 'down' if below else 'up'
+        self._cloud_x0 = 0.0
+        self._cloud_y0 = self.DOTS_H if below else 0.0
+        self._tip_y = tip_below if below else tip_above
+        y = int(round(gpos.y() - self._tip_y))
+        self.move(x, max(sg.top(), min(y, sg.bottom() + 1 - H)))
         self.show()
     def _body_rect(self):
-        top = self.MARGIN + (self.TAIL_H if self._tail_top else 0)
-        return QRectF(self.MARGIN, top, self._body_w, self._body_h)
+        # rettangolo delle voci: al centro della nuvola
+        return QRectF(self._cloud_x0 + (self._cloud_w - self._body_w) / 2.0, self._cloud_y0 + (self._cloud_h - self._body_h) / 2.0,
+                      self._body_w, self._body_h)
     def _row_rect(self, i):
         b = self._body_rect()
         return QRectF(b.x() + self.PAD, b.y() + self.PAD + (i - self._scroll) * self.ROW_H, b.width() - 2 * self.PAD, self.ROW_H)
@@ -2769,25 +2835,62 @@ class BubbleMenu(QWidget):
             if self._row_rect(i).contains(QPointF(pos)): return i
         return -1
     def _bubble_path(self):
-        body = self._body_rect()
-        path = QPainterPath()
-        path.addRoundedRect(body, self.RADIUS, self.RADIUS)
-        tx = float(self._tail_x)
-        d = 1.0 if self._tail_top else -1.0                  # verso del pensiero: dal cursore al fumetto
-        tip_y = float(self.MARGIN) if self._tail_top else self.height() - float(self.MARGIN)
+        path = QPainterPath(self._cloud_local)
+        path.translate(self._cloud_x0, self._cloud_y0)
         r1, r2, g = self.DOT_R1, self.DOT_R2, self.DOT_GAP
-        step = r2 + g + r1                                   # distanza verticale tra i centri dei due cerchi
-        if self._from_center is not None:
-            # la fila di cerchi giace sulla retta tra il centro della finestra e il cursore: il cerchio piccolo è il più vicino al centro
-            dx, dy = self._from_center
-            off = max(-12.0, min(12.0, dx / max(abs(dy), 1.0) * step))
+        step = r2 + g + r1                                   # distanza tra i centri dei due cerchi lungo la fila
+        if self._tail_dir in ('down', 'up'):
+            tx = float(self._tail_x)
+            d = 1.0 if self._tail_dir == 'down' else -1.0    # verso del pensiero: dal cursore alla nuvola
+            tip = float(self._tip_y)
+            if self._from_center is not None:
+                # la fila di cerchi giace sulla retta tra il centro della finestra e il cursore: il cerchio piccolo e' il piu' vicino al centro
+                dx, dy = self._from_center
+                off = max(-12.0, min(12.0, dx / max(abs(dy), 1.0) * step))
+            else:
+                off = (7.0 if tx < self.width() / 2.0 else -7.0)
+            c2 = QPointF(tx, tip + d * r2)
+            c1 = QPointF(tx + off, tip + d * (2 * r2 + g + r1))
         else:
-            off = (7.0 if tx < self.width() / 2.0 else -7.0)
-        c2 = QPointF(tx, tip_y + d * r2)
-        c1 = QPointF(tx + off, tip_y + d * (2 * r2 + g + r1))
+            ty = float(self._tail_y)
+            d = 1.0 if self._tail_dir == 'right' else -1.0   # verso del pensiero: dal punto di aggancio alla nuvola
+            tip = float(self._tip_x)
+            c2 = QPointF(tip + d * r2, ty)
+            c1 = QPointF(tip + d * (2 * r2 + g + r1), ty - 7.0)
         path.addEllipse(c1, r1, r1)
         path.addEllipse(c2, r2, r2)
         return path
+    def _silhouette_h(self, y):
+        """(sinistra, destra) del profilo della nuvola all'altezza locale y."""
+        strip = QPainterPath()
+        strip.addRect(0.0, y - 1.0, self._cloud_w, 2.0)
+        bb = self._cloud_local.intersected(strip).boundingRect()
+        return (bb.left(), bb.right()) if not bb.isEmpty() else (0.0, self._cloud_w)
+    def popup_beside(self, ref_rect):
+        """Apre la nuvola di lato rispetto a `ref_rect` (QRect globale di un altro menu): a destra se ci sta, altrimenti a
+        sinistra. I cerchi del pensiero uniscono le due nuvole in orizzontale, cosi' questo menu non copre quello di partenza."""
+        screen = QApplication.screenAt(ref_rect.center()) or QApplication.primaryScreen()
+        sg = screen.geometry()
+        W, H = int(math.ceil(self._cloud_w + self.DOTS_H)), int(math.ceil(self._cloud_h))
+        self._from_center = None
+        space_r = sg.right() + 1 - (ref_rect.right() + 1)
+        space_l = ref_rect.left() - sg.left()
+        side = 'right' if (space_r >= W or space_r >= space_l) else 'left'
+        self._tail_dir = side
+        self._cloud_x0 = self.DOTS_H if side == 'right' else 0.0
+        self._cloud_y0 = 0.0
+        self.resize(W, H)
+        anchor_x = ref_rect.right() + 1 if side == 'right' else ref_rect.left()
+        anchor_y = ref_rect.center().y()
+        cy = self._cloud_h / 2.0
+        y = int(round(max(sg.top(), min(anchor_y - cy, sg.bottom() + 1 - H))))
+        lim = 0.5 * self._ell_b
+        self._tail_y = max(cy - lim, min(anchor_y - y, cy + lim))     # i cerchi partono dalla zona centrale della nuvola
+        left, right = self._silhouette_h(self._tail_y)
+        self._tip_x = left if side == 'right' else right + self.DOTS_H
+        x = int(round(anchor_x - self._tip_x))
+        self.move(max(sg.left(), min(x, sg.right() + 1 - W)), y)
+        self.show()
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -2871,8 +2974,23 @@ class BubbleMenu(QWidget):
     def leaveEvent(self, event):
         self._hover = -1
         self.update()
+    def mousePressEvent(self, event):
+        # una voce si attiva solo se il tasto viene premuto E rilasciato su di essa dentro questo menu: il rilascio del click
+        # destro che ha aperto il menu (premuto fuori, nella finestra del gatto) non deve attivare la voce sotto il cursore
+        self._press_row = self._row_at(event.pos()) if event.button() in (Qt.LeftButton, Qt.RightButton) else -1
+        if self._press_row < 0 and event.button() in (Qt.LeftButton, Qt.RightButton):
+            # click fuori dalla forma della nuvola (angoli trasparenti della finestra) oppure col destro dove non c'e' una voce: chiude il menu
+            if event.button() == Qt.RightButton or not self._bubble_path().contains(QPointF(event.pos())):
+                event.accept()
+                self.close()
+                return
+        event.accept()
     def mouseReleaseEvent(self, event):
         i = self._row_at(event.pos())
+        pressed, self._press_row = self._press_row, -1
+        if i != pressed:
+            event.accept()
+            return
         if i >= 0 and self.items[i][2] and event.button() in (Qt.LeftButton, Qt.RightButton):
             item = self.items[i]
             cb = item[1]
@@ -2883,10 +3001,23 @@ class BubbleMenu(QWidget):
                 if self._refresh is not None and len(self.items) == len(self._refresh()):
                     self.items = [tuple(it[:3]) + tuple(it[3:]) if len(it) > 3 else tuple(it[:3]) for it in self._refresh()]
                 self.update()
+            elif getattr(cb, "keeps_menu_open", False):
+                cb()                      # apre un sotto-menu: questo menu resta visibile
             else:
                 self.close()
                 QTimer.singleShot(0, cb)
         event.accept()
+    def closeEvent(self, event):
+        BubbleMenu.last_closed = time.monotonic()
+        # menu e sotto-menu si chiudono insieme
+        other, self._linked = self._linked, None
+        if other is not None:
+            try:
+                other._linked = None
+                other.close()
+            except RuntimeError:
+                pass
+        super().closeEvent(event)
 
 class BackgroundContainer(QWidget):
     def __init__(self, bg_pixmap, bg_color=None, parent=None):
@@ -3546,7 +3677,7 @@ class ClockOverlay(QWidget):
         adesso = QTime.currentTime()
         ora = adesso.toString("HH:mm")
         px = max(14, int(min(w * 0.28, h * 0.34)))
-        f = QFont("Orbitron")
+        f = QFont(resolve_ui_font_family())
         f.setBold(True)
         f.setPixelSize(px)
         p = QPainter(self)
@@ -3687,6 +3818,7 @@ class NekoPlayer(QMainWindow):
         self._minimal_size = None             # (w, h) minimal caricate/salvate da config
         self._normal_size_before_minimal = None  # dimensioni originali da ripristinare al toggle off
         self._normal_pos_before_minimal = None   # posizione originale da ripristinare al toggle off
+        self._minimal_pos = None                 # ultima posizione (angolo alto-sinistro) della finestra in minimal: si ripristina al toggle on
         # Timestamp di ripresa per video: {percorso_video: millisecondi} (persistito in config)
         self.resume_positions = {}
         self._controls_visible = True
@@ -4618,7 +4750,7 @@ class NekoPlayer(QMainWindow):
         if not self._wandering: return
         self._wandering = False
         self._wander_timer.stop()
-        if not getattr(self, "_minimal_on", False): self._normal_pos_before_minimal = QPoint(self.pos())
+        self._remember_window_pos()
         self._ears_key = None
         self._whiskers_key = None
         self.sync_ears_position()
@@ -4758,6 +4890,19 @@ class NekoPlayer(QMainWindow):
             return True
         if event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
             if isinstance(obj, QWidget) and self._is_our_widget(obj):
+                # con un menu aperto il click destro lo chiude e basta. Se Qt lo ha gia' chiuso per questo stesso click
+                # (click fuori dal popup) l'evento arriva comunque qui: si riconosce dall'istante di chiusura
+                was_open = False
+                for attr in ("_bubble", "_sub_bubble"):
+                    b = getattr(self, attr, None)
+                    if b is None: continue
+                    try:
+                        if b.isVisible():
+                            was_open = True
+                            b.close()
+                    except RuntimeError:
+                        pass
+                if was_open or time.monotonic() - BubbleMenu.last_closed < 0.25: return True
                 self.show_context_bubble(event.globalPos())
                 return True
         if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
@@ -4828,9 +4973,8 @@ class NekoPlayer(QMainWindow):
         self._drag_fg = None
         self._ears_key = None
         self._whiskers_key = None
-        # A minimal spento, la nuova posizione diventa quella "normale" da ripristinare
-        if not getattr(self, "_minimal_on", False):
-            self._normal_pos_before_minimal = QPoint(self._shake_origin) if self._shaking else QPoint(self.pos())
+        # la nuova posizione diventa quella da ripristinare: "normale" a minimal spento, "minimal" a minimal acceso
+        self._remember_window_pos()
         self.sync_ears_position()
         self.save_settings()
 
@@ -4915,6 +5059,7 @@ class NekoPlayer(QMainWindow):
         # Con minimal attivo, le nuove dimensioni diventano quelle "minimal" salvate in config
         if getattr(self, "_minimal_on", False):
             self._minimal_size = self._normal_window_size()
+            self._minimal_pos = QPoint(self.pos())      # ridimensionando da un angolo la finestra puo' spostarsi
         else:
             # A minimal spento, la posizione corrente diventa quella "normale"
             # da ripristinare alla prossima disattivazione di minimal
@@ -5081,9 +5226,10 @@ class NekoPlayer(QMainWindow):
         return vw / float(vh)
 
     def show_context_bubble(self, gpos):
-        if getattr(self, "_bubble", None) is not None:
-            try: self._bubble.close()
-            except RuntimeError: pass
+        for attr in ("_bubble", "_sub_bubble"):
+            if getattr(self, attr, None) is not None:
+                try: getattr(self, attr).close()
+                except RuntimeError: pass
         can_fit = not (self.isFullScreen() or self.isMaximized() or self.isMinimized())
         has_video = self._has_video()
         self._bubble = BubbleMenu([
@@ -5203,17 +5349,34 @@ class NekoPlayer(QMainWindow):
         files = self._shader_files()
         if not files: return ("Shaders (nessuno)", lambda: None, False)
         n_on = sum(1 for n in files if n in self.active_shaders)
-        return (f"Shaders… ({n_on})", lambda: self.show_shaders_bubble(gpos), True)
+        def apri(): self.show_shaders_bubble(gpos)
+        apri.keeps_menu_open = True        # il menu contestuale resta aperto e il sotto-menu si apre di lato
+        return (f"Shaders… ({n_on})", apri, True)
 
     def show_shaders_bubble(self, gpos):
         """Sotto-menu con un toggle per ogni shader: resta aperto così se ne possono attivare più di uno di seguito."""
-        if getattr(self, "_bubble", None) is not None:
-            try: self._bubble.close()
-            except RuntimeError: pass
         files = self._shader_files()
         if not files: return
-        self._bubble = BubbleMenu(self._shader_menu_items(), keep_open=True, refresh=self._shader_menu_items)
-        self._bubble.popup_at(gpos, self.frameGeometry().center())
+        parent = getattr(self, "_bubble", None)
+        old = getattr(self, "_sub_bubble", None)
+        if old is not None:
+            try:
+                old._linked = None            # chiudendo il vecchio sotto-menu il menu contestuale deve restare aperto
+                old.close()
+            except RuntimeError: pass
+        # al massimo SHADER_MENU_MAX_ROWS voci visibili: le altre si scorrono con la rotella
+        self._sub_bubble = BubbleMenu(self._shader_menu_items(), keep_open=True, refresh=self._shader_menu_items,
+                                      max_rows=SHADER_MENU_MAX_ROWS)
+        try:
+            ref = parent.geometry() if parent is not None and parent.isVisible() else None
+        except RuntimeError:
+            parent, ref = None, None
+        if ref is not None:
+            self._sub_bubble._linked = parent
+            parent._linked = self._sub_bubble
+            self._sub_bubble.popup_beside(ref)            # di lato rispetto al menu contestuale
+        else:
+            self._sub_bubble.popup_at(gpos, self.frameGeometry().center())
 
     def _shader_menu_items(self):
         items = [("Disattiva tutti", self.clear_shaders, bool(self.active_shaders))]
@@ -5281,6 +5444,19 @@ class NekoPlayer(QMainWindow):
         self.video_display.setMinimumSize(
             self._VIDEO_MIN_MINIMAL if on else self._VIDEO_MIN_NORMAL)
 
+    def _remember_window_pos(self):
+        """Memorizza la posizione attuale della finestra per la modalita' corrente: con minimal acceso e' la posizione
+        minimal (ripristinata alla prossima attivazione), altrimenti quella normale (ripristinata alla disattivazione)."""
+        pos = QPoint(self._shake_origin) if self._shaking else QPoint(self.pos())
+        if getattr(self, "_minimal_on", False): self._minimal_pos = pos
+        else: self._normal_pos_before_minimal = pos
+
+    def _clamp_pos_to_screens(self, pos, size):
+        """Porta la posizione `pos` di una finestra di dimensioni `size` (w, h) dentro l'area complessiva degli schermi."""
+        vgeo = QApplication.primaryScreen().virtualGeometry()
+        return QPoint(max(vgeo.left(), min(pos.x(), vgeo.right() - size[0] + 1)),
+                      max(vgeo.top(), min(pos.y(), vgeo.bottom() - size[1] + 1)))
+
     def _refresh_window_min_size(self):
         """Ricalcola subito (non in modo differito) il minimo della finestra dai layout, dopo un cambio dei minimi dei figli."""
         for lay in (self.container.layout(), self.layout()):
@@ -5315,11 +5491,16 @@ class NekoPlayer(QMainWindow):
                 self._refresh_window_min_size()
                 self.resize(*target)
             new_geo = QRect(self.geometry())
-            # Mantieni fisso il centro della finestra durante il passaggio a minimal
-            center = old_geo.center() - QPoint(new_geo.width() // 2, new_geo.height() // 2)
-            self.move(center)
+            if self._minimal_pos is not None:
+                # ripristina l'ultima posizione che la finestra aveva in minimal
+                self.move(self._clamp_pos_to_screens(self._minimal_pos, (new_geo.width(), new_geo.height())))
+            else:
+                # prima volta in minimal: mantieni fisso il centro della finestra durante il passaggio
+                center = old_geo.center() - QPoint(new_geo.width() // 2, new_geo.height() // 2)
+                self.move(center)
         else:
-            # OFF: salva le dimensioni attuali come minimal e ripristina dimensione+posizione originali
+            # OFF: salva dimensioni e posizione attuali come minimal e ripristina dimensione+posizione originali
+            self._minimal_pos = QPoint(self._shake_origin) if self._shaking else QPoint(self.pos())
             self._minimal_on = False
             self._minimal_size = self._normal_window_size()
             restore_size = self._normal_size_before_minimal
@@ -5546,22 +5727,24 @@ class NekoPlayer(QMainWindow):
             "resume_positions": self.resume_positions,
             "theme_color": self.theme_color,
             "window_shape": "ellipse",
-            "window_width": self._normal_window_size()[0],
-            "window_height": self._normal_window_size()[1],
-            # Posizione attuale della finestra (così, riaprendo con minimal attivo e poi
-            # disattivandolo, si può tornare alla posizione dell'ultima sessione normale)
-            "window_x": self.pos().x(),
-            "window_y": self.pos().y()
         }
-        # Dimensioni "minimal" salvate separatamente rispetto a window_width/height
+        # Geometria NORMALE (window_*) e MINIMAL (window_minimal_*) salvate sempre separate: con minimal attivo la finestra
+        # attuale e' quella minimal, mentre la normale e' quella ricordata prima di entrare in minimal
+        cur_pos = QPoint(self._shake_origin) if self._shaking else QPoint(self.pos())
+        cur_size = tuple(self._normal_window_size())
         if getattr(self, "_minimal_on", False):
-            # Con minimal attivo la finestra attuale è quella minimal
-            mw, mh = self._normal_window_size()
+            m_pos, m_size = cur_pos, cur_size
+            n_pos = self._normal_pos_before_minimal if self._normal_pos_before_minimal is not None else cur_pos
+            n_size = self._normal_size_before_minimal if self._normal_size_before_minimal is not None else cur_size
         else:
-            mw, mh = getattr(self, "_minimal_size", None) or (0, 0)
-        if mw > 0 and mh > 0:
-            config_data["window_minimal_w"] = mw
-            config_data["window_minimal_h"] = mh
+            n_pos, n_size = cur_pos, cur_size
+            m_pos, m_size = self._minimal_pos, self._minimal_size
+        config_data["window_width"], config_data["window_height"] = int(n_size[0]), int(n_size[1])
+        config_data["window_x"], config_data["window_y"] = n_pos.x(), n_pos.y()
+        if m_size is not None and m_size[0] > 0 and m_size[1] > 0:
+            config_data["window_minimal_w"], config_data["window_minimal_h"] = int(m_size[0]), int(m_size[1])
+        if m_pos is not None:
+            config_data["window_minimal_x"], config_data["window_minimal_y"] = m_pos.x(), m_pos.y()
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(config_data, f, indent=4)
@@ -5619,6 +5802,10 @@ class NekoPlayer(QMainWindow):
             if isinstance(min_w, int) and isinstance(min_h, int) and min_w > 0 and min_h > 0:
                 self._minimal_size = legacy_to_ellipse_size(min_w, min_h) if legacy_shape else (min_w, min_h)
             self._minimal_on = bool(config_data.get("minimal_mode", False)) and self._minimal_size is not None
+            min_x = config_data.get("window_minimal_x")
+            min_y = config_data.get("window_minimal_y")
+            if isinstance(min_x, int) and isinstance(min_y, int):
+                self._minimal_pos = QPoint(min_x, min_y)
             # Se il salvataggio era in modalità minimal, abbassa subito il limite
             # minimo della finestra (serve anche per aprire dimensioni < 320x200)
             self._apply_minimal_size_limits(self._minimal_on)
@@ -5642,6 +5829,9 @@ class NekoPlayer(QMainWindow):
                 nw, nh = legacy_to_ellipse_size(win_w, win_h)
                 shift = QPoint((nw - win_w) // 2, (nh - win_h) // 2)
                 win_w, win_h = nw, nh
+            norm_w, norm_h = win_w, win_h       # geometria normale (prima di sostituirla con quella minimal)
+            # formato con posizioni separate: window_x/y e window_width/height sono SEMPRE quelli normali
+            separate = isinstance(config_data.get("window_minimal_x"), int) and isinstance(config_data.get("window_minimal_y"), int)
             if self._minimal_on:
                 win_w, win_h = self._minimal_size
             if isinstance(win_w, int) and isinstance(win_h, int) and win_w > 0 and win_h > 0:
@@ -5659,6 +5849,15 @@ class NekoPlayer(QMainWindow):
                 win_x -= shift.x()
                 win_y -= shift.y()
                 vgeo = QApplication.primaryScreen().virtualGeometry()
+                if self._minimal_on and separate and self._minimal_pos is not None:
+                    # si parte in minimal: la finestra va nella posizione minimal, quella normale resta in memoria
+                    # (insieme alle dimensioni normali) per quando si esce da minimal
+                    if isinstance(norm_w, int) and isinstance(norm_h, int) and norm_w > 0 and norm_h > 0:
+                        self._normal_size_before_minimal = (norm_w, norm_h)
+                    nx = max(vgeo.left(), min(win_x, vgeo.right() - (self._normal_size_before_minimal or (0, 0))[0] + 1))
+                    ny = max(vgeo.top(), min(win_y, vgeo.bottom() - (self._normal_size_before_minimal or (0, 0))[1] + 1))
+                    self._normal_pos_before_minimal = QPoint(nx, ny)
+                    win_x, win_y = self._minimal_pos.x(), self._minimal_pos.y()
                 x = max(vgeo.left(), min(win_x, vgeo.right() - self.width() + 1))
                 y = max(vgeo.top(), min(win_y, vgeo.bottom() - self.height() + 1))
                 self.move(x, y)
@@ -6211,9 +6410,10 @@ class NekoPlayer(QMainWindow):
         self._stop_envelope_threads()
         for th in list(self._env_threads): th.wait(1500)
         self._write_settings()
-        if getattr(self, "_bubble", None) is not None:
-            try: self._bubble.close()
-            except RuntimeError: pass
+        for attr in ("_bubble", "_sub_bubble"):
+            if getattr(self, attr, None) is not None:
+                try: getattr(self, attr).close()
+                except RuntimeError: pass
         self.worker.stop()
         self.audio_player.stop()
         self.ear_left.close()
