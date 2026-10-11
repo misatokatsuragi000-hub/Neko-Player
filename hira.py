@@ -10,59 +10,63 @@ Requisiti:
 - PyQt5 (con QtMultimedia)
 - pykakasi
 - numpy
+- sentencepiece (traduzione locale NLLB; ctranslate2 e huggingface_hub arrivano con faster-whisper)
+- Ollama (opzionale, per la traduzione con TranslateGemma): https://ollama.com
 - ffmpeg nel PATH
 
 Installazione:
-python -m pip install faster-whisper PyQt5 pykakasi numpy
+python -m pip install faster-whisper PyQt5 pykakasi numpy sentencepiece
 """
 
 import os
 import re
 import sys
 import json
+import collections
+import csv
 from html import escape
 import wave
 import subprocess
 import tempfile
+import atexit
+import textwrap
+import shlex
+import socket
+import time
 import shutil
-from bisect import bisect_right
+import threading
+from bisect import bisect_left, bisect_right
 from math import ceil
 
 
 def _aggiungi_path_librerie_cuda():
-    """Aggiunge ai percorsi di ricerca le librerie CUDA installate via pip
-    (cublas, cudnn, ...) dentro il venv corrente.
+    """Rende visibili a ctranslate2/faster-whisper le librerie CUDA installate via pip
+    (nvidia-cublas-cu12, nvidia-cudnn-cu12, ...) dentro il venv corrente.
 
-    Su Windows servono i DLL (cartelle *\\bin), su Linux/Mint servono i .so
-    (cartelle */lib): qui li aggiungo a LD_LIBRARY_PATH prima che
-    ctranslate2/faster-whisper provino a caricarli."""
+    Le librerie stanno in <site-packages>/nvidia/<nome>/lib (Linux) o .../bin (Windows).
+    Windows: os.add_dll_directory. Linux: cambiare LD_LIBRARY_PATH a processo avviato NON
+    basta (il loader la legge una volta sola all'avvio), quindi le librerie principali
+    vengono pre-caricate con ctypes (RTLD_GLOBAL): quando ctranslate2 chiede
+    'libcublas.so.12' il loader la trova gia' in memoria. LD_LIBRARY_PATH viene comunque
+    aggiornata per eventuali processi figli."""
     try:
         from importlib.metadata import distributions
     except ImportError:
         return
     is_win = os.name == "nt"
-    est = (".dll",) if is_win else (".so", ".so.12")
-    siti = set()
+    rx = re.compile(r"\.dll$" if is_win else r"\.so(\.\d+)*$")
+    siti = {}
     for dist in distributions():
-        nome = (dist.metadata.get("Name") or "").lower()
-        if nome.startswith(("nvidia-", "torch", "triton")):
-            try:
-                loc = str(dist.locate_file(""))
-            except Exception:
-                continue
-            candidati = []
-            for subdir in ("bin", "lib"):
-                d = os.path.join(loc, subdir)
-                if os.path.isdir(d):
-                    candidati.append(d)
-            if not candidati and os.path.isdir(loc):
-                candidati.append(loc)
-            for d in candidati:
+        nome = (dist.metadata.get("Name") or "").lower().replace("_", "-")
+        if not nome.startswith(("nvidia-", "torch", "triton")):
+            continue
+        for f in (dist.files or []):
+            if rx.search(f.name):
                 try:
-                    if any(f.endswith(est) for f in os.listdir(d)):
-                        siti.add(d)
-                except OSError:
-                    pass
+                    d = str(dist.locate_file(f.parent))
+                except Exception:
+                    continue
+                siti.setdefault(d, []).append(str(dist.locate_file(f)))
     if not siti:
         return
     if is_win:
@@ -70,33 +74,46 @@ def _aggiungi_path_librerie_cuda():
             try:
                 os.add_dll_directory(sito)
             except (AttributeError, OSError):
-                # Python < 3.8 oppure cartella inesistente: usa il PATH
                 os.environ["PATH"] = sito + os.pathsep + os.environ.get("PATH", "")
-    else:
-        ld = os.environ.get("LD_LIBRARY_PATH", "")
-        nuove = [s for s in siti if s not in ld.split(os.pathsep)]
-        if nuove:
-            os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(nuove) + (
-                os.pathsep + ld if ld else ""
-            )
+        return
+    ld = os.environ.get("LD_LIBRARY_PATH", "")
+    nuove = [s for s in siti if s not in ld.split(os.pathsep)]
+    if nuove:
+        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(nuove) + (os.pathsep + ld if ld else "")
+    try:
+        import ctypes
+    except ImportError:
+        return
+    # ordine: prima le dipendenze (runtime, cublasLt), poi cublas e cudnn
+    ordine = ("libcudart", "libnvJitLink", "libcublasLt", "libcublas", "libcudnn.")
+    tutte = [f for lst in siti.values() for f in lst]
+    for pref in ordine:
+        for f in sorted(tutte):
+            n = os.path.basename(f)
+            if n.startswith(pref) and os.path.exists(f):
+                try:
+                    ctypes.CDLL(f, mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
 
 
 _aggiungi_path_librerie_cuda()
 
 import numpy as np
 
-from PyQt5.QtCore import Qt, QThread, QTimer, QUrl, QPointF, QRectF, QSizeF, pyqtSignal
+from PyQt5.QtCore import (Qt, QThread, QTimer, QUrl, QPointF, QRectF, QSizeF, QProcess, QEventLoop,
+                          pyqtSignal)
 from PyQt5.QtGui import (
-    QBrush, QColor, QFont, QKeySequence, QPainter, QPalette, QPen, QPolygonF, QTextCursor,
-    QTextDocument, QTextOption,
+    QBrush, QColor, QFont, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPalette, QPen,
+    QPolygonF, QTextCursor, QTextDocument, QTextOption, QImage, QPixmap,
 )
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
-from PyQt5.QtMultimediaWidgets import QGraphicsVideoItem
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QLineEdit, QPushButton, QComboBox, QCheckBox, QDoubleSpinBox, QTextEdit,
     QFileDialog, QProgressBar, QMessageBox, QFrame, QSlider, QSplitter,
-    QScrollArea, QShortcut, QStyle, QGraphicsView, QGraphicsScene,
+    QScrollArea, QShortcut, QStyle, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
+    QListWidget, QListWidgetItem, QAbstractItemView,
 )
 
 
@@ -133,6 +150,206 @@ PREFISSO_COSYVOICE = "You are a helpful assistant.<|endofprompt|>"
 # impostazioni salvate da una sessione all'altra (accanto allo script)
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hira_config.json")
 
+# Separazione voce/musica: motori disponibili (etichetta, chiave). La chiave e' salvata nella config.
+SEPARATORI = (
+    ("Demucs (htdemucs)", "demucs"),
+    ("BS-RoFormer (audio-separator)", "bsroformer"),
+)
+# Checkpoint BS-RoFormer (voce) scaricato da audio-separator alla prima esecuzione e tenuto in cache locale.
+# Per provarne un altro basta cambiare il nome (python -m audio_separator.utils.cli --list_models).
+BSROFORMER_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+SEPARATOR_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "separator_models")
+# una riga per ogni traduzione AI: righe scartate e rifatte, per confrontare i modelli
+SCARTI_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hira_scarti_traduzione.csv")
+
+# Selezione dei modelli llama.cpp con il selettore di file del sistema (GTK su Linux Mint, tramite zenity).
+# Lo script NON cerca i modelli da solo: usa il percorso scritto nel campo (file .gguf o cartella).
+# Queste cartelle servono solo come punto di partenza del selettore, se il campo e' vuoto.
+USA_DIALOG_SISTEMA = True
+CARTELLE_GGUF = ("~/.lmstudio/models", "~/.cache/lm-studio/models", "~/.cache/llama.cpp",
+                 "~/llama.cpp/models", "~/models", "~/Models", "~/.cache/huggingface/hub",
+                 "~/Scaricati", "~/Downloads")
+CARTELLE_LLAMA_EXE = ("~/llama.cpp/build/bin", "~/llama.cpp", "/usr/local/bin", "/opt/llama.cpp")
+
+
+def cartella_iniziale(attuale, candidate):
+    """Cartella da cui far partire il selettore: quella del percorso gia' nel campo, altrimenti
+    la prima esistente tra le candidate, altrimenti la home."""
+    pth = os.path.expanduser((attuale or "").strip())
+    if pth:
+        d = pth if os.path.isdir(pth) else os.path.dirname(pth)
+        if d and os.path.isdir(d):
+            return d
+    for c in candidate:
+        c = os.path.expanduser(c)
+        if os.path.isdir(c):
+            return c
+    return os.path.expanduser("~")
+
+
+def dialog_file_sistema(parent, titolo, cartella, filtri):
+    """Selettore di file del sistema (zenity = GTK, o kdialog). 'filtri' = [(etichetta, "*.gguf *.GGUF")].
+    Restituisce il percorso scelto, "" se l'utente annulla, None se non c'e' un selettore utilizzabile
+    (in tal caso si ripiega sul dialogo di Qt). Non blocca il ciclo degli eventi di Qt."""
+    if not USA_DIALOG_SISTEMA or not sys.platform.startswith("linux"):
+        return None
+    zen, kd = shutil.which("zenity"), shutil.which("kdialog")
+    if zen:
+        prog = zen
+        args = ["--file-selection", "--title=" + titolo, "--filename=" + cartella.rstrip("/") + "/"]
+        args += ["--file-filter={} | {}".format(et, pat) for et, pat in filtri]
+    elif kd:
+        prog = kd
+        args = ["--getopenfilename", cartella,
+                "\n".join("{}|{}".format(pat, et) for et, pat in filtri), "--title", titolo]
+    else:
+        return None
+
+    proc = QProcess(parent)
+    loop = QEventLoop()
+    proc.finished.connect(lambda *_: loop.quit())
+    proc.errorOccurred.connect(lambda *_: loop.quit())
+    proc.start(prog, args)
+    if not proc.waitForStarted(3000):
+        return None
+    if parent is not None:
+        parent.setEnabled(False)          # come un dialogo modale: la finestra resta ferma finche' e' aperto
+    try:
+        loop.exec_()
+    finally:
+        if parent is not None:
+            parent.setEnabled(True)
+            parent.activateWindow()
+    if proc.error() == QProcess.FailedToStart or proc.exitStatus() != QProcess.NormalExit:
+        return None
+    out = bytes(proc.readAllStandardOutput()).decode(errors="replace").strip()
+    if proc.exitCode() == 0 and out:
+        return out.splitlines()[0]
+    return "" if proc.exitCode() == 1 else None
+
+
+def nome_separatore(chiave):
+    for etichetta, k in SEPARATORI:
+        if k == chiave:
+            return etichetta.split(" (")[0]
+    return "Demucs"
+
+
+def _trova_stem_bsroformer(cartella, src, marca):
+    """audio-separator nomina i file '<nome>_(Vocals)_<modello>.wav' e '<nome>_(Instrumental)_<modello>.wav'."""
+    for f in os.listdir(cartella):
+        if f.lower().endswith(".wav") and marca in f.lower() and os.path.join(cartella, f) != src:
+            return os.path.join(cartella, f)
+    return None
+
+
+def separa_voce_musica(path, motore, device):
+    """Separa voce e musica di 'path'. Restituisce (wav_voce, wav_musica, cartella_temporanea, errore).
+    wav_voce/wav_musica sono None se fallisce; la cartella temporanea va cancellata dal chiamante."""
+    d = tempfile.mkdtemp(prefix="hira_stem_")
+    try:
+        src = os.path.join(d, "audio.wav")
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", path, "-vn", "-ar", "44100", "-ac", "2", src],
+            check=True, stdin=subprocess.DEVNULL, capture_output=True)
+
+        ultimo = ""
+        for dev in (["cpu"] if device == "cpu" else ["cuda", "cpu"]):
+            if motore == "bsroformer":
+                os.makedirs(SEPARATOR_MODELS_DIR, exist_ok=True)
+                env = dict(os.environ)
+                if dev == "cpu":
+                    env["CUDA_VISIBLE_DEVICES"] = "-1"
+                # niente --single_stem: servono entrambe le tracce (Vocals + Instrumental)
+                r = subprocess.run(
+                    [sys.executable, "-c",
+                     "from audio_separator.utils.cli import main; main()",
+                     src, "--model_filename", BSROFORMER_MODEL,
+                     "--model_file_dir", SEPARATOR_MODELS_DIR,
+                     "--output_dir", d, "--output_format", "WAV"],
+                    stdin=subprocess.DEVNULL, capture_output=True, env=env)
+                voce = _trova_stem_bsroformer(d, src, "(vocals)")
+                musica = _trova_stem_bsroformer(d, src, "(instrumental)")
+            else:
+                r = subprocess.run(
+                    [sys.executable, "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
+                     "-d", dev, "-o", d, src],
+                    stdin=subprocess.DEVNULL, capture_output=True)
+                cart = os.path.join(d, "htdemucs", "audio")
+                voce = os.path.join(cart, "vocals.wav")
+                musica = os.path.join(cart, "no_vocals.wav")
+            if (r.returncode == 0 and voce and musica
+                    and os.path.isfile(voce) and os.path.isfile(musica)):
+                return voce, musica, d, ""
+            ultimo = (r.stderr or b"").decode(errors="replace").strip()[-300:]
+            if "No module named" in ultimo:
+                ultimo += ("  ->  python -m pip install " +
+                           ('"audio-separator[gpu]"' if motore == "bsroformer" else "demucs"))
+                break
+        return None, None, d, ultimo or "errore sconosciuto"
+    except FileNotFoundError:
+        return None, None, d, "ffmpeg non trovato"
+    except subprocess.CalledProcessError as e:
+        return None, None, d, (e.stderr or b"").decode(errors="replace").strip()[-300:]
+
+
+class SeparatoreStem(QThread):
+    """Separa voce e musica del file originale e salva le due tracce nei percorsi indicati."""
+    stato = pyqtSignal(str)
+    fatto = pyqtSignal(str)          # messaggio di errore ("" se tutto ok)
+
+    def __init__(self, path, motore, device, dest_voce, dest_musica):
+        super().__init__()
+        self.path, self.motore, self.device = path, motore, device
+        self.dest_voce, self.dest_musica = dest_voce, dest_musica
+
+    def run(self):
+        d = None
+        try:
+            self.stato.emit("Separo voce e musica con {} (puo' richiedere alcuni minuti)...".format(
+                nome_separatore(self.motore)))
+            voce, musica, d, err = separa_voce_musica(self.path, self.motore, self.device)
+            if not voce or not musica:
+                self.fatto.emit(err or "separazione non riuscita")
+                return
+            shutil.copyfile(voce, self.dest_voce)
+            shutil.copyfile(musica, self.dest_musica)
+            self.fatto.emit("")
+        except Exception as e:
+            self.fatto.emit(str(e))
+        finally:
+            if d:
+                shutil.rmtree(d, ignore_errors=True)
+
+# traduzione locale (NLLB-200 distilled, CTranslate2 int8; licenza CC-BY-NC 4.0: solo uso
+# non commerciale). Il modello si scarica una volta sola, al primo uso.
+MODELLI_TRAD = [
+    ("NLLB 600M - veloce (~630 MB)", "nllb", "JustFrederik/nllb-200-distilled-600M-ct2-int8"),
+    ("NLLB 1.3B - piu' accurato (~1,4 GB)", "nllb", "JustFrederik/nllb-200-distilled-1.3B-ct2-int8"),
+    ("TranslateGemma 4B - via Ollama (leggero)", "ollama", "translategemma:4b"),
+    ("TranslateGemma 12B - via Ollama (migliore, serve piu' VRAM)", "ollama", "translategemma:12b"),
+    ("LM Studio - server locale (qualsiasi modello caricato)", "lmstudio", ""),
+    ("llama.cpp - llama-server avviato dallo script (GGUF caricato solo per la traduzione)", "llamaserver", ""),
+]
+LM_URL_PREDEFINITO = "http://localhost:1235/v1"
+# traduzione "a contesto completo": dimensione massima di un gruppo di righe (le finestre
+# di contesto dei modelli locali sono spesso piccole, ad es. 4096 token)
+LM_CTX_RIGHE = 30
+LM_CTX_CAR = 1200
+# modalita' 'un solo passaggio': gruppi piu' larghi (bastano ~8K di contesto)
+LM_CTX_RIGHE_1 = 40
+LM_CTX_CAR_1 = 1800
+NLLB_FILE = ["model.bin", "config.json", "shared_vocabulary.*", "sentencepiece.bpe.model"]
+# lingue per TranslateGemma: (nome, codice)
+LINGUE_GEMMA = {
+    "it": ("Italian", "it"), "en": ("English", "en"), "zh": ("Chinese", "zh-Hans"),
+    "ko": ("Korean", "ko"), "fr": ("French", "fr"), "de": ("German", "de"), "es": ("Spanish", "es"),
+}
+NLLB_LINGUE = {
+    "ja": "jpn_Jpan", "it": "ita_Latn", "en": "eng_Latn", "zh": "zho_Hans",
+    "ko": "kor_Hang", "fr": "fra_Latn", "de": "deu_Latn", "es": "spa_Latn",
+}
+
 SR = 16000  # frequenza di campionamento usata per decodifica/riproduzione
 
 # colori
@@ -143,6 +360,14 @@ C_TEXT = "#e6e8f2"
 C_MUTED = "#8b90a8"
 C_ACCENT = "#7c6cff"      # parte non ancora riprodotta
 C_SPOKEN = "#ffb454"      # parte gia' pronunciata
+C_ROSSO = "#ff2a2a"       # punto di riproduzione sulla sinusoide dei dB (schermo solo audio)
+SUB_CURRENT = "#ff2a2a"       # picco di rosso del kanji/token pronunciato in questo istante
+SUB_TRAD_CURRENT = "#00b0ff"  # azzurro intenso: parte della traduzione che corrisponde al token rosso
+SUB_TRAD = "#bfe3ff"          # traduzione non ancora illuminata
+SUB_PASSI = 16                # a quanti passi si divide la durata di un token (ridisegni del colore)
+WAVE_SPAN = 8.0           # secondi visibili nella sinusoide
+WAVE_CYCLES = 3           # oscillazioni visibili in tutta la larghezza (era 18, poi 6: ora lunghezza d'onda sestupla dell'originale)
+WAVE_HEAD = 0.80          # posizione orizzontale della testina (0 = bordo sinistro, 1 = bordo destro)
 
 STILE = """
 #finestra, #interno { background: %(bg)s; }
@@ -281,6 +506,7 @@ def imposta_palette_scura(app):
 
 # cache del modello faster-whisper caricato
 _cache = {"key": None, "model": None}
+_cache_nllb = {"tr": None, "sp": None, "dev": None, "repo": None}
 _kakasi_instance = None
 
 
@@ -307,18 +533,25 @@ def a_hiragana(testo: str) -> str:
         return f"[Errore conversione hiragana: {e}]"
 
 
-def libera_modello():
-    """Scarica il modello dalla memoria."""
-    _cache["key"] = None
-    _cache["model"] = None
+def _vram_usata_mb():
+    """VRAM usata (MB) sulla prima GPU NVIDIA, oppure None se nvidia-smi non c'e'."""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return int(float(r.stdout.strip().splitlines()[0]))
+    except Exception:
+        pass
+    return None
 
+
+def _svuota_cache_gpu():
     try:
         import gc
         gc.collect()
     except Exception:
         pass
-
-    # Se PyTorch è comunque installato, libera anche la sua cache CUDA.
+    # Se PyTorch e' comunque installato, libera anche la sua cache CUDA.
     # faster-whisper usa CTranslate2, ma questo non guasta.
     try:
         import torch
@@ -326,6 +559,25 @@ def libera_modello():
             torch.cuda.empty_cache()
     except Exception:
         pass
+
+
+def libera_whisper():
+    """Scarica solo Whisper dalla memoria (RAM e VRAM)."""
+    _cache["key"] = None
+    _cache["model"] = None
+    _svuota_cache_gpu()
+
+
+def libera_modello():
+    """Scarica dalla memoria Whisper e il modello di traduzione NLLB."""
+    libera_whisper()
+    _cache_nllb.update(tr=None, sp=None, dev=None, repo=None)
+    _svuota_cache_gpu()
+
+
+def log_hira(msg):
+    """Messaggi diagnostici in console (stderr), con l'ora: servono a capire dove si ferma il caricamento di un file."""
+    print("[hira %s] %s" % (time.strftime("%H:%M:%S"), msg), file=sys.stderr, flush=True)
 
 
 def ha_flusso_video(path):
@@ -341,9 +593,115 @@ def ha_flusso_video(path):
         for st in dati.get("streams", []):
             if not st.get("disposition", {}).get("attached_pic", 0):
                 return True
-    except Exception:
-        pass
+    except subprocess.TimeoutExpired:
+        log_hira("ffprobe: nessuna risposta in 20 s, tratto il file come solo audio")
+    except Exception as e:
+        log_hira("ffprobe: %s (tratto il file come solo audio)" % e)
     return False
+
+
+def info_video(path):
+    """Dimensioni (ridotte, 8 bit) e frequenza dei fotogrammi con cui mostrare il video, o None se non si puo'.
+    Tiene conto del rapporto d'aspetto dei pixel (sorgenti anamorfiche)."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,sample_aspect_ratio,avg_frame_rate,r_frame_rate",
+             "-of", "json", path],
+            capture_output=True, stdin=subprocess.DEVNULL, timeout=20)
+        st = json.loads(r.stdout.decode(errors="replace") or "{}")["streams"][0]
+        w, h = int(st["width"]), int(st["height"])
+        sar = 1.0
+        try:
+            a, b = str(st.get("sample_aspect_ratio", "1:1")).split(":")
+            if float(a) > 0 and float(b) > 0:
+                sar = float(a) / float(b)
+        except Exception:
+            pass
+        fps = 24.0
+        for k in ("avg_frame_rate", "r_frame_rate"):
+            try:
+                n, d = str(st.get(k, "0/1")).split("/")
+                v = float(n) / float(d)
+                if 1.0 < v < 250.0:
+                    fps = v
+                    break
+            except Exception:
+                pass
+        fps = min(fps, 30.0)
+        ew = w * sar
+        W = min(960, int(round(ew)))
+        W -= W % 2
+        H = int(round(W * h / ew))
+        H -= H % 2
+        return dict(w=max(2, W), h=max(2, H), fps=fps)
+    except Exception as e:
+        log_hira("info video: %r" % (e,))
+        return None
+
+
+class SorgenteFrame(QThread):
+    """Decodifica i fotogrammi del video con ffmpeg (RGB 8 bit, ridotti) e li accoda con il loro istante. Il video non
+    passa piu' dal backend multimediale di Qt (GStreamer), che con H.264 a 10 bit (High 10) si blocca o resta nero:
+    l'audio suona sempre dal wav gia' estratto e le immagini seguono la sua posizione."""
+    MAX = 30                      # fotogrammi tenuti in coda: ffmpeg aspetta se la coda e' piena
+
+    def __init__(self, path, inizio, w, h, fps):
+        super().__init__()
+        self.path, self.inizio, self.w, self.h, self.fps = path, float(inizio), int(w), int(h), float(fps)
+        self.coda = collections.deque()      # (istante in secondi, QImage)
+        self.ultimo = self.inizio            # istante dell'ultimo fotogramma accodato
+        self.fermo = False
+        self.finito = False
+        self.proc = None
+
+    def ferma(self):
+        self.fermo = True
+        p = self.proc
+        if p is not None:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    def run(self):
+        cmd = ["ffmpeg", "-nostdin", "-v", "error", "-ss", "%.3f" % self.inizio, "-i", self.path,
+               "-an", "-sn", "-dn",
+               "-vf", "fps=%.5f,scale=%d:%d:flags=fast_bilinear,format=rgb24" % (self.fps, self.w, self.h),
+               "-f", "rawvideo", "-"]
+        size = self.w * self.h * 3
+        t0 = time.perf_counter()
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                         stdin=subprocess.DEVNULL, bufsize=size * 4)
+            n = 0
+            while not self.fermo:
+                while len(self.coda) >= self.MAX and not self.fermo:
+                    self.msleep(10)
+                if self.fermo:
+                    break
+                buf = self.proc.stdout.read(size)
+                if not buf or len(buf) < size:
+                    break
+                img = QImage(buf, self.w, self.h, self.w * 3, QImage.Format_RGB888).copy()
+                t = self.inizio + n / self.fps
+                n += 1
+                self.coda.append((t, img))
+                self.ultimo = t
+                if n == 1:
+                    log_hira("video: primo fotogramma dopo %.2f s (da %.1f s, %dx%d a %.3f fps)"
+                             % (time.perf_counter() - t0, self.inizio, self.w, self.h, self.fps))
+        except Exception as e:
+            log_hira("video: errore di decodifica: %r" % (e,))
+        finally:
+            p = self.proc
+            if p is not None:
+                try:
+                    p.kill()
+                    p.wait(2)
+                except Exception:
+                    pass
+            self.finito = True
 
 
 def fmt_tempo(s):
@@ -411,6 +769,8 @@ def allinea_traduzione(t0, t1, trad):
     Righe senza token vicini: tempi originali. Ripetibile senza effetti collaterali."""
     if not trad or not trad.get("righe") or not t0:
         return trad
+    if trad.get("fissa"):      # tempi presi dai prefissi [N|mm:ss.s]: non toccarli
+        return trad
     ta, tb = list(trad["t0"]), list(trad["t1"])
     n = len(ta)
     if n == 0 or not (len(tb) == n == len(trad["righe"])):
@@ -445,6 +805,201 @@ def allinea_traduzione(t0, t1, trad):
     out = dict(trad)
     out["t0"], out["t1"] = na, nb
     return out
+
+
+def segmenti_giapponesi(seg):
+    """Da tok['seg'] (indice di segmento per ogni token) a una lista di intervalli [a, b) di token."""
+    out = []
+    for i, sg in enumerate(seg):
+        if i == 0 or sg != seg[i - 1]:
+            out.append([i, i + 1])
+        else:
+            out[-1][1] = i + 1
+    return out
+
+
+_RE_PREF_NUM = re.compile(
+    r"^\s*[\[\(\uff08\u3010\uff3b]\s*(\d+)\s*(?:[|:/\uff5c\uff1a]\s*[\d:.,]+\s*)?[\]\)\uff09\u3011\uff3d]\s*(.*)$")
+
+
+def testo_numerato(tok, t0):
+    """Segmenti giapponesi come righe '[N|mm:ss.s] testo', da dare a un traduttore esterno:
+    il prefisso non si traduce e permette di riagganciare ogni riga al suo segmento."""
+    segs = segmenti_giapponesi(tok["seg"])
+    righe = []
+    for n, (a, b) in enumerate(segs, 1):
+        testo = "".join(tok["o"][a:b]).replace("\n", " ").strip()
+        righe.append("[{}|{}] {}".format(n, fmt_tempo(t0[a]), testo))
+    return "\n".join(righe), len(segs)
+
+
+def parse_tempo(s):
+    """'13:23.4' / '1:02:03.5' / '23.4' -> secondi (float), None se non valido."""
+    try:
+        parti = [float(x) for x in s.strip().replace(",", ".").split(":")]
+    except ValueError:
+        return None
+    if not parti or len(parti) > 3:
+        return None
+    v = 0.0
+    for x in parti:
+        v = v * 60.0 + x
+    return v
+
+
+def leggi_numerate_tempi(testo, n_seg):
+    """Legge righe '[N|tempo] testo' (anche solo '[N] testo'; le righe senza prefisso si
+    accodano alla precedente). Restituisce (righe, trovate, scartate) con una riga per
+    segmento (vuota se manca), oppure None se il testo non e' in questo formato."""
+    grezze = (testo or "").replace("\r", "").split("\n")
+    piene = [r for r in grezze if r.strip()]
+    if not piene or sum(1 for r in piene if _RE_PREF_NUM.match(r)) < 0.6 * len(piene):
+        return None
+    trovate, ultimo, scartate, tempi = {}, None, 0, {}
+    for r in grezze:
+        m = _RE_PREF_NUM.match(r)
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= n_seg and n not in trovate:
+                trovate[n] = m.group(2).strip()
+                ultimo = n
+                mt = re.match(r"^\s*[\[\(\uff08\u3010\uff3b]\s*\d+\s*[|:/\uff5c\uff1a]\s*([\d:.,]+)", r)
+                if mt:
+                    v = parse_tempo(mt.group(1))
+                    if v is not None:
+                        tempi[n] = v
+            else:
+                scartate += 1
+                ultimo = None
+        elif ultimo is not None and r.strip():
+            trovate[ultimo] += " " + r.strip()
+    return ([trovate.get(i, "") for i in range(1, n_seg + 1)], len(trovate), scartate,
+            [tempi.get(i) for i in range(1, n_seg + 1)])
+
+
+def spans_riquadro_numerato(testo, n_seg):
+    """Intervalli UTF-16 del testo (dopo il prefisso [N|tempo]) di ogni segmento, calcolati sul
+    riquadro cosi' com'e': serve a evidenziare senza riscrivere il riquadro. Le righe senza
+    prefisso accodano alla precedente (come in leggi_numerate_tempi); i segmenti senza riga
+    hanno un intervallo vuoto."""
+    spans, visti, ultimo, pos = [None] * n_seg, set(), None, 0
+    for r in (testo or "").replace("\r", "").split("\n"):
+        m = _RE_PREF_NUM.match(r)
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= n_seg and n not in visti:
+                visti.add(n)
+                ultimo = n
+                a = pos + l16(r[:m.start(2)])
+                spans[n - 1] = [a, a + l16(m.group(2).rstrip())]
+            else:
+                ultimo = None
+        elif ultimo is not None and r.strip():
+            spans[ultimo - 1][1] = pos + l16(r.rstrip())
+        pos += l16(r) + 1
+    prev, out = 0, []
+    for sp in spans:
+        sp = tuple(sp) if sp is not None else (prev, prev)
+        out.append(sp)
+        prev = sp[1]
+    return out
+
+
+def spans_riquadro_righe(testo, n):
+    """Intervalli UTF-16 delle prime n righe del riquadro, cosi' come sono scritte."""
+    spans, pos = [], 0
+    for r in (testo or "").replace("\r", "").split("\n")[:n]:
+        spans.append((pos, pos + l16(r)))
+        pos += l16(r) + 1
+    return spans
+
+
+_RE_INTERVALLO = re.compile(
+    r"\[\s*([\d:.,]+)\s*(?:->|-->|\u2192)\s*\[?\s*([\d:.,]+)\s*\]")   # [mm:ss.s -> mm:ss.s]
+
+
+def leggi_intervalli_tempo(testo):
+    """Legge un testo fatto di frasi precedute da '[inizio -> fine]' (formato della trascrizione con
+    timestamp; tollerato anche '[inizio -> [fine]' e piu' frasi sulla stessa riga). Restituisce
+    (righe, t0, t1, spans) con gli intervalli UTF-16 del solo testo di ogni frase nel riquadro, oppure
+    None se il testo non e' in questo formato."""
+    testo = (testo or "").replace("\r", "")
+    piene = [r for r in testo.split("\n") if r.strip()]
+    ms = list(_RE_INTERVALLO.finditer(testo))
+    if not ms or len(ms) < 0.6 * len(piene) or testo[:ms[0].start()].strip():
+        return None
+    righe, t0, t1, spans, prev = [], [], [], [], 0.0
+    for k, m in enumerate(ms):
+        a, b = m.end(), (ms[k + 1].start() if k + 1 < len(ms) else len(testo))
+        corpo = testo[a:b]
+        ini = a + (len(corpo) - len(corpo.lstrip()))
+        fin = a + len(corpo.rstrip())
+        riga = " ".join(testo[ini:fin].split())
+        va, vb = parse_tempo(m.group(1)), parse_tempo(m.group(2))
+        if not riga or va is None or vb is None:
+            continue
+        va = max(va, prev)
+        prev = va
+        righe.append(riga)
+        t0.append(va)
+        t1.append(max(vb, va))
+        spans.append((l16(testo[:ini]), l16(testo[:fin])))
+    if not righe:
+        return None
+    return righe, t0, t1, spans
+
+
+def dividi_frasi(testo, max_car=80):
+    """Spezza un testo in frasi (fine frase . ! ? ... e simili); le frasi piu' lunghe di
+    max_car vengono divise alle virgole/punti e virgola e, se serve, a capo parola."""
+    testo = " ".join((testo or "").split())
+    if not testo:
+        return []
+    frasi = [f.strip() for f in re.split(r"(?<=[.!?\u2026\u3002\uff01\uff1f])\s+", testo) if f.strip()]
+    out = []
+    for f in frasi:
+        if len(f) <= max_car:
+            out.append(f)
+            continue
+        cur = ""
+        for pezzo in re.split(r"(?<=[,;:\u3001])\s+", f):
+            if cur and len(cur) + 1 + len(pezzo) > max_car:
+                out.append(cur)
+                cur = pezzo
+            else:
+                cur = (cur + " " + pezzo).strip()
+        if cur:
+            out.append(cur)
+    finale = []
+    for r in out:
+        finale.extend(textwrap.wrap(r, width=max_car + 20, break_long_words=False) or [r])
+    return finale
+
+
+def righe_su_tempi(righe, t0, t1, pesi):
+    """Distribuisce M righe (traduzione incollata a mano) sul tempo dei token giapponesi,
+    in proporzione al 'peso' cumulato dei token (lunghezza della lettura). E' una stima:
+    serve quando le righe incollate non coincidono con i segmenti. Restituisce dict(righe, t0, t1)."""
+    n, m = len(t0), len(righe)
+    cw = [0.0]
+    for w in pesi:
+        cw.append(cw[-1] + w)
+    tot = cw[-1] or 1.0
+    bordi = [0]
+    for k in range(1, m):
+        j = bisect_left(cw, tot * k / m)
+        bordi.append(min(max(j, bordi[-1]), n))
+    bordi.append(n)
+    a0, a1, prev = [], [], 0.0
+    for k in range(m):
+        a = min(bordi[k], n - 1)
+        b = max(bordi[k + 1], a + 1)
+        ini = max(t0[a], prev)
+        fin = max(t1[min(b, n) - 1], ini)
+        a0.append(ini)
+        a1.append(fin)
+        prev = ini
+    return dict(righe=list(righe), t0=a0, t1=a1)
 
 
 def karaoke_espandi(d):
@@ -482,13 +1037,17 @@ def karaoke_espandi(d):
             tok_h.append(h)
             tok_seg.append(n)
 
-    out = {k: v for k, v in d.items() if k not in ("s", "tr")}
+    out = {k: v for k, v in d.items() if k not in ("s", "tr", "trf", "trn")}
     if d.get("tr"):
         out["trad"] = dict(
             righe=[e[0] for e in d["tr"]],
             t0=[e[1] for e in d["tr"]],
             t1=[e[2] for e in d["tr"]],
         )
+        if d.get("trf"):
+            out["trad"]["fissa"] = True
+        if d.get("trn"):
+            out["trad"]["num"] = True
     if out.get("trad"):
         out["trad"] = allinea_traduzione(t0, t1, out["trad"])
     out.update(
@@ -523,6 +1082,10 @@ def karaoke_compatto(r):
     if tr and tr.get("righe"):
         d["tr"] = [[t, round(float(a), 2), round(float(b), 2)]
                    for t, a, b in zip(tr["righe"], tr["t0"], tr["t1"])]
+        if tr.get("fissa"):
+            d["trf"] = 1
+        if tr.get("num"):
+            d["trn"] = 1
 
     # verifica: la ricostruzione deve riprodurre esattamente testi e intervalli
     try:
@@ -539,6 +1102,971 @@ def karaoke_compatto(r):
 
 
 # ---------------------------------------------------------------------------
+# Batch: ricerca file e salvataggio dei risultati senza passare dalla GUI
+# ---------------------------------------------------------------------------
+EXT_MEDIA = tuple(e[1:].lower() for e in (EST_AUDIO + " " + EST_VIDEO).split())
+
+
+def _chiave_naturale(s):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+
+def trova_media(percorso):
+    """Elenco dei file audio/video: il file stesso, oppure tutti quelli contenuti
+    in una cartella (sottocartelle comprese), in ordine naturale (2 prima di 10)."""
+    if os.path.isfile(percorso):
+        return [percorso] if percorso.lower().endswith(EXT_MEDIA) else []
+    trovati = []
+    if os.path.isdir(percorso):
+        for rad, sotto, files in os.walk(percorso):
+            sotto.sort(key=_chiave_naturale)
+            for f in sorted(files, key=_chiave_naturale):
+                if f.lower().endswith(EXT_MEDIA):
+                    trovati.append(os.path.join(rad, f))
+    return trovati
+
+
+def scrivi_karaoke_json(r, media, percorso):
+    """Scrive il file _karaoke.json del risultato r (formato compatto v2, se possibile)."""
+    dati = dict(
+        file=os.path.basename(media),
+        percorso_file=os.path.abspath(media),
+    )
+    comp = karaoke_compatto(r)
+    if comp is not None:
+        dati.update(comp)
+    else:  # fallback: formato completo v1
+        dati.update(
+            versione=1,
+            orig=r["orig"],
+            hira=r["hira"],
+            span_o=[list(x) for x in r["span_o"]],
+            span_h=[list(x) for x in r["span_h"]],
+            t0=[round(float(t), 2) for t in r["t0"]],
+            t1=[round(float(t), 2) for t in r["t1"]],
+            tok=r["tok"],
+        )
+    with open(percorso, "w", encoding="utf-8") as fh:
+        json.dump(dati, fh, ensure_ascii=False, separators=(",", ":"))
+
+
+def traduzione_numerata(trad):
+    """Traduzione come righe '[N|mm:ss.s] testo' (stesso formato di 'Copia con numeri'):
+    e' il formato dei file _traduzione.txt, con il tempo di inizio di ogni frase."""
+    return "\n".join(
+        "[{}|{}] {}".format(k, fmt_tempo(a), " ".join(str(rg).split()))
+        for k, (rg, a) in enumerate(zip(trad["righe"], trad["t0"]), 1))
+
+
+def salva_risultato(r, media):
+    """Salva accanto a 'media' gli stessi file di "Salva accanto all'audio":
+    _trascrizione.txt, _hiragana.txt, _traduzione.txt (se c'e') e _karaoke.json."""
+    base = os.path.splitext(media)[0]
+    testi = [("_trascrizione.txt", r["orig"]), ("_hiragana.txt", r["hira"])]
+    trad = r.get("trad")
+    if trad and trad.get("righe"):
+        testi.append(("_traduzione.txt", traduzione_numerata(trad)))
+    scritti = []
+    for suff, t in testi:
+        if t.strip():
+            with open(base + suff, "w", encoding="utf-8") as fh:
+                fh.write(t)
+            scritti.append(suff)
+    scrivi_karaoke_json(r, media, base + "_karaoke.json")
+    scritti.append("_karaoke.json")
+    return scritti
+
+
+# ---------------------------------------------------------------------------
+# Traduzione locale (NLLB-200 via CTranslate2)
+# ---------------------------------------------------------------------------
+def _traduci_nllb(testi, lingua, device="auto", progresso=None, stato=None, batch=16, repo=None):
+    """Traduce dal giapponese con NLLB-200 (CTranslate2), tutto in locale.
+    Ogni riga e' una frase indipendente e i risultati tornano nello stesso ordine:
+    l'allineamento con i tempi e' garantito. Restituisce una lista lunga come 'testi'
+    ("" per le righe vuote, None dove il modello non ha dato testo).
+    Solleva ImportError se manca sentencepiece/ctranslate2/huggingface_hub."""
+    if lingua not in NLLB_LINGUE:
+        raise ValueError("lingua '{}' non supportata dalla traduzione locale".format(lingua))
+    import ctranslate2
+    import sentencepiece as spm
+    from huggingface_hub import snapshot_download
+
+    repo = repo or MODELLI_TRAD[0][2]
+    src, tgt = NLLB_LINGUE["ja"], NLLB_LINGUE[lingua]
+    risultati = ["" if not t else None for t in testi]
+    da_fare = [i for i, t in enumerate(testi) if t]
+    if not da_fare:
+        return risultati
+
+    if _cache_nllb["tr"] is None or _cache_nllb["repo"] != repo:
+        _cache_nllb.update(tr=None, sp=None, dev=None, repo=None)
+        if stato:
+            stato("Cerco il modello di traduzione {} (la prima volta lo scarica)...".format(repo.split("/")[-1]))
+        cartella = snapshot_download(repo, allow_patterns=NLLB_FILE)
+        sp = spm.SentencePieceProcessor()
+        sp.load(os.path.join(cartella, "sentencepiece.bpe.model"))
+
+        tr, ultimo, usato = None, None, None
+        for dev in (["cuda", "cpu"] if device in ("auto", "cuda") else ["cpu"]):
+            try:
+                if dev == "cuda" and ctranslate2.get_cuda_device_count() == 0:
+                    continue
+                if stato:
+                    stato("Carico il modello di traduzione su {}...".format(dev))
+                tr = ctranslate2.Translator(cartella, device=dev, compute_type="auto")
+                usato = dev
+                break
+            except Exception as e:
+                ultimo = e
+        if tr is None:
+            raise RuntimeError("impossibile caricare il modello NLLB: {}".format(ultimo))
+        _cache_nllb.update(tr=tr, sp=sp, dev=usato, repo=repo)
+
+    tr, sp = _cache_nllb["tr"], _cache_nllb["sp"]
+    fatte = 0
+    for k in range(0, len(da_fare), batch):
+        idx = da_fare[k:k + batch]
+        sorgenti = [[src] + sp.encode(testi[i].replace("\n", " "), out_type=str) + ["</s>"] for i in idx]
+        lim = min(256, 3 * max(len(x) for x in sorgenti) + 10)
+        res = tr.translate_batch(
+            sorgenti, target_prefix=[[tgt]] * len(idx), beam_size=5, max_decoding_length=lim)
+        for i, r in zip(idx, res):
+            toks = list(r.hypotheses[0])
+            if toks and toks[0] == tgt:
+                toks = toks[1:]
+            risultati[i] = sp.decode(toks).strip() or None
+        fatte += len(idx)
+        if progresso:
+            progresso(fatte, len(da_fare))
+    return risultati
+
+
+def _prompt_gemma(lingua, testo):
+    """Prompt nel formato di TranslateGemma (giapponese -> lingua scelta)."""
+    t, c = LINGUE_GEMMA[lingua]
+    return (
+        "You are a professional Japanese (ja) to {t} ({c}) translator. Your goal is to accurately "
+        "convey the meaning and nuances of the original Japanese text while adhering to {t} grammar, "
+        "vocabulary, and cultural sensitivities.\n"
+        "Produce only the {t} translation, without any additional explanations or commentary. "
+        "Please translate the following Japanese text into {t}:\n\n\n"
+    ).format(t=t, c=c) + testo.replace("\n", " ")
+
+
+def _prompt_plamo(lingua, testo):
+    """Prompt nel formato di PLaMo-2-translate (giapponese -> lingua scelta).
+    Il modello va interrogato con /v1/completions (non /chat/completions): il formato
+    e' quello 'dataset translation' con i token speciali <|plamo:op|>."""
+    t = LINGUE_GEMMA[lingua][0]
+    return (
+        "<|plamo:op|>dataset\ntranslation\n"
+        "<|plamo:op|>input lang=Japanese\n{}\n"
+        "<|plamo:op|>output lang={}\n"
+    ).format(testo.replace("\n", " "), t)
+
+
+# ---------------------------------------------------------------- llama-server (llama.cpp)
+_LLAMA = {"proc": None, "chiave": None, "url": None, "logf": None, "logpath": None}
+
+
+def ferma_llamaserver():
+    """Termina il llama-server avviato dallo script (libera subito la VRAM)."""
+    pr = _LLAMA.get("proc")
+    if pr is not None and pr.poll() is None:
+        try:
+            pr.terminate()
+            pr.wait(timeout=15)
+        except Exception:
+            try:
+                pr.kill()
+                pr.wait(timeout=5)
+            except Exception:
+                pass
+    lf = _LLAMA.get("logf")
+    if lf is not None:
+        try:
+            lf.close()
+        except Exception:
+            pass
+    lp = _LLAMA.get("logpath")
+    if lp:
+        try:
+            os.remove(lp)
+        except OSError:
+            pass
+    _LLAMA.update(proc=None, chiave=None, url=None, logf=None, logpath=None)
+
+
+atexit.register(ferma_llamaserver)
+
+
+def _coda_log(path, n=12):
+    try:
+        with open(path, "rb") as fh:
+            righe = fh.read().decode("utf-8", "replace").strip().splitlines()
+    except OSError:
+        return ""
+    return "\n".join(righe[-n:])
+
+
+def _risolvi_exe(percorso):
+    """Accetta il file llama-server oppure una cartella che lo contiene (anche in
+    sottocartelle: es. ~/.lmstudio/extensions/backends)."""
+    percorso = (percorso or "").strip()
+    if percorso and os.path.isdir(percorso):
+        for root, dirs, files in os.walk(percorso):
+            if root[len(percorso):].count(os.sep) > 5:
+                dirs[:] = []
+                continue
+            for nome in ("llama-server", "llama-server.exe"):
+                if nome in files:
+                    return os.path.join(root, nome)
+        raise RuntimeError("nessun llama-server trovato dentro {}".format(percorso))
+    return percorso or shutil.which("llama-server") or ""
+
+
+def _risolvi_gguf(percorso):
+    """Accetta il file .gguf oppure la cartella del modello (sceglie il .gguf, escludendo
+    mmproj; per i modelli spezzati in parti usa la prima)."""
+    percorso = (percorso or "").strip()
+    if not percorso or not os.path.isdir(percorso):
+        return percorso
+    trovati = []
+    for root, dirs, files in os.walk(percorso):
+        for f in sorted(files):
+            if f.lower().endswith(".gguf") and "mmproj" not in f.lower():
+                trovati.append(os.path.join(root, f))
+    if not trovati:
+        raise RuntimeError("nessun file .gguf dentro {}".format(percorso))
+    if len(trovati) == 1:
+        return trovati[0]
+    prime = [f for f in trovati if "-00001-of-" in f]
+    if len(prime) == 1:
+        return prime[0]
+    raise RuntimeError("piu' file .gguf in {}: scegli quello giusto con 'Sfoglia...':\n{}".format(
+        percorso, "\n".join(os.path.basename(f) for f in trovati[:10])))
+
+
+def _llama_avvia(cfg, stato=None):
+    """Avvia (o riusa) llama-server con il GGUF scelto; restituisce l'URL base /v1."""
+    import urllib.request
+    import urllib.error
+    exe = _risolvi_exe(cfg.get("exe"))
+    if not exe or not os.path.isfile(exe):
+        raise RuntimeError("llama-server non trovato: indica il percorso dell'eseguibile "
+                           "(da https://github.com/ggml-org/llama.cpp/releases) oppure mettilo nel PATH.")
+    gguf = _risolvi_gguf(cfg.get("gguf"))
+    if not gguf or not os.path.isfile(gguf):
+        raise RuntimeError("File .gguf non trovato: {}".format(gguf or "(vuoto)"))
+    try:
+        ctx = int(str(cfg.get("ctx") or "").strip() or 16384)
+    except ValueError:
+        ctx = 16384
+    ngl = str(cfg.get("ngl") or "").strip() or "99"
+    try:
+        extra = shlex.split(cfg.get("extra") or "", posix=(os.name != "nt"))
+    except ValueError as e:
+        raise RuntimeError("argomenti extra non validi: {}".format(e))
+    chiave = (exe, gguf, ctx, ngl, tuple(extra))
+
+    pr = _LLAMA["proc"]
+    if pr is not None and pr.poll() is None and _LLAMA["chiave"] == chiave:
+        return _LLAMA["url"]
+    ferma_llamaserver()
+
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        porta = sk.getsockname()[1]
+    cmd = [exe, "-m", gguf, "-c", str(ctx), "-ngl", ngl,
+           "--host", "127.0.0.1", "--port", str(porta)] + extra
+    logf = tempfile.NamedTemporaryFile(prefix="llama_server_", suffix=".log", delete=False)
+    kw = {}
+    if os.name != "nt":
+        # le build incluse in LM Studio hanno le librerie (libllama, libggml-*) accanto all'eseguibile
+        env = dict(os.environ)
+        cartella = os.path.dirname(os.path.abspath(exe))
+        dirs = [cartella]
+        # le librerie CUDA (libcudart, libcublas) di LM Studio stanno in backends/vendor/<...>
+        vendor = os.path.join(os.path.dirname(cartella), "vendor")
+        if os.path.isdir(vendor):
+            for v in sorted(os.listdir(vendor)):
+                if os.path.isdir(os.path.join(vendor, v)) and (
+                        "cuda12" not in cartella or "cuda12" in v):
+                    dirs.append(os.path.join(vendor, v))
+        if env.get("LD_LIBRARY_PATH"):
+            dirs.append(env["LD_LIBRARY_PATH"])
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(dirs)
+        kw["env"] = env
+        kw["cwd"] = cartella
+    if os.name == "nt":
+        kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        pr = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
+                              stdin=subprocess.DEVNULL, **kw)
+    except OSError as e:
+        logf.close()
+        os.remove(logf.name)
+        raise RuntimeError("impossibile avviare llama-server: {}".format(e))
+    _LLAMA.update(proc=pr, chiave=chiave, logf=logf, logpath=logf.name)
+
+    nome = os.path.basename(gguf)
+    t0 = time.time()
+    ultimo = 0
+    while True:
+        if pr.poll() is not None:
+            coda = _coda_log(logf.name)
+            ferma_llamaserver()
+            raise RuntimeError("llama-server si e' chiuso (codice {}) durante il caricamento di {}. "
+                               "Ultime righe del log:\n{}".format(pr.returncode, nome, coda))
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:{}/health".format(porta), timeout=2) as r:
+                if r.status == 200:
+                    break
+        except (urllib.error.URLError, OSError):
+            pass
+        sec = int(time.time() - t0)
+        if sec > 900:
+            ferma_llamaserver()
+            raise RuntimeError("llama-server non e' diventato pronto entro 15 minuti.")
+        if stato and sec - ultimo >= 3:
+            ultimo = sec
+            stato("Carico {} in llama.cpp ({} s)...".format(nome, sec))
+        time.sleep(0.5)
+    _LLAMA["url"] = "http://127.0.0.1:{}/v1".format(porta)
+    return _LLAMA["url"]
+
+
+def _traduci_llamaserver(testi, lingua, cfg, progresso=None, stato=None):
+    if lingua not in LINGUE_GEMMA:
+        raise ValueError("lingua '{}' non supportata".format(lingua))
+    if not any(testi):
+        return ["" for _ in testi]
+    cfg = dict(cfg, gguf=_risolvi_gguf(cfg.get("gguf")))
+    url = _llama_avvia(cfg, stato)
+    # il nome del file serve anche a riconoscere translategemma / plamo
+    nome = os.path.splitext(os.path.basename(cfg["gguf"]))[0]
+    return _traduci_lmstudio(testi, lingua, url, nome, progresso, stato,
+                             contesto_completo=bool(cfg.get("contesto")), tutto=bool(cfg.get("tutto")),
+                             veloce=bool(cfg.get("veloce")))
+
+
+def _ollama_url():
+    h = os.environ.get("OLLAMA_HOST", "").strip() or "127.0.0.1:11434"
+    if not h.startswith("http"):
+        h = "http://" + h
+    return h.replace("0.0.0.0", "127.0.0.1").rstrip("/")
+
+
+def _ollama_json(percorso, dati=None, timeout=300):
+    """GET (dati=None) o POST JSON verso Ollama. Errori in messaggi comprensibili."""
+    import urllib.request
+    import urllib.error
+    url = _ollama_url() + percorso
+    req = urllib.request.Request(
+        url, data=None if dati is None else json.dumps(dati).encode("utf-8"),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            det = json.loads(e.read().decode("utf-8")).get("error", "")
+        except Exception:
+            det = ""
+        raise RuntimeError("Ollama ha risposto con errore {}: {}".format(e.code, det or e.reason))
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            "Ollama non raggiungibile su {} ({}). Installalo da https://ollama.com e assicurati "
+            "che sia in esecuzione (comando:  ollama serve).".format(_ollama_url(), e.reason))
+
+
+def _ollama_assicura_modello(nome, stato=None):
+    """Se il modello non e' ancora presente lo scarica con Ollama (solo la prima volta)."""
+    import urllib.request
+    elenco = _ollama_json("/api/tags", timeout=20).get("models", [])
+    presenti = {m.get("name", "") for m in elenco} | {m.get("model", "") for m in elenco}
+    if nome in presenti or (":" not in nome and nome + ":latest" in presenti):
+        return
+    if stato:
+        stato("Scarico il modello {} con Ollama (solo la prima volta, puo' richiedere molti minuti)...".format(nome))
+    req = urllib.request.Request(
+        _ollama_url() + "/api/pull",
+        data=json.dumps({"model": nome, "name": nome, "stream": True}).encode("utf-8"),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=600) as r:
+            for riga in r:
+                if not riga.strip():
+                    continue
+                d = json.loads(riga.decode("utf-8"))
+                if d.get("error"):
+                    raise RuntimeError("download del modello {} non riuscito: {}".format(nome, d["error"]))
+                if stato and d.get("total") and d.get("completed") is not None:
+                    stato("Scarico {} con Ollama: {:.0f}%".format(nome, 100.0 * d["completed"] / d["total"]))
+    except OSError as e:
+        raise RuntimeError("download del modello {} non riuscito: {}".format(nome, e))
+
+
+def _traduci_ollama(testi, lingua, nome_modello, progresso=None, stato=None):
+    """Traduce dal giapponese con TranslateGemma tramite Ollama, una riga per richiesta
+    (quindi l'allineamento con i tempi e' garantito). Nessun limite di richieste."""
+    if lingua not in LINGUE_GEMMA:
+        raise ValueError("lingua '{}' non supportata".format(lingua))
+    tgt, tgt_cod = LINGUE_GEMMA[lingua]
+    risultati = ["" if not t else None for t in testi]
+    da_fare = [i for i, t in enumerate(testi) if t]
+    if not da_fare:
+        return risultati
+
+    _ollama_assicura_modello(nome_modello, stato)
+
+
+    for n, i in enumerate(da_fare, 1):
+        if stato and n == 1:
+            stato("Carico {} in Ollama (la prima richiesta puo' richiedere un po')...".format(nome_modello))
+        r = _ollama_json("/api/generate", dict(
+            model=nome_modello,
+            prompt=_prompt_gemma(lingua, testi[i]),
+            stream=False,
+            options=dict(temperature=0.0, num_predict=400),
+        ), timeout=600)
+        out = " ".join((r.get("response") or "").split())
+        risultati[i] = out or None
+        if progresso:
+            progresso(n, len(da_fare))
+    return risultati
+
+
+def _lm_base(url):
+    u = (url or "").strip() or LM_URL_PREDEFINITO
+    if not u.startswith("http"):
+        u = "http://" + u
+    u = u.rstrip("/")
+    return u if u.endswith("/v1") else u + "/v1"
+
+
+def _lm_json(base, percorso, dati=None, timeout=300):
+    """GET (dati=None) o POST JSON verso un server OpenAI-compatibile (LM Studio)."""
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(
+        base + percorso, data=None if dati is None else json.dumps(dati).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": "Bearer lm-studio"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        det = ""
+        try:
+            d = json.loads(e.read().decode("utf-8")).get("error", "")
+            det = d.get("message", "") if isinstance(d, dict) else str(d)
+        except Exception:
+            pass
+        raise RuntimeError("LM Studio ha risposto con errore {}: {}".format(e.code, det or e.reason))
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            "LM Studio non raggiungibile su {} ({}). Apri LM Studio, avvia il server locale "
+            "(scheda Developer) e controlla l'indirizzo.".format(base, e.reason))
+    except OSError as e:
+        raise RuntimeError("LM Studio non ha risposto: {}".format(e))
+
+
+_RE_GIAPP = re.compile("[\u3040-\u30ff\u4e00-\u9fff]")
+_RE_NUM = re.compile(r"^\s*\[(\d+)\]\s*(.*)$")
+
+
+def _pulisci_lm(out):
+    out = re.sub(r"<think>.*?</think>", "", out or "", flags=re.S)
+    out = " ".join(out.split())
+    if len(out) > 1 and out[0] in '"\u201c\u300c\u00ab' and out[-1] in '"\u201d\u300d\u00bb':
+        out = out[1:-1].strip()
+    return out
+
+
+_LM_ULTIMO = {"info": ""}
+
+# Statistiche di scarto dell'ultima traduzione (azzerate da traduzione_segmenti). Nei metodi a gruppi
+# ('un solo passaggio' e 'contesto completo') una riga generata dal modello e' SCARTATA se manca nel
+# formato [N], e' vuota o e' rimasta in giapponese: viene allora rifatta una per una.
+_STAT_TRAD = {}
+
+
+def _stat_add(chiave, n=1):
+    _STAT_TRAD[chiave] = _STAT_TRAD.get(chiave, 0) + n
+
+
+def _stat_gruppo(n_righe, risposta_ok):
+    _stat_add("gruppi")
+    _stat_add("tot", n_righe)
+    if not risposta_ok:
+        _stat_add("gruppi_vuoti")
+
+
+def _stat_scarto(pezzo):
+    _stat_add("scartate")
+    _stat_add("mancanti" if not pezzo else "giapponese")
+
+
+def _stat_rifatta(out, lingua):
+    ok = bool(out) and (lingua == "zh" or not _RE_GIAPP.search(out))
+    _stat_add("rifatte_ok" if ok else "rifatte_ko")
+
+
+def _report_scarti(p, testi, righe_tmp):
+    """Testo per la barra di stato e riga nel CSV con le righe scartate dal modello."""
+    st = _STAT_TRAD
+    richieste = [i for i, t in enumerate(testi) if t]
+    if not richieste:
+        return ""
+    zh = p.get("lingua") == "zh"
+    senza = sum(1 for i in richieste if righe_tmp[i] is None)
+    giapp = 0 if zh else sum(1 for i in richieste if righe_tmp[i] and _RE_GIAPP.search(righe_tmp[i]))
+    if st.get("gruppi"):
+        tot = max(1, st.get("tot", len(richieste)))
+        scart = st.get("scartate", 0)
+        msg = (" (righe AI scartate: {} su {} = {:.1f}% [{} mancanti o vuote, {} rimaste in giapponese]; "
+               "rifatte bene {}, ancora non valide {})").format(
+            scart, tot, 100.0 * scart / tot, st.get("mancanti", 0), st.get("giapponese", 0),
+            st.get("rifatte_ok", 0), st.get("rifatte_ko", 0))
+    else:
+        msg = (" (questo metodo non scarta righe: {} senza risultato, {} ancora con caratteri giapponesi)"
+               ).format(senza, giapp)
+    try:
+        nuovo = not os.path.isfile(SCARTI_LOG)
+        with open(SCARTI_LOG, "a", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh)
+            if nuovo:
+                w.writerow(["data", "file", "modello", "metodo", "lingua", "righe", "scartate", "mancanti_o_vuote",
+                            "rimaste_in_giapponese", "rifatte_ok", "rifatte_ko", "gruppi", "gruppi_senza_risposta",
+                            "finali_senza_risultato", "finali_con_giapponese"])
+            w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), os.path.basename(str(p.get("file", ""))),
+                        st.get("modello", ""), st.get("metodo", ""), p.get("lingua", ""), len(richieste),
+                        st.get("scartate", 0) if st.get("gruppi") else "", st.get("mancanti", 0),
+                        st.get("giapponese", 0), st.get("rifatte_ok", 0), st.get("rifatte_ko", 0),
+                        st.get("gruppi", 0), st.get("gruppi_vuoti", 0), senza, giapp])
+    except OSError:
+        pass
+    return msg
+# i modelli Qwen3 & co. "pensano" prima di rispondere e il ragionamento consuma i token: lo si
+# disattiva nel template di chat (llama-server lo supporta; chi non lo conosce lo ignora)
+_SENZA_THINKING = dict(enable_thinking=False)
+
+
+def _info_risposta(r):
+    try:
+        ch = r["choices"][0]
+        rag = bool((ch.get("message") or {}).get("reasoning_content"))
+        return "finish_reason={}{}".format(ch.get("finish_reason"), ", il modello ha solo 'pensato'" if rag else "")
+    except Exception:
+        return ""
+
+
+def _lm_chat(base, modello, messaggi, max_tokens):
+    r = _lm_json(base, "/chat/completions", dict(
+        model=modello, messages=messaggi, temperature=0.0, max_tokens=max_tokens, stream=False,
+        chat_template_kwargs=_SENZA_THINKING), timeout=900)
+    _LM_ULTIMO["info"] = _info_risposta(r)
+    try:
+        out = r["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError("risposta inattesa da LM Studio: {}".format(str(r)[:150]))
+    return re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
+
+
+def _lm_completion(base, modello, prompt, max_tokens):
+    """Richiesta /v1/completions (prompt grezzo) usata da PLaMo-2-translate."""
+    r = _lm_json(base, "/completions", dict(
+        model=modello, prompt=prompt, temperature=0.1, max_tokens=max_tokens,
+        stop=["<|plamo:op|>"], stream=False), timeout=600)
+    try:
+        out = r["choices"][0]["text"] or ""
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError("risposta inattesa da LM Studio: {}".format(str(r)[:150]))
+    return out.split("<|plamo:op|>")[0].strip()
+
+
+def _leggi_numerate(testo, attesi):
+    """Legge righe nel formato '[N] testo' (le righe di continuazione si accodano)."""
+    trovate, ultimo = {}, None
+    for riga in testo.splitlines():
+        m = _RE_NUM.match(riga)
+        if m:
+            n = int(m.group(1))
+            if n in attesi and n not in trovate:
+                trovate[n] = m.group(2)
+                ultimo = n
+            else:
+                ultimo = None
+        elif ultimo is not None and riga.strip():
+            trovate[ultimo] += " " + riga.strip()
+    return trovate
+
+
+def _traduci_lm_numerato(testi, lingua, base, modello, progresso=None, stato=None, tutto=False):
+    """Un solo passaggio: ogni gruppo di righe numerate viene tradotto direttamente in righe
+    numerate (meta' dei token rispetto al metodo a due passaggi). Il modello vede tutto il
+    gruppo e le ultime righe gia' tradotte, quindi capisce soggetti e pronomi omessi.
+    Le righe mancanti o rimaste in giapponese vengono rifatte una per una."""
+    tgt = LINGUE_GEMMA[lingua][0]
+    risultati = ["" if not t else None for t in testi]
+    da_fare = [i for i, t in enumerate(testi) if t]
+
+    gruppi, cur, car = [], [], 0
+    for i in da_fare:
+        lung = len(testi[i])
+        if cur and not tutto and (len(cur) >= LM_CTX_RIGHE_1 or car + lung > LM_CTX_CAR_1):
+            gruppi.append(cur)
+            cur, car = [], 0
+        cur.append(i)
+        car += lung
+    if cur:
+        gruppi.append(cur)
+
+    sistema = (
+        "You are a professional Japanese to {t} translator of song lyrics, subtitles and dialogue. "
+        "You receive numbered Japanese lines that belong to ONE continuous text; a sentence may be "
+        "split across lines. Japanese omits subjects and pronouns, so use the whole text (and the "
+        "previous part, if given) to work out who does what, and keep a consistent tone. Translate "
+        "EACH line into {t}. Output exactly one line per input line in the format [N] translation, "
+        "keep the same numbers and order, never merge or split lines, translate a fragment as a "
+        "fragment, and output nothing else: no notes, no romanization."
+    ).format(t=tgt)
+    sistema_riga = (
+        "You are a professional Japanese to {t} translator of song lyrics, subtitles and dialogue. "
+        "You receive a Japanese text for context and ONE line from it. Reply with ONLY the {t} "
+        "translation of that line: no quotes, no notes, no explanations."
+    ).format(t=tgt)
+
+    fatte, coda = 0, []
+    for gn, g in enumerate(gruppi, 1):
+        righe = [testi[i].replace("\n", " ") for i in g]
+        car = sum(len(x) for x in righe)
+        if stato:
+            stato("LM Studio: traduco il gruppo {}/{} ({} righe)...".format(gn, len(gruppi), len(g)))
+        utente = ""
+        if coda:
+            utente += ("Previous part of the same text, already translated (context only, do not "
+                       "repeat it):\n" + "\n".join("{} => {}".format(a, b) for a, b in coda) + "\n\n")
+        utente += "Translate these lines:\n" + "\n".join("[{}] {}".format(k, r) for k, r in enumerate(righe, 1))
+        try:
+            ris = _lm_chat(base, modello,
+                           [dict(role="system", content=sistema), dict(role="user", content=utente)],
+                           min(8000, 600 + 3 * car + 10 * len(g)))
+        except RuntimeError:
+            ris = ""
+        trovate = _leggi_numerate(ris, set(range(1, len(g) + 1)))
+        _stat_gruppo(len(g), bool(ris))
+
+        da_rifare = []
+        for k, i in enumerate(g, 1):
+            pezzo = _pulisci_lm(trovate.get(k, ""))
+            if pezzo and (lingua == "zh" or not _RE_GIAPP.search(pezzo)):
+                risultati[i] = pezzo
+            else:
+                da_rifare.append(i)
+                _stat_scarto(pezzo)
+        if da_rifare and not trovate and not ris:
+            raise RuntimeError("il modello non ha restituito la traduzione ({}). Se ha 'pensato' troppo, "
+                               "aggiungi --reasoning-budget 0 agli argomenti extra o usa un modello "
+                               "non-thinking".format(_LM_ULTIMO["info"]))
+        for n, i in enumerate(da_rifare, 1):
+            if stato:
+                stato("LM Studio: rifaccio le righe non valide ({}/{}, gruppo {}/{})...".format(
+                    n, len(da_rifare), gn, len(gruppi)))
+            u = "Japanese text for context:\n{}\n\nTranslate only this line into {}:\n{}".format(
+                "\n".join(righe), tgt, testi[i].replace("\n", " "))
+            out = _pulisci_lm(_lm_chat(base, modello,
+                                       [dict(role="system", content=sistema_riga), dict(role="user", content=u)], 400))
+            risultati[i] = out or None
+            _stat_rifatta(out, lingua)
+
+        coda = [(righe[k], risultati[g[k]]) for k in range(max(0, len(g) - 3), len(g)) if risultati[g[k]]]
+        fatte += len(g)
+        if progresso:
+            progresso(fatte, len(da_fare))
+    return risultati
+
+
+def _traduci_lm_contesto(testi, lingua, base, modello, progresso=None, stato=None, tutto=False):
+    """Traduzione a contesto completo, in due passaggi per ogni gruppo di righe:
+    1) il modello traduce TUTTO il testo come un discorso unico (il giapponese omette soggetti e
+       pronomi: servono i versi vicini per capirli);
+    2) gli si chiede di assegnare a ogni riga giapponese numerata la parte corrispondente di
+       quella traduzione. Le righe mancanti, in giapponese o sospette vengono rifatte una per
+       una usando la traduzione completa come riferimento: l'allineamento resta sempre per riga."""
+    tgt = LINGUE_GEMMA[lingua][0]
+    risultati = ["" if not t else None for t in testi]
+    da_fare = [i for i, t in enumerate(testi) if t]
+
+    gruppi, cur, car = [], [], 0
+    for i in da_fare:
+        lung = len(testi[i])
+        if not tutto and cur and (len(cur) >= LM_CTX_RIGHE or car + lung > LM_CTX_CAR):
+            gruppi.append(cur)
+            cur, car = [], 0
+        cur.append(i)
+        car += lung
+    if cur:
+        gruppi.append(cur)
+
+    sistema1 = (
+        "You are a professional Japanese to {t} translator of song lyrics, subtitles and dialogue. "
+        "Japanese is highly context dependent: it often omits subjects and pronouns, so use the whole "
+        "text to work out who does what and to whom, and keep a consistent tone. Translate the whole "
+        "text naturally and faithfully into {t}. Output ONLY the {t} translation, with no notes, "
+        "no romanization and no explanations."
+    ).format(t=tgt)
+    sistema2 = (
+        "You align a translation to its source lines. You receive a Japanese text split into numbered "
+        "lines and its complete {t} translation. REPLACE each Japanese line with the part of the "
+        "{t} translation that corresponds to it. Rules: reuse the wording of the given translation (only "
+        "cut it into pieces; adjust punctuation or capitalization if needed); add nothing; keep the "
+        "order; if the translation does not render some line, translate that line briefly in the same "
+        "style. Output exactly one line per Japanese line in the format [N] text, and nothing else."
+    ).format(t=tgt)
+    sistema_riga = (
+        "You are a professional Japanese to {t} translator of song lyrics, subtitles and dialogue. "
+        "You receive a reference translation of the whole text and ONE Japanese line from it. Reply with "
+        "ONLY the {t} translation of that line, consistent with the reference translation: no quotes, "
+        "no notes, no explanations."
+    ).format(t=tgt)
+
+    fatte, coda = 0, []
+    for gn, g in enumerate(gruppi, 1):
+        righe = [testi[i].replace("\n", " ") for i in g]
+        car = sum(len(x) for x in righe)
+
+        # --- passo 1: traduzione libera di tutto il testo
+        if stato:
+            stato("LM Studio: traduco tutto il testo (gruppo {}/{})...".format(gn, len(gruppi)))
+        utente = ""
+        if coda:
+            utente += ("Previous part of the same text, already translated (for continuity only, "
+                       "do not repeat it):\n" + "\n".join("{} => {}".format(a, b) for a, b in coda) + "\n\n")
+        utente += "Text to translate:\n" + "\n".join(righe)
+        completa = _lm_chat(base, modello,
+                            [dict(role="system", content=sistema1), dict(role="user", content=utente)],
+                            min(16000, 600 + 3 * car))
+        if not completa:
+            raise RuntimeError("il modello non ha restituito la traduzione del testo ({}). Se ha 'pensato' troppo, "
+                               "aggiungi --reasoning-budget 0 agli argomenti extra o usa un modello non-thinking".format(_LM_ULTIMO["info"]))
+
+        # --- passo 2: assegna a ogni riga la sua parte
+        if stato:
+            stato("LM Studio: riallineo la traduzione alle righe (gruppo {}/{})...".format(gn, len(gruppi)))
+        numerate = "\n".join("[{}] {}".format(k, r) for k, r in enumerate(righe, 1))
+        utente2 = "Japanese lines:\n{}\n\n{} translation:\n{}\n\nOutput the aligned lines now.".format(
+            numerate, tgt, completa)
+        try:
+            ris2 = _lm_chat(base, modello,
+                            [dict(role="system", content=sistema2), dict(role="user", content=utente2)],
+                            min(16000, 800 + 4 * car))
+        except RuntimeError:
+            ris2 = ""
+        trovate = _leggi_numerate(ris2, set(range(1, len(g) + 1)))
+        _stat_gruppo(len(g), bool(ris2))
+
+        da_rifare = []
+        for k, i in enumerate(g, 1):
+            pezzo = _pulisci_lm(trovate.get(k, ""))
+            if pezzo and (lingua == "zh" or not _RE_GIAPP.search(pezzo)):
+                risultati[i] = pezzo
+            else:
+                da_rifare.append(i)
+                _stat_scarto(pezzo)
+
+        # --- righe non valide: una per una, con la traduzione completa come riferimento
+        for i in da_rifare:
+            if stato:
+                stato("LM Studio: rifaccio {} righe non allineate (gruppo {}/{})...".format(
+                    len(da_rifare), gn, len(gruppi)))
+            u = "Reference translation of the whole text:\n{}\n\nTranslate only this Japanese line into {}:\n{}".format(
+                completa, tgt, testi[i].replace("\n", " "))
+            out = _pulisci_lm(_lm_chat(base, modello,
+                                       [dict(role="system", content=sistema_riga), dict(role="user", content=u)], 400))
+            risultati[i] = out or None
+            _stat_rifatta(out, lingua)
+
+        coda = [(righe[k], risultati[g[k]]) for k in range(max(0, len(g) - 3), len(g)) if risultati[g[k]]]
+        fatte += len(g)
+        if progresso:
+            progresso(fatte, len(da_fare))
+    return risultati
+
+
+def _traduci_lmstudio(testi, lingua, url, modello, progresso=None, stato=None, contesto=2, contesto_completo=False, tutto=False, veloce=False):
+    """Traduce dal giapponese con un modello servito da LM Studio (API OpenAI), una riga per
+    richiesta: l'allineamento con i tempi e' garantito. Con i modelli generici si passano
+    anche le righe vicine come contesto (da non tradurre), utile per i versi spezzati;
+    con TranslateGemma si usa il suo prompt specifico, senza altro."""
+    if lingua not in LINGUE_GEMMA:
+        raise ValueError("lingua '{}' non supportata".format(lingua))
+    tgt = LINGUE_GEMMA[lingua][0]
+    risultati = ["" if not t else None for t in testi]
+    da_fare = [i for i, t in enumerate(testi) if t]
+    if not da_fare:
+        return risultati
+
+    base = _lm_base(url)
+    modello = (modello or "").strip()
+    if not modello:
+        elenco = _lm_json(base, "/models", timeout=20).get("data", [])
+        ids = [m["id"] for m in elenco if m.get("id") and "embed" not in m["id"].lower()]
+        if not ids:
+            raise RuntimeError("LM Studio non ha nessun modello disponibile: caricane uno "
+                               "oppure scrivi il suo nome nel campo del modello.")
+        modello = ids[0]
+    _STAT_TRAD["modello"] = modello
+    if stato:
+        stato("Traduco con LM Studio ({})...".format(modello))
+    gemma = "translategemma" in modello.lower()
+    plamo = "plamo" in modello.lower()
+    _STAT_TRAD["metodo"] = "riga per riga"
+    if (contesto_completo or veloce) and not gemma and not plamo:
+        if veloce:
+            _STAT_TRAD["metodo"] = "un solo passaggio (numerato)"
+            return _traduci_lm_numerato(testi, lingua, base, modello, progresso, stato, tutto=tutto)
+        _STAT_TRAD["metodo"] = "contesto completo (2 passaggi)"
+        return _traduci_lm_contesto(testi, lingua, base, modello, progresso, stato, tutto=tutto)
+
+    sistema = (
+        "You are a professional Japanese to {t} translator of song lyrics, subtitles and dialogue. "
+        "You translate ONE line at a time, faithfully and naturally; the line may be a sentence "
+        "fragment, so keep its meaning and tone. Reply with ONLY the {t} translation of the requested "
+        "line: no quotes, no notes, no romanization, no explanations, and never translate the context lines."
+    ).format(t=tgt)
+
+    for n, i in enumerate(da_fare, 1):
+        riga = testi[i].replace("\n", " ")
+        if plamo:
+            out = _pulisci_lm(_lm_completion(base, modello, _prompt_plamo(lingua, riga), 400))
+            risultati[i] = out or None
+            if progresso:
+                progresso(n, len(da_fare))
+            continue
+        if gemma:
+            messaggi = [dict(role="user", content=_prompt_gemma(lingua, riga))]
+        else:
+            prec = [testi[j].replace("\n", " ") for j in range(max(0, i - contesto), i) if testi[j]]
+            succ = [testi[j].replace("\n", " ") for j in range(i + 1, min(len(testi), i + 1 + contesto)) if testi[j]]
+            utente = ""
+            if prec:
+                utente += "Previous lines (context only, do not translate):\n" + "\n".join(prec) + "\n\n"
+            if succ:
+                utente += "Next lines (context only, do not translate):\n" + "\n".join(succ) + "\n\n"
+            utente += "Translate this line into {}:\n{}".format(tgt, riga)
+            messaggi = [dict(role="system", content=sistema), dict(role="user", content=utente)]
+        r = _lm_json(base, "/chat/completions", dict(
+            model=modello, messages=messaggi, temperature=0.0, max_tokens=400, stream=False,
+            chat_template_kwargs=_SENZA_THINKING), timeout=600)
+        try:
+            out = r["choices"][0]["message"]["content"] or ""
+        except (KeyError, IndexError, TypeError):
+            raise RuntimeError("risposta inattesa da LM Studio: {}".format(str(r)[:150]))
+        out = re.sub(r"<think>.*?</think>", "", out, flags=re.S)
+        out = " ".join(out.split())
+        if len(out) > 1 and out[0] in '"\u201c\u300c\u00ab' and out[-1] in '"\u201d\u300d\u00bb':
+            out = out[1:-1].strip()
+        risultati[i] = out or None
+        if progresso:
+            progresso(n, len(da_fare))
+    return risultati
+
+
+def traduci_locale(testi, lingua, device="auto", progresso=None, stato=None, modello=None, lm=None):
+    """Traduzione locale dal giapponese. 'modello' e' una voce di MODELLI_TRAD
+    (nome, tipo, id): NLLB (CTranslate2) oppure TranslateGemma (Ollama).
+    Restituisce una lista lunga come 'testi' ("" per le righe vuote, None se senza risultato)."""
+    nome, tipo, ident = modello or MODELLI_TRAD[0]
+    _STAT_TRAD["modello"] = ident or nome
+    _STAT_TRAD["metodo"] = {"nllb": "NLLB", "ollama": "riga per riga (Ollama)"}.get(tipo, tipo)
+    if tipo == "llamaserver":
+        return _traduci_llamaserver(testi, lingua, lm or {}, progresso, stato)
+    if tipo == "lmstudio":
+        lm = lm or {}
+        return _traduci_lmstudio(testi, lingua, lm.get("url", ""), lm.get("modello", ""), progresso, stato,
+                                 contesto_completo=bool(lm.get("contesto")), tutto=bool(lm.get("tutto")),
+                                 veloce=bool(lm.get("veloce")))
+    if tipo == "ollama":
+        return _traduci_ollama(testi, lingua, ident, progresso, stato)
+    return _traduci_nllb(testi, lingua, device, progresso, stato, repo=ident)
+
+
+_STOP = threading.Event()        # impostato dal pulsante "Interrompi": i cicli lunghi lo controllano
+
+
+class Interrotto(Exception):
+    """Operazione interrotta dall'utente."""
+
+
+def controlla_stop():
+    if _STOP.is_set():
+        raise Interrotto()
+
+
+_RE_TS_AI = re.compile(
+    r"\[\s*\d+\s*[|\uff5c:/]\s*[\d:.,]+\s*\]"                      # [N|mm:ss.s]
+    r"|\[\s*[\d:.,]+\s*(?:->|-->|\u2192)\s*[\d:.,]+\s*\]")       # [mm:ss.s -> mm:ss.s]
+
+
+def pulisci_per_ai(t):
+    """Toglie timestamp e numeri di segmento dal testo prima di darlo al modello di traduzione."""
+    return _RE_TS_AI.sub("", t or "").strip()
+
+
+def _progresso_trad(p, stato):
+    def f(i, n):
+        controlla_stop()
+        if stato:
+            stato("Passaggio 2/2: traduco le liriche in '{}' ({}/{})...".format(p["lingua"], i, n))
+    return f
+
+
+def traduzione_segmenti(p, testi, tt0, tt1, stato=None):
+    """Traduce i segmenti giapponesi con il modello scelto in 'p' (impostazioni del Worker).
+    Restituisce (trad, avviso): 'trad' e' un dict(righe, t0, t1) con una riga per segmento,
+    oppure None se la traduzione non e' riuscita; 'avviso' spiega eventuali problemi."""
+    avviso, righe_tmp = "", None
+    _STAT_TRAD.clear()
+    testi = [pulisci_per_ai(t) for t in testi]
+    try:
+        righe_tmp = traduci_locale(
+            testi, p["lingua"], p["device"],
+            modello=MODELLI_TRAD[min(max(int(p.get("trad_modello", 0)), 0), len(MODELLI_TRAD) - 1)],
+            lm=dict(url=p.get("lm_url", ""), modello=p.get("lm_modello", ""), contesto=p.get("lm_contesto", True),
+                    tutto=p.get("lm_tutto", False), veloce=p.get("lm_veloce", True),
+                    exe=p.get("ls_exe", ""), gguf=p.get("ls_gguf", ""), ctx=p.get("ls_ctx", ""),
+                    ngl=p.get("ls_ngl", ""), extra=p.get("ls_extra", "")),
+            progresso=_progresso_trad(p, stato),
+            stato=stato)
+    except Interrotto:
+        raise
+    except ImportError as e:
+        avviso += (" (traduzione locale non disponibile: manca {}. "
+                   "Installa:  python -m pip install sentencepiece)").format(e.name or "un modulo")
+    except Exception as e:
+        avviso += " (traduzione locale non riuscita: {})".format(str(e).strip()[:600])
+    finally:
+        if not p.get("batch"):
+            ferma_llamaserver()
+
+    trad = None
+    if righe_tmp is not None:
+        richieste = [i for i, t in enumerate(testi) if t]
+        ko = [i for i in richieste if righe_tmp[i] is None]
+        if richieste and len(ko) < len(richieste):
+            trad = dict(righe=[r if r is not None else testi[i] for i, r in enumerate(righe_tmp)], t0=tt0, t1=tt1)
+            if ko:
+                avviso += " (traduzione: {} righe su {} senza risultato, lasciate in giapponese)".format(
+                    len(ko), len(richieste))
+        else:
+            avviso += " (traduzione NON riuscita: il modello non ha restituito testo)"
+        avviso += _report_scarti(p, testi, righe_tmp)
+    return trad, avviso
+
+
+# ---------------------------------------------------------------------------
 # Thread: decodifica audio + calcolo livelli in dB
 # ---------------------------------------------------------------------------
 class Decoder(QThread):
@@ -548,15 +2076,19 @@ class Decoder(QThread):
     def __init__(self, path):
         super().__init__()
         self.path = path
+        self.info = None          # dimensioni/fps con cui mostrare il video (se c'e')
 
     def run(self):
         wav = None
+        t0 = time.perf_counter()
+        log_hira("decodifica: avvio ffmpeg su %s" % self.path)
         try:
             wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
             subprocess.run(
-                ["ffmpeg", "-y", "-v", "error", "-i", self.path, "-vn",
+                ["ffmpeg", "-y", "-nostdin", "-v", "error", "-i", self.path, "-vn",
                  "-ar", str(SR), "-ac", "1", "-c:a", "pcm_s16le", wav],
                 check=True, stdin=subprocess.DEVNULL, capture_output=True)
+            log_hira("decodifica: ffmpeg finito in %.1f s" % (time.perf_counter() - t0))
 
             with wave.open(wav, "rb") as w:
                 raw = w.readframes(w.getnframes())
@@ -571,15 +2103,23 @@ class Decoder(QThread):
             rms = np.sqrt(np.mean(x[:m * win].reshape(m, win) ** 2, axis=1))
             db = np.clip(20.0 * np.log10(rms + 1e-9), -60.0, 0.0)
 
-            self.pronto.emit(self.path, wav, db, 0.01, len(x) / float(SR),
-                             ha_flusso_video(self.path))
+            ha_video = ha_flusso_video(self.path)
+            self.info = info_video(self.path) if ha_video else None
+            log_hira("decodifica: finita in %.1f s (durata %.1f s, traccia video: %s)"
+                     % (time.perf_counter() - t0, len(x) / float(SR), ha_video))
+            self.pronto.emit(self.path, wav, db, 0.01, len(x) / float(SR), ha_video)
 
         except FileNotFoundError:
+            log_hira("decodifica: ffmpeg non trovato")
             self.errore.emit(self.path, "ffmpeg non trovato: installalo e aggiungilo al PATH.")
         except subprocess.CalledProcessError as e:
-            self.errore.emit(self.path, (e.stderr or b"").decode(errors="replace") or str(e))
-        except Exception as e:
-            self.errore.emit(self.path, str(e))
+            msg = (e.stderr or b"").decode(errors="replace") or str(e)
+            log_hira("decodifica: ffmpeg ha fallito: " + msg[-500:])
+            self.errore.emit(self.path, msg)
+        except BaseException as e:
+            import traceback
+            log_hira("decodifica: errore imprevisto: %r\n%s" % (e, traceback.format_exc()))
+            self.errore.emit(self.path, str(e) or repr(e))
 
 
 # ---------------------------------------------------------------------------
@@ -641,7 +2181,7 @@ class Worker(QThread):
                 )
 
                 if _cache["model"] is not None:
-                    libera_modello()
+                    libera_whisper()
 
                 model = WhisperModel(
                     p["modello"],
@@ -693,10 +2233,13 @@ class Worker(QThread):
         )
 
     def _isola_voce(self, path):
-        """Separa la voce dalla musica con Demucs (modello htdemucs, stem 'vocals').
-        Restituisce (wav_voce, cartella_temporanea, messaggio_errore): wav_voce e' None se fallisce.
-        Richiede:  python -m pip install demucs"""
-        d = tempfile.mkdtemp(prefix="hira_demucs_")
+        """Separa la voce dalla musica con il motore scelto (Demucs htdemucs oppure BS-RoFormer
+        tramite audio-separator) e restituisce (wav_voce, cartella_temporanea, messaggio_errore):
+        wav_voce e' None se fallisce.
+        Richiede:  python -m pip install demucs
+              o:   python -m pip install "audio-separator[gpu]"   (oppure [cpu])"""
+        motore = self.p.get("separatore") or "demucs"
+        d = tempfile.mkdtemp(prefix="hira_sep_")
         try:
             src = os.path.join(d, "audio.wav")
             subprocess.run(
@@ -705,19 +2248,51 @@ class Worker(QThread):
 
             ultimo = ""
             for dev in (["cpu"] if self.p["device"] == "cpu" else ["cuda", "cpu"]):
-                r = subprocess.run(
-                    [sys.executable, "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
-                     "-d", dev, "-o", d, src],
-                    stdin=subprocess.DEVNULL, capture_output=True)
-                voce = os.path.join(d, "htdemucs", "audio", "vocals.wav")
-                if r.returncode == 0 and os.path.isfile(voce):
+                if motore == "bsroformer":
+                    os.makedirs(SEPARATOR_MODELS_DIR, exist_ok=True)
+                    env = dict(os.environ)
+                    if dev == "cpu":
+                        env["CUDA_VISIBLE_DEVICES"] = "-1"     # audio-separator sceglie da solo la GPU
+                    r = subprocess.run(
+                        [sys.executable, "-c",
+                         "from audio_separator.utils.cli import main; main()",
+                         src, "--model_filename", BSROFORMER_MODEL,
+                         "--model_file_dir", SEPARATOR_MODELS_DIR,
+                         "--output_dir", d, "--output_format", "WAV",
+                         "--single_stem", "Vocals"],
+                        stdin=subprocess.DEVNULL, capture_output=True, env=env)
+                    voce = self._trova_voce_bsroformer(d, src)
+                else:
+                    r = subprocess.run(
+                        [sys.executable, "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
+                         "-d", dev, "-o", d, src],
+                        stdin=subprocess.DEVNULL, capture_output=True)
+                    voce = os.path.join(d, "htdemucs", "audio", "vocals.wav")
+                if r.returncode == 0 and voce and os.path.isfile(voce):
                     return voce, d, ""
                 ultimo = (r.stderr or b"").decode(errors="replace").strip()[-300:]
+                if "No module named" in ultimo:
+                    ultimo += ("  ->  python -m pip install " +
+                               ('"audio-separator[gpu]"' if motore == "bsroformer" else "demucs"))
+                    break      # inutile riprovare su CPU: manca proprio il pacchetto
             return None, d, ultimo or "errore sconosciuto"
         except FileNotFoundError:
             return None, d, "ffmpeg non trovato"
         except subprocess.CalledProcessError as e:
             return None, d, (e.stderr or b"").decode(errors="replace").strip()[-300:]
+
+    @staticmethod
+    def _trova_voce_bsroformer(cartella, src):
+        """audio-separator nomina il file '<nome>_(Vocals)_<modello>.wav': lo cerca nella cartella."""
+        wavs = [f for f in os.listdir(cartella)
+                if f.lower().endswith(".wav") and os.path.join(cartella, f) != src]
+        for f in wavs:
+            if "(vocals)" in f.lower():
+                return os.path.join(cartella, f)
+        for f in wavs:
+            if "instrumental" not in f.lower():
+                return os.path.join(cartella, f)
+        return None
 
     def run(self):
         tmp = None
@@ -738,17 +2313,18 @@ class Worker(QThread):
                 subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, capture_output=True)
                 path = tmp
 
-            # Musica di sottofondo: Demucs isola la voce, poi si trascrive solo quella
+            # Musica di sottofondo: Demucs / BS-RoFormer isola la voce, poi si trascrive solo quella
             voce_isolata = False
             avviso_pre = ""
             if p.get("demucs"):
-                self.stato.emit("Isolo la voce con Demucs (puo' richiedere alcuni minuti)...")
+                nome_sep = nome_separatore(p.get("separatore"))
+                self.stato.emit("Isolo la voce con {} (puo' richiedere alcuni minuti)...".format(nome_sep))
                 voce, dir_demucs, err = self._isola_voce(path)
                 if voce:
                     path = voce
                     voce_isolata = True
                 else:
-                    avviso_pre = " (Demucs non utilizzabile, uso l'audio originale: {})".format(err)
+                    avviso_pre = " ({} non utilizzabile, uso l'audio originale: {})".format(nome_sep, err)
 
             model, device, compute_type = self._load_model()
 
@@ -768,11 +2344,11 @@ class Worker(QThread):
             # attivo ma piu' sensibile, con la musica ancora presente viene disattivato.
             musica = bool(p.get("musica")) or bool(p.get("demucs"))
 
-            def _opzioni(lang, con_prompt, musica_forzata=None):
+            def _opzioni(lang, con_prompt, musica_forzata=None, task="transcribe"):
                 musica_eff = musica if musica_forzata is None else bool(musica_forzata)
                 o = dict(
                     language=lang,
-                    task="transcribe",
+                    task=task,
                     beam_size=5,
                     vad_filter=True,
                     vad_parameters=dict(min_silence_duration_ms=500),
@@ -794,19 +2370,25 @@ class Worker(QThread):
                         o.pop("vad_parameters")
                 return o
 
-            def _consume(lang, word_timestamps, con_prompt=True, musica_forzata=None):
+            def _consume(lang, word_timestamps, con_prompt=True, musica_forzata=None, task="transcribe"):
                 segments_iter, info = model.transcribe(
                     path,
                     word_timestamps=word_timestamps,
-                    **_opzioni(lang, con_prompt, musica_forzata)
+                    **_opzioni(lang, con_prompt, musica_forzata, task)
                 )
-                return list(segments_iter), info
+                out = []
+                for sg in segments_iter:
+                    controlla_stop()
+                    out.append(sg)
+                return out, info
 
             raw_segments = None
             info = None
 
             try:
                 raw_segments, info = _consume(lingua_jp, use_words)
+            except Interrotto:
+                raise
             except Exception as e:
                 if use_words:
                     self.stato.emit(
@@ -829,28 +2411,7 @@ class Worker(QThread):
                 kk_ok = False
                 avviso = " (pykakasi mancante: hiragana non convertito)"
 
-            trad = None
-            if doppio:
-                self.stato.emit("Passaggio 2/2: testo in '{}'...".format(p["lingua"]))
-                try:
-                    raw_tr, _ = _consume(p["lingua"], False, False, musica_forzata=musica)
-                    righe, tt0, tt1 = [], [], []
-                    prec_t, prev_t = None, 0.0
-                    for seg in raw_tr:
-                        testo = (getattr(seg, "text", "") or "").strip()
-                        if not testo or testo == prec_t:
-                            continue
-                        prec_t = testo
-                        a = max(float(getattr(seg, "start", 0.0)) + p["inizio"], prev_t)
-                        b = max(float(getattr(seg, "end", a)) + p["inizio"], a)
-                        prev_t = a
-                        righe.append(testo.replace("\n", " "))
-                        tt0.append(a)
-                        tt1.append(b)
-                    if righe:
-                        trad = dict(righe=righe, t0=tt0, t1=tt1)
-                except Exception as e:
-                    avviso += " (secondo passaggio non riuscito: {})".format(e)
+            off = p["inizio"]
 
             def hira_di(t):
                 if not kk_ok:
@@ -860,7 +2421,6 @@ class Worker(QThread):
                 except Exception:
                     return t
 
-            off = p["inizio"]
             segmenti = []
             precedente = None
 
@@ -912,6 +2472,71 @@ class Worker(QThread):
                     nuovi.append((o, h, a, b))
                 segmenti[n] = (s0, s1, nuovi)
 
+            trad = None
+
+            # Fuori dal batch Whisper non serve piu' dopo la trascrizione: lo scarico subito dalla
+            # memoria (VRAM compresa), cosi' resta spazio per il modello di traduzione (LM Studio,
+            # Ollama...) e per il resto del sistema. Nel batch resta caricato per non ricaricarlo a ogni
+            # file: lo scarica _batch_fine alla fine.
+            if not p.get("batch") and p.get("scarica_whisper", True):
+                prima = _vram_usata_mb() if device == "cuda" else None
+                model = None  # anche il riferimento locale usato da _consume
+                libera_whisper()
+                if prima is not None:
+                    import time as _t
+                    _t.sleep(0.5)
+                    dopo = _vram_usata_mb()
+                    if dopo is not None:
+                        if prima - dopo >= 300:
+                            avviso += " (VRAM: {:.1f} -> {:.1f} GB dopo aver scaricato Whisper)".format(
+                                prima / 1024.0, dopo / 1024.0)
+                        else:
+                            avviso += (" (VRAM non rilasciata da Whisper: {:.1f} -> {:.1f} GB; CTranslate2 puo' "
+                                       "tenerla finche' il programma e' aperto: se il server locale non riesce a "
+                                       "caricare il modello, riavvia hira.py)").format(prima / 1024.0, dopo / 1024.0)
+
+            da_tradurre = None
+            if doppio and segmenti:
+                testi_da_tradurre = ["".join(tok[0] for tok in toks).strip() for _, _, toks in segmenti]
+                tt0 = [s[0] for s in segmenti]
+                tt1 = [s[1] for s in segmenti]
+
+                if p.get("solo_trascrizione"):
+                    # batch a due fasi: le traduzioni si fanno dopo, per tutti i file insieme
+                    da_tradurre = dict(testi=testi_da_tradurre, t0=tt0, t1=tt1)
+                else:
+                    self.stato.emit("Passaggio 2/2: traduco le liriche in '{}'...".format(p["lingua"]))
+                    # una riga per segmento: i risultati tornano nello stesso ordine, quindi
+                    # restano allineati ai tempi
+                    trad, av = traduzione_segmenti(p, testi_da_tradurre, tt0, tt1, self.stato.emit)
+                    avviso += av
+
+                    # verso l'inglese Whisper sa tradurre da solo: ripiego se il resto non va
+                    if trad is None and p["lingua"] == "en":
+                        self.stato.emit("Traduzione locale non disponibile: uso Whisper translate verso l'inglese...")
+                        try:
+                            if model is None:
+                                model, device, compute_type = self._load_model()
+                            raw_tr, _ = _consume("en", False, False, musica_forzata=musica, task="translate")
+                            righe, tt0_w, tt1_w = [], [], []
+                            prec_t, prev_t = None, 0.0
+                            for seg in raw_tr:
+                                t = (getattr(seg, "text", "") or "").strip()
+                                if not t or t == prec_t:
+                                    continue
+                                prec_t = t
+                                a_ = max(float(getattr(seg, "start", 0.0)) + off, prev_t)
+                                b_ = max(float(getattr(seg, "end", a_)) + off, a_)
+                                prev_t = a_
+                                righe.append(t.replace("\n", " "))
+                                tt0_w.append(a_)
+                                tt1_w.append(b_)
+                            if righe:
+                                trad = dict(righe=righe, t0=tt0_w, t1=tt1_w)
+                                avviso += " (traduzione fatta da Whisper)"
+                        except Exception as e:
+                            avviso += " (anche Whisper translate e' fallito: {})".format(e)
+
             sep = "\n" if (p["timestamp"] or p["a_capo"]) else ("" if lingua in ("ja", "zh") else " ")
 
             po, ph = [], []
@@ -961,6 +2586,7 @@ class Worker(QThread):
                 t0=[t[0] for t in tempi],
                 t1=[t[1] for t in tempi],
                 avviso=avviso,
+                da_tradurre=da_tradurre,
                 tok=dict(o=tok_o, h=tok_h, seg=tok_seg),
                 trad=allinea_traduzione([t[0] for t in tempi], [t[1] for t in tempi], trad),
             ))
@@ -970,6 +2596,9 @@ class Worker(QThread):
 
         except subprocess.CalledProcessError as e:
             self.errore.emit((e.stderr or b"").decode(errors="replace") or str(e))
+
+        except Interrotto:
+            self.errore.emit("__interrotto__")
 
         except Exception as e:
             msg = str(e)
@@ -1380,8 +3009,37 @@ class SliderPos(QSlider):
         self.trascina = False
 
 
+class OndaDB:
+    """Livelli in dB condivisi tra lo schermo principale e quello a schermo intero: servono a disegnare,
+    nei file solo audio, la sinusoide la cui ampiezza segue il volume nel tempo."""
+
+    def __init__(self):
+        self.attiva = False      # True: file senza video, schermo nero con sinusoide
+        self.db = None
+        self.amp = None
+        self.times = None
+        self.t = 0.0
+
+    def imposta(self, db, hop):
+        db = np.asarray(db, dtype=np.float32)
+        if len(db) == 0:
+            return self.pulisci()
+        lo = Forma.DB_MIN
+        hi = max(float(np.percentile(db, 99.5)), lo + 12.0)
+        amp = np.clip((db - lo) / (hi - lo), 0.0, 1.0)
+        amp = np.convolve(amp, np.array([1, 2, 3, 2, 1], dtype=np.float32) / 9.0, mode="same")
+        self.db = db
+        self.amp = amp.astype(np.float32)
+        self.times = np.arange(len(db), dtype=np.float32) * float(hop)
+        self.t = 0.0
+
+    def pulisci(self):
+        self.db = self.amp = self.times = None
+        self.t = 0.0
+
+
 class VideoSchermo(QGraphicsView):
-    """Visualizzatore video basato su QGraphicsVideoItem."""
+    """Visualizzatore video: mostra i fotogrammi decodificati da ffmpeg (SorgenteFrame) in un QGraphicsPixmapItem."""
     doppio_clic = pyqtSignal()
 
     def __init__(self, sorgente=None):
@@ -1399,18 +3057,18 @@ class VideoSchermo(QGraphicsView):
             self.item = sorgente.item
         else:
             self._scena = QGraphicsScene(self)
-            self.item = QGraphicsVideoItem()
+            self.item = QGraphicsPixmapItem()
+            self.item.setTransformationMode(Qt.SmoothTransformation)
             self._scena.addItem(self.item)
         self.setScene(self._scena)
+        self.onda = sorgente.onda if sorgente is not None else OndaDB()
         self._sub_html = ""
         self._sub_cache = None
-        self.item.nativeSizeChanged.connect(self._adatta)
 
     def _adatta(self, *_):
-        sz = self.item.nativeSize()
-        if sz.isValid() and not sz.isEmpty():
-            self.item.setSize(QSizeF(sz))
-            self._scena.setSceneRect(self.item.boundingRect())
+        br = self.item.boundingRect()
+        if br.isValid() and not br.isEmpty():
+            self._scena.setSceneRect(br)
             self.fitInView(self.item, Qt.KeepAspectRatio)
 
     def resizeEvent(self, e):
@@ -1438,8 +3096,82 @@ class VideoSchermo(QGraphicsView):
         d.setHtml(html)
         return d
 
+    def _disegna_onda(self):
+        """Schermo nero dei file solo audio: sinusoide che scorre, ampiezza = livello in dB.
+        Si vede solo la parte prima della testina (gia' riprodotta), arancione-rossa; il futuro e' nascosto."""
+        o = self.onda
+        w, h = self.viewport().width(), self.viewport().height()
+        if w < 60 or h < 60:
+            return
+        p = QPainter(self.viewport())
+        p.setRenderHint(QPainter.Antialiasing)
+        cx, cy = w * WAVE_HEAD, h * 0.30
+        amp_px = h * 0.18
+        lw = max(1.5, h * 0.006)
+        p.setPen(QPen(QColor(255, 255, 255, 28), 1))
+        p.drawLine(QPointF(w * 0.04, cy), QPointF(w * 0.96, cy))
+        if o.amp is None:
+            p.end()
+            return
+
+        t = o.t
+        period = WAVE_SPAN / WAVE_CYCLES
+        step = max(2, int(w / 360))
+        xs = np.arange(0, w + 1, step, dtype=np.float64)
+        u = np.where(xs < cx, (xs - cx) / (cx * 0.96), (xs - cx) / max(1.0, (w - cx) * 0.96))
+        taper = np.clip(1.0 - u ** 4, 0.0, 1.0)          # i bordi sfumano
+        tx = t + (xs - cx) / w * WAVE_SPAN
+        a = np.interp(tx, o.times, o.amp, left=0.0, right=0.0)
+        ys = cy - a * amp_px * taper * np.sin(2.0 * np.pi * tx / period)
+
+        path = QPainterPath()
+        path.moveTo(float(xs[0]), float(ys[0]))
+        for x, y in zip(xs[1:], ys[1:]):
+            path.lineTo(float(x), float(y))
+
+        past = QLinearGradient(cx - cx * 0.80, 0, cx, 0)
+        past.setColorAt(0.0, QColor(255, 180, 84, 40))
+        past.setColorAt(0.6, QColor(C_SPOKEN))
+        past.setColorAt(1.0, QColor(C_ROSSO))
+        # la parte non ancora riprodotta (a destra della testina) non viene disegnata
+        for clip, grad in ((QRectF(0, 0, cx, h), past),):
+            p.save()
+            p.setClipRect(clip)
+            p.setOpacity(0.18)
+            p.setPen(QPen(QBrush(grad), lw * 4.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.drawPath(path)
+            p.setOpacity(1.0)
+            p.setPen(QPen(QBrush(grad), lw, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.drawPath(path)
+            p.restore()
+
+        # testina: linea verticale, punto sulla sinusoide e livello in dB
+        a0 = float(np.interp(t, o.times, o.amp, left=0.0, right=0.0))
+        y0 = cy - a0 * amp_px * float(np.sin(2.0 * np.pi * t / period))
+        p.setPen(QPen(QColor(255, 255, 255, 70), 1))
+        p.drawLine(QPointF(cx, cy - amp_px * 1.1), QPointF(cx, cy + amp_px * 1.1))
+        r = max(3.0, h * 0.014)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 42, 42, 90))
+        p.drawEllipse(QPointF(cx, y0), r * 1.9, r * 1.9)
+        p.setBrush(QColor(C_ROSSO))
+        p.drawEllipse(QPointF(cx, y0), r, r)
+
+        i = int(min(len(o.db) - 1, max(0, round(t / max(float(o.times[1]) if len(o.times) > 1 else 0.01, 1e-6)))))
+        val = float(o.db[i])
+        txt = "< -60 dB" if val <= Forma.DB_MIN + 0.5 else "%d dB" % round(val)
+        f = QFont(self.font())
+        f.setPixelSize(max(11, int(h * 0.034)))
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor(255, 255, 255, 150))
+        p.drawText(QRectF(cx - 70, cy - amp_px * 1.1 - h * 0.06, 140, h * 0.05), Qt.AlignCenter, txt)
+        p.end()
+
     def paintEvent(self, e):
         super().paintEvent(e)
+        if self.onda.attiva:
+            self._disegna_onda()
         if not self._sub_html:
             return
 
@@ -1541,6 +3273,40 @@ def card(titolo=None):
     return f, lay
 
 
+class TraduttoreBatch(QThread):
+    """Seconda fase del batch: traduce, uno dopo l'altro, i segmenti di tutti i file gia'
+    trascritti. Whisper e' gia' stato scaricato dalla memoria; il modello di traduzione
+    (LM Studio, Ollama, NLLB) resta caricato per tutta la fase."""
+    stato = pyqtSignal(str)
+    inizio = pyqtSignal(int)
+    fatto = pyqtSignal(int, object, str)   # indice, trad (o None), avviso
+    finito = pyqtSignal()
+
+    def __init__(self, p, lavori):
+        super().__init__()
+        self.p = p
+        self.lavori = lavori               # lista di (testi, t0, t1)
+        self.fermo = False
+
+    def run(self):
+        try:
+            for k, (testi, t0, t1) in enumerate(self.lavori):
+                if self.fermo:
+                    break
+                self.inizio.emit(k)
+                try:
+                    trad, av = traduzione_segmenti(self.p, testi, t0, t1, self.stato.emit)
+                except Interrotto:
+                    trad, av = None, " (interrotta)"
+                    self.fermo = True
+                except Exception as e:
+                    trad, av = None, " (traduzione non riuscita: {})".format(str(e).strip()[:200])
+                self.fatto.emit(k, trad, av)
+        finally:
+            ferma_llamaserver()
+            self.finito.emit()
+
+
 class Finestra(QWidget):
     def __init__(self):
         super().__init__()
@@ -1553,10 +3319,26 @@ class Finestra(QWidget):
 
         self.worker = None
         self.decoder = None
+        self._batch_attivo = False
+        self._batch_stop = False
+        self._batch_i = -1
+        self._batch_corrente = ""
+        self._batch_due_fasi = False
+        self._batch_fase = 1
+        self._batch_lavori = []
+        self._batch_trad = None
+        self._trad_solo = None
+        self._stem = None
+        self._batch_params = None
+        self._batch_interrotto1 = False
+        self._batch_esiti = dict(ok=0, salt=0, vuoti=[], err=[], avvisi=[], note=[])
         self._vecchi = []
         self.wav_tmp = None
         self.file_corrente = ""
         self.modo_video = False
+        self.onda = None
+        self._onda_ancora = None
+        self._onda_ultimo = 0.0
         self._fs = False
         self.cont_fs = None
         self.ultimo_ris = None
@@ -1573,6 +3355,11 @@ class Finestra(QWidget):
 
         self.player = QMediaPlayer(None, QMediaPlayer.LowLatency)
         self.player.setVolume(80)
+
+        self._tm_stop = QTimer(self)
+        self._tm_stop.setInterval(300)
+        self._tm_stop.timeout.connect(self._aggiorna_stop)
+        self._tm_stop.start()
 
         self.timer = QTimer(self)
         self.timer.setInterval(30)
@@ -1691,8 +3478,108 @@ class Finestra(QWidget):
         self.ck_doppio.setChecked(True)
         self.ck_doppio.setToolTip(
             "1° passaggio: whisper in giapponese (kanji, hiragana e tempi per parola)\n"
-            "2° passaggio: whisper nella lingua scelta (es. italiano) per il testo tradotto")
+            "2° passaggio: traduzione diretta dei segmenti giapponesi nella lingua scelta\n"
+            "(traduzione locale con NLLB-200 / CTranslate2: il modello locale si scarica la prima volta;\n"
+            "se non va e la lingua e' l'inglese, whisper task='translate')")
         l1.addWidget(self.ck_doppio)
+
+        rt = QHBoxLayout()
+        self.lb_trad = QLabel("Modello di traduzione")
+        self.cb_trad = QComboBox()
+        for nome, _, _ in MODELLI_TRAD:
+            self.cb_trad.addItem(nome)
+        self.cb_trad.setCurrentIndex(4)
+        self.cb_trad.setToolTip(
+            "Traduzione locale (nessun limite di richieste). NLLB: modelli generici, si scaricano da soli.\n"
+            "TranslateGemma: modello specializzato nella traduzione, richiede Ollama installato e in\n"
+            "esecuzione (https://ollama.com); se manca, il modello viene scaricato da Ollama al primo uso.\n"
+            "LM Studio: usa il server locale di LM Studio con il modello che hai caricato (indirizzo sotto).")
+        rt.addWidget(self.lb_trad)
+        rt.addWidget(self.cb_trad, 1)
+        rt.addStretch(2)
+        l1.addLayout(rt)
+
+        rl = QHBoxLayout()
+        self.lb_lm = QLabel("LM Studio")
+        self.ed_lm_url = QLineEdit(LM_URL_PREDEFINITO)
+        self.ed_lm_url.setToolTip("Indirizzo del server locale di LM Studio (API compatibile con OpenAI)")
+        self.ed_lm_modello = QLineEdit()
+        self.ed_lm_modello.setPlaceholderText("nome del modello (vuoto = il primo disponibile)  [solo LM Studio]")
+        self.ed_lm_modello.setToolTip(
+            "Nome del modello come appare in LM Studio. Lasciando vuoto si usa il primo modello\n"
+            "disponibile sul server. Se contiene 'translategemma' viene usato il prompt di TranslateGemma,\n"
+            "se contiene 'plamo' il formato di PLaMo-2-translate (/v1/completions),\n"
+            "altrimenti un prompt generico con le righe vicine come contesto.")
+        rl.addWidget(self.lb_lm)
+        rl.addWidget(self.ed_lm_url, 2)
+        rl.addWidget(self.ed_lm_modello, 2)
+        l1.addLayout(rl)
+        self.ck_lm_ctx = QCheckBox("LM Studio: traduci prima tutto il testo, poi riallinea riga per riga (piu' contesto)")
+        self.ck_lm_ctx.setChecked(True)
+        self.ck_lm_ctx.setToolTip(
+            "Il giapponese omette soggetti e pronomi: il modello traduce prima tutto il testo come un\n"
+            "discorso unico e poi assegna a ogni riga la sua parte. Le righe che non tornano vengono\n"
+            "rifatte una per una. Non si applica ai modelli TranslateGemma e PLaMo (prompt specifico).")
+        l1.addWidget(self.ck_lm_ctx)
+        self.ck_lm_tutto = QCheckBox("LM Studio: manda tutto il file in un solo blocco (serve un contesto ampio, es. Bonsai)")
+        self.ck_lm_tutto.setChecked(False)
+        self.ck_lm_tutto.setToolTip(
+            "Invece di gruppi di ~30 righe, il modello riceve l'intero testo: traduce tutto d'un fiato e\n"
+            "poi sostituisce ogni riga giapponese con la corrispondente frase tradotta. Richiede che nel\n"
+            "modello caricato in LM Studio il 'Context Length' sia abbastanza grande per tutto il testo.")
+        l1.addWidget(self.ck_lm_tutto)
+        self.ck_lm_veloce = QCheckBox("LM Studio / llama.cpp: un solo passaggio (piu' veloce: traduce direttamente le righe numerate)")
+        self.ck_lm_veloce.setChecked(True)
+        self.ck_lm_veloce.setToolTip(
+            "Salta il passaggio 'traduci tutto, poi riallinea': il modello traduce subito gruppi di righe\n"
+            "numerate vedendo anche le ultime righe gia' tradotte. Dimezza i tempi e bastano ~8K di\n"
+            "contesto. Se e' spuntato 'tutto il file in un solo blocco' il gruppo e' l'intero testo.")
+        l1.addWidget(self.ck_lm_veloce)
+        self.ck_scarica_whisper = QCheckBox("Scarica Whisper dalla VRAM prima della traduzione")
+        self.ck_scarica_whisper.setChecked(True)
+        self.ck_scarica_whisper.setToolTip(
+            "Libera la VRAM occupata da Whisper dopo la trascrizione (utile se il modello di traduzione\n"
+            "ne ha bisogno). Togli la spunta se hai VRAM in abbondanza: Whisper resta caricato e la\n"
+            "trascrizione successiva parte subito. Il pulsante 'Libera modello' lo scarica a mano.")
+        l1.addWidget(self.ck_scarica_whisper)
+
+        # --- llama.cpp: llama-server avviato dallo script solo per la traduzione
+        ra = QHBoxLayout()
+        self.lb_ls = QLabel("llama.cpp")
+        self.ed_ls_exe = QLineEdit()
+        self.ed_ls_exe.setPlaceholderText("llama-server (vuoto = cerca nel PATH)")
+        self.b_ls_exe = QPushButton("Sfoglia...")
+        self.b_ls_exe.clicked.connect(self._sfoglia_ls_exe)
+        ra.addWidget(self.lb_ls)
+        ra.addWidget(self.ed_ls_exe, 1)
+        ra.addWidget(self.b_ls_exe)
+        l1.addLayout(ra)
+        rb = QHBoxLayout()
+        self.ed_ls_gguf = QLineEdit()
+        self.ed_ls_gguf.setPlaceholderText("modello .gguf (es. Bonsai o TranslateGemma)")
+        self.ed_ls_gguf.setToolTip(
+            "Percorso del file .gguf (o della cartella che lo contiene). Lo script non cerca i modelli da solo:\n"
+            "usa questo percorso. 'Sfoglia...' apre il selettore di file del sistema.")
+        self.b_ls_gguf = QPushButton("Sfoglia...")
+        self.b_ls_gguf.clicked.connect(self._sfoglia_ls_gguf)
+        rb.addWidget(self.ed_ls_gguf, 1)
+        rb.addWidget(self.b_ls_gguf)
+        l1.addLayout(rb)
+        rc = QHBoxLayout()
+        self.ed_ls_ctx = QLineEdit("16384")
+        self.ed_ls_ctx.setToolTip("Context Length (-c). Piu' e' grande, piu' VRAM usa la KV cache.")
+        self.ed_ls_ngl = QLineEdit("99")
+        self.ed_ls_ngl.setToolTip("Layer sulla GPU (-ngl). 99 = tutti; abbassa se la VRAM non basta.")
+        self.ed_ls_extra = QLineEdit()
+        self.ed_ls_extra.setPlaceholderText("argomenti extra, es. -ctk q8_0 -ctv q8_0 -fa on")
+        rc.addWidget(QLabel("Contesto"))
+        rc.addWidget(self.ed_ls_ctx, 1)
+        rc.addWidget(QLabel("Layer GPU"))
+        rc.addWidget(self.ed_ls_ngl, 1)
+        rc.addWidget(self.ed_ls_extra, 3)
+        l1.addLayout(rc)
+        self.cb_trad.currentIndexChanged.connect(self._trad_ui)
+        self._trad_ui()
 
         self.ck_musica = QCheckBox(
             "Musica di sottofondo: non scartare i testi cantati (niente filtro VAD, soglie rilassate)")
@@ -1703,11 +3590,32 @@ class Finestra(QWidget):
         l1.addWidget(self.ck_musica)
 
         self.ck_demucs = QCheckBox(
-            "Isola prima la voce con Demucs (molto piu' efficace con la musica, ma lento)")
+            "Isola prima la voce dalla musica (molto piu' efficace con la musica, ma lento)")
         self.ck_demucs.setToolTip(
-            "Separa la voce dalla musica prima della trascrizione. Richiede:  python -m pip install demucs\n"
-            "Se Demucs non e' disponibile si usa l'audio originale. Implica le impostazioni 'musica'.")
+            "Separa la voce dalla musica prima della trascrizione.\n"
+            "Demucs:      python -m pip install demucs\n"
+            "BS-RoFormer: python -m pip install \"audio-separator[gpu]\"  (o [cpu])\n"
+            "Se il motore non e' disponibile si usa l'audio originale. Implica le impostazioni 'musica'.")
         l1.addWidget(self.ck_demucs)
+
+        rs = QHBoxLayout()
+        self.lb_sep = QLabel("Motore di separazione")
+        self.cb_sep = QComboBox()
+        for etichetta, chiave in SEPARATORI:
+            self.cb_sep.addItem(etichetta, chiave)
+        self.cb_sep.setToolTip(
+            "Demucs: modello htdemucs, veloce e robusto.\n"
+            "BS-RoFormer: spesso piu' pulito sulla voce cantata, ma piu' pesante; il checkpoint\n"
+            "({}) viene scaricato alla prima esecuzione in:\n{}".format(BSROFORMER_MODEL, SEPARATOR_MODELS_DIR))
+        rs.addWidget(self.lb_sep)
+        rs.addWidget(self.cb_sep, 1)
+        l1.addLayout(rs)
+
+        def _sep_ui(att):
+            self.lb_sep.setEnabled(att)
+            self.cb_sep.setEnabled(att)
+        self.ck_demucs.toggled.connect(_sep_ui)
+        _sep_ui(self.ck_demucs.isChecked())
         self.cb_lingua.currentIndexChanged.connect(self._lingua_cambiata)
         self._lingua_cambiata()
 
@@ -1731,7 +3639,23 @@ class Finestra(QWidget):
         )
         self.b_salva_accanto.clicked.connect(self.salva_accanto)
 
+        self.b_salva_stem = QPushButton("🎙 Salva voce e musica")
+        self.b_salva_stem.setToolTip(
+            "Separa la voce dalla musica del file scelto (con il motore selezionato sotto) e salva\n"
+            "accanto all'originale due file WAV: <nome>_voce.wav e <nome>_musica.wav.\n"
+            "Usa sempre il file intero (Da/A ignorati) e non richiede di aver trascritto prima."
+        )
+        self.b_salva_stem.clicked.connect(self.salva_voce_musica)
+
+        self.b_ferma = QPushButton("■ Interrompi")
+        self.b_ferma.setEnabled(False)
+        self.b_ferma.setToolTip(
+            "Interrompe il processo in corso (trascrizione, traduzione o batch). Si ferma al\n"
+            "prossimo segmento/riga: una richiesta gia' partita verso il modello deve finire.")
+        self.b_ferma.clicked.connect(self.interrompi)
+
         az.addWidget(self.b_avvia)
+        az.addWidget(self.b_ferma)
         self.b_carica_k = QPushButton("📂 Carica karaoke...")
         self.b_carica_k.setToolTip(
             "Carica un file _karaoke.json salvato in precedenza: riapre il video/audio "
@@ -1740,6 +3664,7 @@ class Finestra(QWidget):
         self.b_carica_k.clicked.connect(self.scegli_karaoke)
 
         az.addWidget(self.b_salva_accanto)
+        az.addWidget(self.b_salva_stem)
         az.addWidget(self.b_carica_k)
         az.addStretch(1)
         az.addWidget(self.b_libera)
@@ -1757,15 +3682,79 @@ class Finestra(QWidget):
         self.c1 = c1
         root.addWidget(c1)
 
+        # --- batch ---
+        cbt, lbt = card("Batch (piu' file in coda)")
+
+        nota = QLabel(
+            "Ogni file viene trascritto per intero con le impostazioni qui sopra (Da/A ignorati) "
+            "e salvato accanto all'originale: _trascrizione.txt, _hiragana.txt, "
+            "_traduzione.txt e _karaoke.json. Con la traduzione attiva il batch lavora in due fasi: "
+            "prima tutte le trascrizioni (Whisper caricato una volta sola), poi lo scarica dalla memoria "
+            "e traduce tutti i file. Puoi anche trascinare qui piu' file o una cartella."
+        )
+        nota.setObjectName("sotto")
+        nota.setWordWrap(True)
+        lbt.addWidget(nota)
+
+        self.lst_batch = QListWidget()
+        self.lst_batch.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.lst_batch.setFixedHeight(140)
+        lbt.addWidget(self.lst_batch)
+
+        rb = QHBoxLayout()
+        self.b_b_file = QPushButton("Aggiungi file...")
+        self.b_b_file.clicked.connect(self.scegli_batch_file)
+        self.b_b_cart = QPushButton("Aggiungi cartella...")
+        self.b_b_cart.setToolTip("Aggiunge tutti i file audio/video della cartella (sottocartelle comprese)")
+        self.b_b_cart.clicked.connect(self.scegli_batch_cartella)
+        self.b_b_rimuovi = QPushButton("Rimuovi selezionati")
+        self.b_b_rimuovi.setToolTip("Rimuove i file selezionati dalla coda (tasto Canc)")
+        self.b_b_rimuovi.clicked.connect(self.rimuovi_batch)
+        self.b_b_svuota = QPushButton("Svuota")
+        self.b_b_svuota.clicked.connect(self.svuota_batch)
+        rb.addWidget(self.b_b_file)
+        rb.addWidget(self.b_b_cart)
+        rb.addWidget(self.b_b_rimuovi)
+        rb.addWidget(self.b_b_svuota)
+        rb.addStretch(1)
+        self.lb_batch = QLabel("")
+        self.lb_batch.setObjectName("sotto")
+        rb.addWidget(self.lb_batch)
+        lbt.addLayout(rb)
+
+        sc_canc = QShortcut(QKeySequence("Delete"), self.lst_batch)
+        sc_canc.setContext(Qt.WidgetShortcut)
+        sc_canc.activated.connect(self.rimuovi_batch)
+
+        self.ck_salta = QCheckBox("Salta i file che hanno gia' un _karaoke.json (utile per riprendere un batch interrotto)")
+        self.ck_salta.setChecked(True)
+        lbt.addWidget(self.ck_salta)
+
+        rb2 = QHBoxLayout()
+        self.b_batch = QPushButton("▶▶ Trascrivi batch")
+        self.b_batch.setObjectName("primario")
+        self.b_batch.clicked.connect(self.avvia_batch)
+        self.b_batch_stop = QPushButton("■ Interrompi dopo il file corrente")
+        self.b_batch_stop.setEnabled(False)
+        self.b_batch_stop.clicked.connect(self.ferma_batch)
+        rb2.addWidget(self.b_batch)
+        rb2.addWidget(self.b_batch_stop)
+        rb2.addStretch(1)
+        lbt.addLayout(rb2)
+
+        self.cbt = cbt
+        root.addWidget(cbt)
+        self._batch_conteggio()
+
         # --- player ---
         c2, l2 = card("Player")
 
         self.l2, self.c2 = l2, c2
         self.cont_video = ContenitoreVideo()
         self.video = self.cont_video.video
+        self.onda = self.video.onda
         self._collega_cont(self.cont_video)
         self.cont_video.hide()
-        self.player.setVideoOutput(self.video.item)
         l2.addWidget(self.cont_video, 1)
 
         self.forma = Forma()
@@ -1837,6 +3826,21 @@ class Finestra(QWidget):
         self.player.stateChanged.connect(self._stato_player)
         self.player.positionChanged.connect(self.aggiorna_pos)
         self.player.error[QMediaPlayer.Error].connect(self._errore_player)
+        self.player.mediaStatusChanged.connect(self._stato_media)
+        # guardia del video: il backend multimediale (GStreamer) puo' bloccarsi senza emettere alcun errore
+        self._t_decod = 0.0
+        self._tm_decod = QTimer(self)
+        self._tm_decod.setInterval(1000)
+        self._tm_decod.timeout.connect(self._decodifica_attiva)
+        # video: fotogrammi decodificati da ffmpeg e mostrati in sincronia con la posizione dell'audio
+        self._frame_src = None
+        self._frame_vecchi = []
+        self._info_video = None
+        self._frame_t_mostrato = None
+        self._frame_ultimo_avvio = 0.0
+        self._tm_frame = QTimer(self)
+        self._tm_frame.setInterval(25)
+        self._tm_frame.timeout.connect(self._aggiorna_frame)
 
         # --- testi affiancati ---
         split = QSplitter(Qt.Horizontal)
@@ -1857,8 +3861,16 @@ class Finestra(QWidget):
         self.b_salva.setObjectName("piccolo")
         self.b_salva.clicked.connect(self.salva)
 
+        self.b_copia_num = QPushButton("Copia con numeri")
+        self.b_copia_num.setObjectName("piccolo")
+        self.b_copia_num.setToolTip(
+            "Copia i segmenti come righe '[N|mm:ss.s] testo', da far tradurre a un programma esterno.\n"
+            "Il traduttore non tocca i numeri: incollando il risultato nel riquadro TRADUZIONE e premendo\n"
+            "'Applica' ogni riga torna al suo segmento, con i tempi esatti.")
+        self.b_copia_num.clicked.connect(self.copia_numerata)
         h3.addWidget(lb3)
         h3.addStretch(1)
+        h3.addWidget(self.b_copia_num)
         h3.addWidget(self.b_copia)
         h3.addWidget(self.b_salva)
         l3.addLayout(h3)
@@ -1907,8 +3919,22 @@ class Finestra(QWidget):
         self.b_copia_trad = QPushButton("Copia")
         self.b_copia_trad.setObjectName("piccolo")
         self.b_copia_trad.clicked.connect(self.copia_traduzione)
+        self.b_applica_trad = QPushButton("Applica")
+        self.b_applica_trad.setObjectName("piccolo")
+        self.b_applica_trad.setToolTip(
+            "Usa il testo di questo riquadro (anche incollato a mano) come traduzione ufficiale:\n"
+            "viene agganciata ai tempi del giapponese e salvata nel karaoke (.json) e nei sottotitoli.")
+        self.b_applica_trad.clicked.connect(self.applica_traduzione)
+        self.b_traduci = QPushButton("Traduci")
+        self.b_traduci.setObjectName("piccolo")
+        self.b_traduci.setToolTip(
+            "Traduce di nuovo solo il testo (senza rifare la trascrizione), con il modello e la lingua\n"
+            "scelti sopra, e mette il risultato in questo riquadro agganciato ai tempi del giapponese.")
+        self.b_traduci.clicked.connect(self.traduci_solo)
         h5.addWidget(lb5)
         h5.addStretch(1)
+        h5.addWidget(self.b_traduci)
+        h5.addWidget(self.b_applica_trad)
         h5.addWidget(self.b_copia_trad)
         l5.addLayout(h5)
 
@@ -1951,6 +3977,20 @@ class Finestra(QWidget):
             doppio=self.ck_doppio.isChecked(),
             musica=self.ck_musica.isChecked(),
             demucs=self.ck_demucs.isChecked(),
+            separatore=self.cb_sep.currentData(),
+            batch_salta=self.ck_salta.isChecked(),
+            trad_modello=self.cb_trad.currentIndex(),
+            lm_url=self.ed_lm_url.text(),
+            lm_modello=self.ed_lm_modello.text(),
+            lm_contesto=self.ck_lm_ctx.isChecked(),
+            lm_tutto=self.ck_lm_tutto.isChecked(),
+            lm_veloce=self.ck_lm_veloce.isChecked(),
+            scarica_whisper=self.ck_scarica_whisper.isChecked(),
+            ls_exe=self.ed_ls_exe.text().strip(),
+            ls_gguf=self.ed_ls_gguf.text().strip(),
+            ls_ctx=self.ed_ls_ctx.text().strip(),
+            ls_ngl=self.ed_ls_ngl.text().strip(),
+            ls_extra=self.ed_ls_extra.text().strip(),
             prompt_iniziale=self.ed_prompt.text(),
             sottotitoli=self.cb_sub.currentIndex(),
             velocita=self.cb_vel.currentText(),
@@ -1986,6 +4026,21 @@ class Finestra(QWidget):
 
         combo(self.cb_modello, d.get("modello"))
         combo(self.cb_device, d.get("device"))
+        isep = self.cb_sep.findData(d.get("separatore"))
+        if isep >= 0:
+            self.cb_sep.setCurrentIndex(isep)
+        tm = d.get("trad_modello")
+        if isinstance(tm, int) and 0 <= tm < self.cb_trad.count():
+            self.cb_trad.setCurrentIndex(tm)
+        if isinstance(d.get("lm_url"), str) and d["lm_url"].strip():
+            self.ed_lm_url.setText(d["lm_url"])
+        if isinstance(d.get("lm_modello"), str):
+            self.ed_lm_modello.setText(d["lm_modello"])
+        for ed, k in ((self.ed_ls_exe, "ls_exe"), (self.ed_ls_gguf, "ls_gguf"),
+                       (self.ed_ls_ctx, "ls_ctx"), (self.ed_ls_ngl, "ls_ngl"),
+                       (self.ed_ls_extra, "ls_extra")):
+            if isinstance(d.get(k), str):
+                ed.setText(d[k])
         cod = d.get("lingua")
         for i, (_, c) in enumerate(LINGUE):
             if (c or "auto") == cod:
@@ -1994,7 +4049,11 @@ class Finestra(QWidget):
         for ck, k in ((self.ck_timestamp, "timestamp"), (self.ck_acapo, "a_capo"),
                       (self.ck_parole, "parole"), (self.ck_prefisso, "prefisso"),
                       (self.ck_doppio, "doppio"), (self.ck_musica, "musica"),
-                      (self.ck_demucs, "demucs")):
+                      (self.ck_demucs, "demucs"), (self.ck_salta, "batch_salta"),
+                      (self.ck_lm_ctx, "lm_contesto"),
+                      (self.ck_lm_tutto, "lm_tutto"),
+                      (self.ck_lm_veloce, "lm_veloce"),
+                      (self.ck_scarica_whisper, "scarica_whisper")):
             spunta(ck, k)
         if isinstance(d.get("prompt_iniziale"), str):
             self.ed_prompt.setText(d["prompt_iniziale"])
@@ -2019,13 +4078,18 @@ class Finestra(QWidget):
             e.acceptProposedAction()
 
     def dropEvent(self, e):
-        urls = e.mimeData().urls()
-        if urls:
-            f = urls[0].toLocalFile()
+        files = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        if not files:
+            return
+        if len(files) == 1 and os.path.isfile(files[0]):
+            f = files[0]
             if f.lower().endswith(".json"):
                 self.carica_karaoke_json(f)
             else:
                 self.imposta_file(f)
+        else:
+            # piu' file o una cartella: finiscono nella coda del batch
+            self._aggiungi_batch(files)
 
     def scegli_file(self):
         f, _ = QFileDialog.getOpenFileName(
@@ -2044,7 +4108,15 @@ class Finestra(QWidget):
 
     def _file_modificato(self):
         path = self.ed_file.text().strip()
-        if path and path != self.file_corrente and os.path.isfile(path):
+        if not path:
+            return
+        if not os.path.isfile(path):
+            self.lb_stato.setText("File non trovato: " + path)
+            log_hira("file non trovato: " + path)
+            return
+        # stesso file di prima: si ricarica solo se la volta scorsa non e' arrivato a fine decodifica (prima non succedeva nulla)
+        in_corso = self.decoder is not None and self.decoder.isRunning() and self.decoder.path == path
+        if path != self.file_corrente or (self.wav_tmp is None and not in_corso):
             self.carica_audio(path)
             self._cerca_karaoke(path)
 
@@ -2058,15 +4130,23 @@ class Finestra(QWidget):
 
     def carica_audio(self, path):
         self.file_corrente = path
+        self._tm_frame.stop()
+        self._ferma_frame()
+        self._info_video = None
+        self.video.item.setPixmap(QPixmap())
         self.player.stop()
         self.player.setMedia(QMediaContent())
         self._rimuovi_wav()
-        self._mostra_video(False)
+        self.onda.pulisci()
+        self._mostra_video(False, schermo=False)
 
         self.forma.pulisci("Decodifico l'audio...")
         self.sl_pos.setRange(0, 0)
         self.lb_stato.setText("Decodifico il file...")
         self.lb_tempo.setText("00:00.0 / 00:00.0")
+        log_hira("carico %s" % path)
+        self._t_decod = time.perf_counter()
+        self._tm_decod.start()
 
         if self.decoder is not None:
             self._vecchi.append(self.decoder)
@@ -2077,7 +4157,14 @@ class Finestra(QWidget):
         self.decoder.errore.connect(self._audio_errore)
         self.decoder.start()
 
+    def _decodifica_attiva(self):
+        """Mostra il tempo trascorso: se il contatore avanza, ffmpeg sta ancora lavorando (file lungo), non e' bloccato."""
+        self.lb_stato.setText("Decodifico il file... %d s" % int(time.perf_counter() - self._t_decod))
+
     def _audio_pronto(self, path, wav, db, hop, durata, ha_video):
+        if path == self.file_corrente:
+            self._tm_decod.stop()
+            self.lb_stato.setText("Pronto: %s (%s)" % (os.path.basename(path), "video" if ha_video else "solo audio"))
         if path != self.file_corrente:
             try:
                 os.remove(wav)
@@ -2088,12 +4175,23 @@ class Finestra(QWidget):
         self.wav_tmp = wav
         self.durata = durata
         self.forma.imposta(db, hop, durata)
+        self.onda.imposta(db, hop)
 
-        self.modo_video = bool(ha_video)
+        emittente = self.sender()
+        info = getattr(emittente, "info", None) if emittente is not None else None
+        self.modo_video = bool(ha_video) and info is not None
         self._mostra_video(self.modo_video)
-        sorgente = path if self.modo_video else wav
-        self.player.setMedia(QMediaContent(QUrl.fromLocalFile(sorgente)))
+        # l'audio suona sempre dal wav estratto (affidabile con qualunque codec); il video lo disegna ffmpeg
+        self._log_player("apro l'audio (%s), video=%s" % (wav, self.modo_video))
+        self.player.setMedia(QMediaContent(QUrl.fromLocalFile(wav)))
         self.player.setPlaybackRate(float(self.cb_vel.currentText().rstrip("x")))
+        if self.modo_video:
+            self._info_video = info
+            self._frame_t_mostrato = None
+            self._avvia_frame(0.0)
+            self._tm_frame.start()
+        else:
+            self._tm_frame.stop()
 
         self.sl_pos.setRange(0, int(durata * 1000))
         self._aggiorna_selezione()
@@ -2101,21 +4199,49 @@ class Finestra(QWidget):
 
     def _audio_errore(self, path, msg):
         if path == self.file_corrente:
+            self._tm_decod.stop()
             self.forma.pulisci("Impossibile decodificare l'audio")
             self.lb_stato.setText("Errore di decodifica audio.")
             QMessageBox.warning(self, "Audio", msg)
 
-    def _mostra_video(self, on):
+    def _mostra_video(self, on, schermo=True):
+        """on: il file ha una vera traccia video. Con schermo=True lo schermo si vede comunque: nei
+        file solo audio e' nero, con i sottotitoli karaoke e la sinusoide dei dB."""
         self.modo_video = bool(on)
-        if not on:
+        if not schermo:
             self._fullscreen(False)
-        self.cont_video.setVisible(bool(on))
+        self.cont_video.setVisible(bool(schermo))
         self.root.setStretchFactor(self.c1, 0)
-        self.root.setStretchFactor(self.c2, 4 if on else 0)
-        self.lb_sub.setVisible(bool(on))
-        self.cb_sub.setVisible(bool(on))
-        self.b_fs.setVisible(bool(on))
+        self.root.setStretchFactor(self.c2, 4 if schermo else 0)
+        self.lb_sub.setVisible(bool(schermo))
+        self.cb_sub.setVisible(bool(schermo))
+        self.b_fs.setVisible(bool(schermo))
+        self.onda.attiva = bool(schermo) and not on
+        self._onda_ancora = None
         self._sub_chiave = None
+        self._aggiorna_schermi()
+
+    def _aggiorna_schermi(self):
+        self.video.viewport().update()
+        if self.cont_fs is not None and self.cont_fs.isVisible():
+            self.cont_fs.video.viewport().update()
+
+    def _tempo_onda(self, ms):
+        """Tempo di riproduzione interpolato tra un aggiornamento e l'altro del player (movimento fluido)."""
+        t = ms / 1000.0
+        now = time.perf_counter()
+        a = self._onda_ancora
+        if a is None or t != a[0]:
+            self._onda_ancora = a = (t, now)
+        if self.player.state() == QMediaPlayer.PlayingState:
+            rate = self.player.playbackRate() or 1.0
+            te = t + min((now - a[1]) * rate, 1.0)
+            if 0.0 < self._onda_ultimo - te < 0.3:
+                te = self._onda_ultimo      # niente piccoli passi indietro
+        else:
+            te = t
+        self._onda_ultimo = te
+        return te
 
     def _tasto_f(self):
         w = QApplication.focusWidget()
@@ -2124,7 +4250,7 @@ class Finestra(QWidget):
         self.schermo_intero()
 
     def schermo_intero(self):
-        if self.modo_video:
+        if self.wav_tmp is not None:
             self._fullscreen(not self._fs)
 
     def _collega_cont(self, c):
@@ -2201,27 +4327,92 @@ class Finestra(QWidget):
             f = (t - a) / (b - a)
         return min(1.0, max(0.0, f))
 
-    def _html_trad(self, testo, cut):
-        lit, resto = escape(testo[:cut]), escape(testo[cut:])
+    @staticmethod
+    def _mix(c1, c2, t):
+        """Interpola linearmente due colori '#rrggbb' (t=0 -> c1, t=1 -> c2)."""
+        t = min(1.0, max(0.0, t))
+        a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+        b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+        return "#%02x%02x%02x" % tuple(int(round(x + (y - x) * t)) for x, y in zip(a, b))
+
+    @staticmethod
+    def _liscia(x):
+        x = min(1.0, max(0.0, x))
+        return x * x * (3.0 - 2.0 * x)
+
+    def _env(self, passo):
+        """Intensita' 0..1 al passo 'passo': sale in fretta, tiene, poi scende."""
+        u = (passo + 0.5) / SUB_PASSI
+        return self._liscia(u / 0.25) if u < 0.5 else self._liscia((1.0 - u) / 0.25)
+
+    def _colore_corrente(self, passo):
+        """Token in riproduzione: dal bianco sale al rosso, poi si raffredda verso l'arancione."""
+        u = (passo + 0.5) / SUB_PASSI
+        base = "#ffffff" if u < 0.5 else C_SPOKEN
+        return self._mix(base, SUB_CURRENT, self._env(passo))
+
+    def _colore_traduzione(self, passo):
+        """Azzurro intenso del tratto di traduzione in corso: stessa curva del rosso dei kanji."""
+        u = (passo + 0.5) / SUB_PASSI
+        base = SUB_TRAD if u < 0.5 else C_SPOKEN
+        return self._mix(base, SUB_TRAD_CURRENT, self._env(passo))
+
+    def _intervallo_trad(self, i, idx):
+        """Intervallo [c0, c1) di caratteri della riga tradotta i che corrisponde al token
+        giapponese idx (stessa proporzione dell'illuminazione); esteso a parole intere se ci sono spazi."""
+        testo = self.trad_righe[i]
+        n = len(testo)
+        a, b = self.t0_t[i], self.t1_t[i]
+        ca, cb = self._prog_jp(a), self._prog_jp(b)
+        if cb - ca > 1e-9:
+            f0 = (self._cw[idx] - ca) / (cb - ca)
+            f1 = (self._cw[idx + 1] - ca) / (cb - ca)
+        elif b > a:
+            f0 = (self.t0[idx] - a) / (b - a)
+            f1 = (self.t1[idx] - a) / (b - a)
+        else:
+            return 0, 0
+        c0 = int(round(n * min(1.0, max(0.0, f0))))
+        c1 = int(round(n * min(1.0, max(0.0, f1))))
+        if c1 <= c0:
+            return c0, c0
+        if " " in testo:
+            while 0 < c0 < n and not testo[c0 - 1].isspace() and not testo[c0].isspace():
+                c0 -= 1
+            while 0 < c1 < n and not testo[c1 - 1].isspace() and not testo[c1].isspace():
+                c1 += 1
+            if c1 > c0 and testo[c1 - 1].isspace():
+                c1 -= 1
+        return c0, c1
+
+    def _html_trad(self, testo, cut, c1=None, passo=None):
+        if c1 is not None and passo is not None:
+            parti = ((testo[:cut], C_SPOKEN),
+                     (testo[cut:c1], self._colore_traduzione(passo)),
+                     (testo[c1:], SUB_TRAD))
+        else:
+            parti = ((testo[:cut], C_SPOKEN), (testo[cut:], SUB_TRAD))
         out = ""
-        if lit:
-            out += '<span style="color:%s;">%s</span>' % (C_SPOKEN, lit)
-        if resto:
-            out += '<span style="color:#bfe3ff;">%s</span>' % resto
+        for frag, col in parti:
+            if frag:
+                out += '<span style="color:%s;">%s</span>' % (col, escape(frag))
         return '<div style="white-space: pre-wrap;">%s</div>' % out
 
-    def _html_riga(self, tok, a, b, idx, in_corso):
+    def _html_riga(self, tok, a, b, idx, in_corso, corrente=None):
         out = []
         for i in range(a, b):
             tx = escape(tok[i])
-            if i <= idx:
-                out.append('<span style="color:%s;">%s</span>' % (C_SPOKEN, tx))
+            if i == idx and corrente:
+                col = corrente                # token in riproduzione: sfumatura verso il rosso
+            elif i <= idx:
+                col = C_SPOKEN
             else:
-                out.append('<span style="color:#ffffff;">%s</span>' % tx)
+                col = "#ffffff"
+            out.append('<span style="color:%s;">%s</span>' % (col, tx))
         return '<div style="white-space: pre-wrap;">%s</div>' % "".join(out)
 
     def _aggiorna_sub(self, t):
-        if not self.modo_video or not self.tok_sub or not self.t0:
+        if not self.tok_sub or not self.t0:
             return
 
         m = self.cb_sub.currentIndex()
@@ -2229,7 +4420,7 @@ class Finestra(QWidget):
         mostra_tr = m in (4, 5) and bool(self.t0_t)
 
         idx, in_corso = -1, False
-        chiave_jp, chiave_tr = None, None
+        chiave_jp, chiave_tr, k_c = None, None, None
 
         if mostra_jp:
             idx = bisect_right(self.t0, t) - 1
@@ -2237,16 +4428,26 @@ class Finestra(QWidget):
                 in_corso = t <= self.t1[idx]
                 if in_corso or t - self.t1[idx] <= 1.5:
                     chiave_jp = (idx, in_corso)
+                if in_corso and self.tok_sub["o"][idx].strip():
+                    d = self.t1[idx] - self.t0[idx]
+                    u = (t - self.t0[idx]) / d if d > 0 else 0.5
+                    k_c = (idx, min(SUB_PASSI - 1, max(0, int(u * SUB_PASSI))))
 
         if mostra_tr:
             it = bisect_right(self.t0_t, t) - 1
             if it >= 0 and t <= self.t1_t[it] + 1.5:
                 n_car = len(self.trad_righe[it])
-                chiave_tr = (it, int(round(n_car * self._frazione_trad(it, t))))
+                c0 = c1 = 0
+                if k_c is not None:
+                    c0, c1 = self._intervallo_trad(it, k_c[0])
+                if c1 > c0:
+                    chiave_tr = (it, c0, c1)      # tratto azzurro = dove i kanji sono rossi
+                else:
+                    chiave_tr = (it, int(round(n_car * self._frazione_trad(it, t))), None)
 
         chiave = None
         if chiave_jp is not None or chiave_tr is not None:
-            chiave = (chiave_jp, chiave_tr, m)
+            chiave = (chiave_jp, chiave_tr, k_c, m)
 
         if chiave == self._sub_chiave:
             return
@@ -2257,26 +4458,86 @@ class Finestra(QWidget):
             return
 
         righe = []
+        corrente = self._colore_corrente(k_c[1]) if k_c else None
         if chiave_jp is not None:
             a, b = self.seg_range[self.tok_sub["seg"][idx]]
             if m in (0, 1, 4):
-                righe.append(self._html_riga(self.tok_sub["o"], a, b, idx, in_corso))
+                righe.append(self._html_riga(self.tok_sub["o"], a, b, idx, in_corso, corrente))
             if m in (0, 2, 4):
-                righe.append(self._html_riga(self.tok_sub["h"], a, b, idx, in_corso))
+                righe.append(self._html_riga(self.tok_sub["h"], a, b, idx, in_corso, corrente))
         if chiave_tr is not None:
-            righe.append(self._html_trad(self.trad_righe[chiave_tr[0]], chiave_tr[1]))
+            if chiave_tr[2] is not None and k_c:
+                righe.append(self._html_trad(self.trad_righe[chiave_tr[0]], chiave_tr[1],
+                                             chiave_tr[2], k_c[1]))
+            else:
+                righe.append(self._html_trad(self.trad_righe[chiave_tr[0]], chiave_tr[1]))
         self._sub_set("".join(righe))
 
-    def _errore_player(self, _codice):
-        if self.modo_video and self.wav_tmp and os.path.exists(self.wav_tmp):
-            self._mostra_video(False)
-            self.player.setMedia(QMediaContent(QUrl.fromLocalFile(self.wav_tmp)))
-            self.player.setPlaybackRate(float(self.cb_vel.currentText().rstrip("x")))
-            self.lb_stato.setText(
-                "Video non riproducibile dal backend multimediale: uso solo l'audio."
-            )
-        elif not self.modo_video:
-            self.lb_stato.setText("Errore del player: " + self.player.errorString())
+    @staticmethod
+    def _log_player(msg):
+        log_hira(msg)
+
+    def _errore_player(self, codice):
+        self._log_player("errore del player (%s): %s" % (codice, self.player.errorString()))
+        self.lb_stato.setText("Errore del player: " + self.player.errorString())
+
+    def _stato_media(self, st):
+        nomi = {QMediaPlayer.UnknownMediaStatus: "sconosciuto", QMediaPlayer.NoMedia: "nessun media",
+                QMediaPlayer.LoadingMedia: "caricamento", QMediaPlayer.LoadedMedia: "caricato",
+                QMediaPlayer.StalledMedia: "bloccato (dati non arrivano)", QMediaPlayer.BufferingMedia: "buffering",
+                QMediaPlayer.BufferedMedia: "bufferizzato", QMediaPlayer.EndOfMedia: "fine",
+                QMediaPlayer.InvalidMedia: "NON VALIDO per il backend"}
+        self._log_player("stato media: " + nomi.get(st, str(st)))
+
+    # ---------------------------------------------------------------- video (fotogrammi da ffmpeg)
+    def _ferma_frame(self):
+        src = self._frame_src
+        if src is not None:
+            src.ferma()
+            self._frame_vecchi.append(src)
+            self._frame_src = None
+        self._frame_vecchi = [t for t in self._frame_vecchi if t.isRunning()]
+
+    def _avvia_frame(self, t):
+        self._ferma_frame()
+        info = self._info_video
+        if not info or not self.file_corrente:
+            return
+        self._frame_ultimo_avvio = time.perf_counter()
+        self._frame_src = SorgenteFrame(self.file_corrente, max(0.0, t), info["w"], info["h"], info["fps"])
+        self._frame_src.start()
+
+    def _mostra_frame(self, img):
+        pm = QPixmap.fromImage(img)
+        cambiata = pm.size() != self.video.item.pixmap().size()
+        self.video.item.setPixmap(pm)
+        if cambiata:
+            self.video._adatta()
+            if self.cont_fs is not None:
+                self.cont_fs.video._adatta()
+
+    def _aggiorna_frame(self):
+        """Ogni 25 ms: mostra il fotogramma che corrisponde alla posizione dell'audio; dopo un salto (o se la
+        decodifica e' rimasta troppo indietro) riparte da li'."""
+        src = self._frame_src
+        if not self.modo_video or src is None:
+            return
+        t = self._tempo_onda(self.player.position())
+        coda = src.coda
+        dovuto = None
+        while coda and coda[0][0] <= t + 0.005:
+            dovuto = coda.popleft()
+        if dovuto is not None:
+            self._frame_t_mostrato = dovuto[0]
+            self._mostra_frame(dovuto[1])
+        if time.perf_counter() - self._frame_ultimo_avvio < 0.6:
+            return
+        mostrato = self._frame_t_mostrato
+        indietro = mostrato is not None and t < mostrato - 0.3          # salto all'indietro
+        prima = t < src.inizio - 0.05
+        in_ritardo = (not coda) and t > src.ultimo + 1.0 and (not src.finito or t < getattr(self, "durata", 0.0) - 1.0)
+        if indietro or prima or in_ritardo:
+            self._avvia_frame(t)
 
     def _aggiorna_selezione(self):
         a = self.sp_inizio.value()
@@ -2328,6 +4589,11 @@ class Finestra(QWidget):
             self.sl_pos.setValue(int(ms))
         self.lb_tempo.setText("{} / {}".format(fmt_tempo(t), fmt_tempo(getattr(self, "durata", 0.0))))
 
+        o = getattr(self, "onda", None)
+        if o is not None and o.attiva:
+            o.t = self._tempo_onda(ms)
+            self._aggiorna_schermi()
+
         if self.t0:
             idx = bisect_right(self.t0, t) - 1
             in_corso = idx >= 0 and t <= self.t1[idx]
@@ -2353,7 +4619,400 @@ class Finestra(QWidget):
         if self.player.state() != QMediaPlayer.PlayingState:
             self.player.play()
 
+    # ------------------------------------------------------------------ batch
+    def _parametri(self, path, intero=False):
+        """Parametri del Worker dalle impostazioni correnti. Con intero=True
+        (batch) l'intervallo Da/A viene ignorato: si trascrive tutto il file."""
+        return dict(
+            file=path,
+            modello=self.cb_modello.currentText(),
+            lingua=LINGUE[self.cb_lingua.currentIndex()][1],
+            device=self.cb_device.currentText(),
+            inizio=0.0 if intero else self.sp_inizio.value(),
+            fine=0.0 if intero else self.sp_fine.value(),
+            batch=bool(intero),
+            timestamp=self.ck_timestamp.isChecked(),
+            a_capo=self.ck_acapo.isChecked(),
+            parole=self.ck_parole.isChecked(),
+            prefisso=self.ck_prefisso.isChecked(),
+            doppio=self.ck_doppio.isEnabled() and self.ck_doppio.isChecked(),
+            trad_modello=self.cb_trad.currentIndex(),
+            lm_url=self.ed_lm_url.text().strip(),
+            lm_modello=self.ed_lm_modello.text().strip(),
+            lm_contesto=self.ck_lm_ctx.isChecked(),
+            lm_tutto=self.ck_lm_tutto.isChecked(),
+            lm_veloce=self.ck_lm_veloce.isChecked(),
+            scarica_whisper=self.ck_scarica_whisper.isChecked(),
+            ls_exe=self.ed_ls_exe.text().strip(),
+            ls_gguf=self.ed_ls_gguf.text().strip(),
+            ls_ctx=self.ed_ls_ctx.text().strip(),
+            ls_ngl=self.ed_ls_ngl.text().strip(),
+            ls_extra=self.ed_ls_extra.text().strip(),
+            musica=self.ck_musica.isChecked(),
+            demucs=self.ck_demucs.isChecked(),
+            separatore=self.cb_sep.currentData(),
+            prompt_iniziale=self.ed_prompt.text().strip(),
+        )
+
+    def _batch_etichetta(self, item, icona):
+        nome = os.path.basename(item.data(Qt.UserRole))
+        item.setText("{}  {}".format(icona, nome) if icona else nome)
+
+    def _batch_conteggio(self):
+        n = self.lst_batch.count()
+        self.lb_batch.setText("{} file in coda".format(n) if n else "Coda vuota")
+        libero = not self._batch_attivo
+        self.b_batch.setEnabled(libero and n > 0)
+        self.b_b_rimuovi.setEnabled(libero and n > 0)
+        self.b_b_svuota.setEnabled(libero and n > 0)
+
+    def _batch_ui(self):
+        """Abilita/disabilita i controlli in base al batch in corso."""
+        libero = not self._batch_attivo
+        self.b_b_file.setEnabled(libero)
+        self.b_b_cart.setEnabled(libero)
+        self.ck_salta.setEnabled(libero)
+        self.b_batch_stop.setEnabled(not libero)
+        self.b_avvia.setEnabled(libero)
+        self.b_libera.setEnabled(libero)
+        if libero:
+            self.b_batch_stop.setText("■ Interrompi dopo il file corrente")
+        self._batch_conteggio()
+
+    def _aggiungi_batch(self, percorsi):
+        if self._batch_attivo:
+            return
+        presenti = {self.lst_batch.item(i).data(Qt.UserRole) for i in range(self.lst_batch.count())}
+        nuovi = 0
+        for p in percorsi:
+            for f in trova_media(p):
+                f = os.path.abspath(f)
+                if f in presenti:
+                    continue
+                presenti.add(f)
+                it = QListWidgetItem()
+                it.setData(Qt.UserRole, f)
+                it.setToolTip(f)
+                self._batch_etichetta(it, "")
+                self.lst_batch.addItem(it)
+                nuovi += 1
+        self._batch_conteggio()
+        if nuovi:
+            self.lb_stato.setText("Aggiunti {} file alla coda del batch.".format(nuovi))
+        else:
+            self.lb_stato.setText("Nessun nuovo file audio/video da aggiungere.")
+
+    def scegli_batch_file(self):
+        fs, _ = QFileDialog.getOpenFileNames(
+            self, "Aggiungi file al batch", self.ultima_cartella,
+            FILTRO_FILE,
+            options=QFileDialog.DontUseNativeDialog
+        )
+        if fs:
+            if os.path.isdir(os.path.dirname(fs[0])):
+                self.ultima_cartella = os.path.dirname(fs[0])
+            self._aggiungi_batch(fs)
+
+    def scegli_batch_cartella(self):
+        d = QFileDialog.getExistingDirectory(
+            self, "Aggiungi cartella al batch", self.ultima_cartella,
+            options=QFileDialog.DontUseNativeDialog | QFileDialog.ShowDirsOnly
+        )
+        if d:
+            self.ultima_cartella = d
+            self._aggiungi_batch([d])
+
+    def rimuovi_batch(self):
+        if self._batch_attivo:
+            return
+        for it in self.lst_batch.selectedItems():
+            self.lst_batch.takeItem(self.lst_batch.row(it))
+        self._batch_conteggio()
+
+    def svuota_batch(self):
+        if self._batch_attivo:
+            return
+        self.lst_batch.clear()
+        self._batch_conteggio()
+
+    def avvia_batch(self):
+        if self._batch_attivo:
+            return
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.information(self, "Trascrizione in corso", "Aspetta la fine della trascrizione corrente.")
+            return
+        n = self.lst_batch.count()
+        if n == 0:
+            QMessageBox.warning(self, "Coda vuota", "Aggiungi prima almeno un file alla coda del batch.")
+            return
+
+        self._salva_impostazioni()
+        _STOP.clear()
+        for i in range(n):
+            self._batch_etichetta(self.lst_batch.item(i), "")
+
+        # con la traduzione attiva il batch si fa in due fasi: prima TUTTE le trascrizioni (Whisper
+        # caricato una volta sola), poi Whisper viene scaricato e si fanno TUTTE le traduzioni
+        pb = self._parametri("", intero=True)
+        self._batch_params = pb
+        self._batch_due_fasi = bool(pb["doppio"]) and pb["lingua"] not in (None, "ja")
+        self._batch_fase = 1
+        self._batch_lavori = []
+        self._batch_interrotto1 = False
+
+        self._batch_i = -1
+        self._batch_stop = False
+        self._batch_esiti = dict(ok=0, salt=0, vuoti=[], err=[], avvisi=[], note=[])
+        self._batch_attivo = True
+        self._batch_ui()
+        self.barra.setRange(0, n)
+        self.barra.setValue(0)
+        self._batch_avanti()
+
+    def ferma_batch(self):
+        self._batch_stop = True
+        if self._batch_fase == 2 and self._batch_trad is not None:
+            self._batch_trad.fermo = True
+        self.b_batch_stop.setEnabled(False)
+        self.b_batch_stop.setText("Mi fermo dopo il file corrente...")
+
+    def _batch_avanti(self):
+        """Passa al file successivo (saltando quelli da non rifare) o chiude il batch."""
+        if not self._batch_attivo:
+            return
+        n = self.lst_batch.count()
+        while True:
+            self._batch_i += 1
+            if self._batch_stop or self._batch_i >= n:
+                self._batch_fine_fase1()
+                return
+            it = self.lst_batch.item(self._batch_i)
+            path = it.data(Qt.UserRole)
+            if not os.path.isfile(path):
+                self._batch_etichetta(it, "✗")
+                self._batch_esiti["err"].append((path, "file non trovato"))
+            elif self.ck_salta.isChecked() and self._batch_gia_fatto(path):
+                self._batch_etichetta(it, "↷")
+                self._batch_esiti["salt"] += 1
+            else:
+                break
+            self.barra.setValue(self._batch_i + 1)
+
+        self._batch_corrente = path
+        self._batch_etichetta(it, "⏳")
+        self.lst_batch.scrollToItem(it)
+
+        prefisso = "Batch {}/{} · {}: ".format(self._batch_i + 1, n, os.path.basename(path))
+        self.lb_stato.setText(prefisso + "avvio...")
+
+        # il vecchio worker puo' non aver ancora finito di uscire: lo tengo vivo
+        if self.worker is not None:
+            self._vecchi.append(self.worker)
+            self._vecchi = [t for t in self._vecchi if t.isRunning()]
+
+        par = self._parametri(path, intero=True)
+        par["solo_trascrizione"] = self._batch_due_fasi
+        w = Worker(par)
+        w.stato.connect(lambda m, pre=prefisso: self.lb_stato.setText(pre + m))
+        w.finito.connect(self._batch_ok)
+        w.errore.connect(self._batch_errore)
+        self.worker = w
+        w.start()
+
+    def _batch_ok(self, r):
+        if not self._batch_attivo:
+            return
+        it = self.lst_batch.item(self._batch_i)
+        path = self._batch_corrente
+        if not r["t0"]:
+            # niente testo: non scrivo il json, cosi' "salta i file gia' fatti" non lo salta alla prossima
+            self._batch_etichetta(it, "⚠")
+            self._batch_esiti["vuoti"].append(path)
+        elif self._batch_due_fasi and r.get("da_tradurre"):
+            # fase 1: salvo subito la trascrizione (senza traduzione) e metto il file in coda per la fase 2
+            try:
+                salva_risultato(r, path)
+                self._batch_etichetta(it, "✎")
+                self._batch_lavori.append(dict(i=self._batch_i, path=path, r=r, fatto=False))
+            except OSError as e:
+                self._batch_etichetta(it, "✗")
+                self._batch_esiti["err"].append((path, "salvataggio non riuscito: {}".format(e)))
+        else:
+            try:
+                salva_risultato(r, path)
+                if "traduzione" in r.get("avviso", ""):
+                    self._batch_etichetta(it, "⚠")
+                    self._batch_esiti["avvisi"].append((path, r["avviso"].strip()))
+                else:
+                    self._batch_etichetta(it, "✓")
+                self._batch_esiti["ok"] += 1
+            except OSError as e:
+                self._batch_etichetta(it, "✗")
+                self._batch_esiti["err"].append((path, "salvataggio non riuscito: {}".format(e)))
+        self.barra.setValue(self._batch_i + 1)
+        self._batch_avanti()
+
+    def _batch_gia_fatto(self, path):
+        """Un file e' da saltare se ha il _karaoke.json e, quando si traduce, anche la _traduzione.txt."""
+        base = os.path.splitext(path)[0]
+        if not os.path.isfile(base + "_karaoke.json"):
+            return False
+        return not self._batch_due_fasi or os.path.isfile(base + "_traduzione.txt")
+
+    def _batch_fine_fase1(self):
+        """Finite (o interrotte) le trascrizioni: scarico Whisper e passo alle traduzioni."""
+        if not (self._batch_due_fasi and self._batch_lavori):
+            self._batch_fine()
+            return
+        self._batch_interrotto1 = self._batch_stop
+        self._batch_fase = 2
+        self._batch_stop = False
+
+        # lascio uscire l'ultimo Worker, poi scarico Whisper dalla memoria (VRAM compresa)
+        if self.worker is not None:
+            self.worker.wait(5000)
+        import time as _t
+        prima = _vram_usata_mb()
+        libera_whisper()
+        if prima is not None:
+            _t.sleep(0.5)
+            dopo = _vram_usata_mb()
+            if dopo is not None:
+                if prima - dopo >= 300:
+                    self._batch_esiti["note"].append(
+                        "VRAM: {:.1f} -> {:.1f} GB dopo aver scaricato Whisper".format(prima / 1024.0, dopo / 1024.0))
+                else:
+                    self._batch_esiti["note"].append(
+                        "VRAM non rilasciata da Whisper ({:.1f} -> {:.1f} GB): CTranslate2 puo' tenerla finche' il "
+                        "programma e' aperto; se il server locale non riesce a caricare il modello, riavvia hira.py"
+                        .format(prima / 1024.0, dopo / 1024.0))
+
+        n = len(self._batch_lavori)
+        self.barra.setRange(0, n)
+        self.barra.setValue(0)
+        self.b_batch_stop.setEnabled(True)
+        self.b_batch_stop.setText("■ Interrompi le traduzioni dopo il file corrente")
+        self.lb_stato.setText("Fase 2/2: traduco {} file...".format(n))
+
+        t = TraduttoreBatch(
+            self._batch_params,
+            [(l["r"]["da_tradurre"]["testi"], l["r"]["da_tradurre"]["t0"], l["r"]["da_tradurre"]["t1"])
+             for l in self._batch_lavori])
+        t.inizio.connect(self._batch_trad_inizio)
+        t.stato.connect(self._batch_trad_stato)
+        t.fatto.connect(self._batch_trad_fatto)
+        t.finito.connect(self._batch_fine)
+        self._batch_trad = t
+        t.start()
+
+    def _batch_trad_stato(self, m):
+        if self._batch_attivo:
+            k = self.barra.value() + 1
+            n = len(self._batch_lavori)
+            nome = os.path.basename(self._batch_lavori[min(k, n) - 1]["path"])
+            self.lb_stato.setText("Traduzione {}/{} · {}: {}".format(min(k, n), n, nome, m))
+
+    def _batch_trad_inizio(self, k):
+        if not self._batch_attivo:
+            return
+        it = self.lst_batch.item(self._batch_lavori[k]["i"])
+        self._batch_etichetta(it, "⏳")
+        self.lst_batch.scrollToItem(it)
+
+    def _batch_trad_fatto(self, k, trad, avviso):
+        if not self._batch_attivo:
+            return
+        lav = self._batch_lavori[k]
+        lav["fatto"] = True
+        it = self.lst_batch.item(lav["i"])
+        r = lav["r"]
+        r["trad"] = allinea_traduzione(r["t0"], r["t1"], trad)
+        r["avviso"] = (r.get("avviso", "") + avviso)
+        try:
+            salva_risultato(r, lav["path"])
+            if trad is None or "traduzione" in avviso:
+                self._batch_etichetta(it, "⚠")
+                self._batch_esiti["avvisi"].append((lav["path"], (avviso.strip() or "traduzione non riuscita")))
+            else:
+                self._batch_etichetta(it, "✓")
+            self._batch_esiti["ok"] += 1
+        except OSError as e:
+            self._batch_etichetta(it, "✗")
+            self._batch_esiti["err"].append((lav["path"], "salvataggio non riuscito: {}".format(e)))
+        lav["r"] = None  # libero la memoria del risultato
+        self.barra.setValue(k + 1)
+
+    def _batch_errore(self, msg):
+        if not self._batch_attivo:
+            return
+        it = self.lst_batch.item(self._batch_i)
+        if msg == "__interrotto__":
+            msg = "interrotto dall'utente"
+            self._batch_stop = True
+        riga = (msg.strip().splitlines() or ["errore sconosciuto"])[0][:200]
+        self._batch_etichetta(it, "✗")
+        self._batch_esiti["err"].append((self._batch_corrente, riga))
+
+        # errori che si ripeterebbero identici su ogni file: inutile proseguire
+        if ("Impossibile caricare faster-whisper" in msg or "faster-whisper non installato" in msg
+                or "ffmpeg non trovato" in msg):
+            self._batch_stop = True
+
+        self.barra.setValue(self._batch_i + 1)
+        self._batch_avanti()
+
+    def _batch_fine(self):
+        self._batch_attivo = False
+        libera_whisper()  # nel batch Whisper e' rimasto in memoria tra un file e l'altro
+        if self._batch_trad is not None:  # il thread puo' non essere ancora uscito: lo tengo vivo
+            self._vecchi.append(self._batch_trad)
+            self._vecchi = [t for t in self._vecchi if t.isRunning()]
+            self._batch_trad = None
+        self._batch_ui()
+        self.barra.setRange(0, 1)
+        self.barra.setValue(0)
+
+        e = self._batch_esiti
+        for lav in self._batch_lavori:
+            if not lav["fatto"]:
+                e["avvisi"].append((lav["path"], "trascritto ma non tradotto (batch interrotto)"))
+        msg = "Batch {}: {} completati, {} saltati, {} senza testo, {} con errori.".format(
+            "interrotto" if (self._batch_stop or self._batch_interrotto1) else "terminato",
+            e["ok"], e["salt"], len(e["vuoti"]), len(e["err"]))
+        self.lb_stato.setText(msg)
+
+        dett = ["✗ {}: {}".format(os.path.basename(p), m) for p, m in e["err"][:15]]
+        dett += ["⚠ {}: nessun testo riconosciuto".format(os.path.basename(p)) for p in e["vuoti"][:15]]
+        dett += ["⚠ {}: {}".format(os.path.basename(p), m) for p, m in e["avvisi"][:15]]
+        dett += list(e["note"])
+        if dett:
+            QMessageBox.warning(self, "Batch", msg + "\n\n" + "\n".join(dett))
+        else:
+            QMessageBox.information(self, "Batch", msg)
+
     # ------------------------------------------------------- trascrizione
+    def _in_corso(self):
+        return (self._batch_attivo
+                or (self.worker is not None and self.worker.isRunning())
+                or (self._trad_solo is not None and self._trad_solo.isRunning()))
+
+    def _aggiorna_stop(self):
+        if not self._in_corso():
+            _STOP.clear()          # niente da interrompere: riparte pulito
+        self.b_ferma.setEnabled(self._in_corso() and not _STOP.is_set())
+
+    def interrompi(self):
+        """Ferma il processo in corso: trascrizione, traduzione o batch."""
+        if not self._in_corso():
+            return
+        _STOP.set()
+        if self._trad_solo is not None and self._trad_solo.isRunning():
+            self._trad_solo.fermo = True
+        if self._batch_attivo:
+            self.ferma_batch()
+        self.b_ferma.setEnabled(False)
+        self.lb_stato.setText("Interrompo: attendo la fine del passo corrente...")
+
     def avvia(self):
         path = self.ed_file.text().strip()
 
@@ -2361,25 +5020,15 @@ class Finestra(QWidget):
             QMessageBox.warning(self, "File mancante", "Scegli un file audio/video valido.")
             return
 
-        params = dict(
-            file=path,
-            modello=self.cb_modello.currentText(),
-            lingua=LINGUE[self.cb_lingua.currentIndex()][1],
-            device=self.cb_device.currentText(),
-            inizio=self.sp_inizio.value(),
-            fine=self.sp_fine.value(),
-            timestamp=self.ck_timestamp.isChecked(),
-            a_capo=self.ck_acapo.isChecked(),
-            parole=self.ck_parole.isChecked(),
-            prefisso=self.ck_prefisso.isChecked(),
-            doppio=self.ck_doppio.isEnabled() and self.ck_doppio.isChecked(),
-            musica=self.ck_musica.isChecked(),
-            demucs=self.ck_demucs.isChecked(),
-            prompt_iniziale=self.ed_prompt.text().strip(),
-        )
+        if self._batch_attivo:
+            QMessageBox.information(self, "Batch in corso", "Aspetta la fine del batch o interrompilo.")
+            return
+
+        params = self._parametri(path)
 
         self._salva_impostazioni()
 
+        _STOP.clear()
         self.b_avvia.setEnabled(False)
         self.barra.setRange(0, 0)
         self.ultimo_ris = None
@@ -2398,10 +5047,58 @@ class Finestra(QWidget):
     def _lingua_cambiata(self, *_):
         cod = LINGUE[self.cb_lingua.currentIndex()][1]
         self.ck_doppio.setEnabled(cod not in (None, "ja"))
+        self.cb_trad.setEnabled(cod not in (None, "ja"))
+        self.lb_trad.setEnabled(cod not in (None, "ja"))
+        self._trad_ui()
+
+    def _trad_ui(self, *_):
+        """I campi di LM Studio sono attivi solo se e' scelto quel backend."""
+        tipo = MODELLI_TRAD[self.cb_trad.currentIndex()][1]
+        att = self.cb_trad.isEnabled()
+        lm, ls = tipo == "lmstudio" and att, tipo == "llamaserver" and att
+        for w in (self.lb_lm, self.ed_lm_url, self.ed_lm_modello):
+            w.setEnabled(lm)
+        for w in (self.ck_lm_ctx, self.ck_lm_tutto, self.ck_lm_veloce):
+            w.setEnabled(lm or ls)
+        for w in (self.lb_ls, self.ed_ls_exe, self.b_ls_exe, self.ed_ls_gguf, self.b_ls_gguf,
+                  self.ed_ls_ctx, self.ed_ls_ngl, self.ed_ls_extra):
+            w.setEnabled(ls)
+
+    def _sfoglia_ls_exe(self):
+        ini = cartella_iniziale(self.ed_ls_exe.text(), CARTELLE_LLAMA_EXE)
+        f = dialog_file_sistema(self, "Scegli llama-server", ini, [("Tutti i file", "*")])
+        if f is None:     # nessun selettore di sistema: dialogo di Qt
+            f, _ = QFileDialog.getOpenFileName(
+                self, "Scegli llama-server", ini, "Tutti i file (*)",
+                options=QFileDialog.DontUseNativeDialog)
+        if f:
+            self.ed_ls_exe.setText(f)
+
+    def _sfoglia_ls_gguf(self):
+        ini = cartella_iniziale(self.ed_ls_gguf.text(), CARTELLE_GGUF)
+        f = dialog_file_sistema(self, "Scegli il modello GGUF", ini,
+                                [("Modelli GGUF", "*.gguf *.GGUF"), ("Tutti i file", "*")])
+        if f is None:
+            f, _ = QFileDialog.getOpenFileName(
+                self, "Scegli il modello GGUF", ini, "Modelli GGUF (*.gguf);;Tutti i file (*)",
+                options=QFileDialog.DontUseNativeDialog)
+        if f:
+            self.ed_ls_gguf.setText(f)
 
     def _imposta_testi(self, orig, hira, span_o, span_h, t0, t1, tok=None, trad=None):
         if trad and trad.get("righe"):
-            testo_t, span_t = testo_righe(trad["righe"])
+            if trad.get("num"):
+                # traduzione numerata: il riquadro conserva i prefissi [N|mm:ss.s]; le
+                # evidenziazioni coprono solo il testo, dopo il prefisso
+                parti, span_t, pos = [], [], 0
+                for k, (rg, ta) in enumerate(zip(trad["righe"], trad["t0"]), 1):
+                    pref = "[{}|{}] ".format(k, fmt_tempo(ta))
+                    parti.append(pref + rg)
+                    span_t.append((pos + l16(pref), pos + l16(pref) + l16(rg)))
+                    pos += l16(pref) + l16(rg) + 1
+                testo_t = "\n".join(parti)
+            else:
+                testo_t, span_t = testo_righe(trad["righe"])
             self.trad_righe = list(trad["righe"])
             self.t0_t, self.t1_t = list(trad["t0"]), list(trad["t1"])
         else:
@@ -2455,8 +5152,14 @@ class Finestra(QWidget):
 
         self.aggiorna_pos(self.player.position())
 
+        if "traduzione" in r["avviso"]:
+            QMessageBox.warning(self, "Traduzione", r["avviso"].strip())
+
     def fine_errore(self, msg):
         self._ripristina()
+        if msg == "__interrotto__":
+            self.lb_stato.setText("Trascrizione interrotta.")
+            return
         self.lb_stato.setText("Errore.")
         QMessageBox.critical(self, "Errore", msg)
 
@@ -2494,28 +5197,7 @@ class Finestra(QWidget):
     # --------------------------------------------------------------- azioni
     # ------------------------------------------------------- karaoke (.json)
     def _scrivi_json(self, percorso):
-        r = self.ultimo_ris
-        media = self.ed_file.text().strip()
-        dati = dict(
-            file=os.path.basename(media),
-            percorso_file=os.path.abspath(media),
-        )
-        comp = karaoke_compatto(r)
-        if comp is not None:
-            dati.update(comp)
-        else:  # fallback: formato completo v1
-            dati.update(
-                versione=1,
-                orig=r["orig"],
-                hira=r["hira"],
-                span_o=[list(x) for x in r["span_o"]],
-                span_h=[list(x) for x in r["span_h"]],
-                t0=[round(float(t), 2) for t in r["t0"]],
-                t1=[round(float(t), 2) for t in r["t1"]],
-                tok=r["tok"],
-            )
-        with open(percorso, "w", encoding="utf-8") as fh:
-            json.dump(dati, fh, ensure_ascii=False, separators=(",", ":"))
+        scrivi_karaoke_json(self.ultimo_ris, self.ed_file.text().strip(), percorso)
 
     @staticmethod
     def _valida_karaoke(d):
@@ -2529,7 +5211,11 @@ class Finestra(QWidget):
             raise ValueError("File karaoke non valido: dati incoerenti.")
 
     def _applica_karaoke(self, d):
-        d = karaoke_espandi(d)
+        # Espandi solo i dati nel formato compatto v2 ("versione" >= 2 con "s");
+        # i dati già espansi (v1 o output di karaoke_espandi, che rimuove "s")
+        # passano senza doppia espansione.
+        if isinstance(d, dict) and d.get("versione", 1) >= 2 and "s" in d:
+            d = karaoke_espandi(d)
         self._valida_karaoke(d)
         r = dict(
             orig=d["orig"], hira=d["hira"],
@@ -2568,7 +5254,13 @@ class Finestra(QWidget):
     def carica_karaoke_json(self, pj):
         try:
             with open(pj, encoding="utf-8") as fh:
-                dati = karaoke_espandi(json.load(fh))
+                raw = json.load(fh)
+            # Espandi solo se necessario (formato compatto v2 con "versione" >= 2);
+            # i dati già espansi o in formato v1 passano senza doppia espansione.
+            if isinstance(raw, dict) and raw.get("versione", 1) >= 2 and "s" in raw:
+                dati = karaoke_espandi(raw)
+            else:
+                dati = raw
             self._valida_karaoke(dati)
         except Exception as e:
             QMessageBox.warning(self, "Karaoke", "Impossibile leggere il file:\n{}".format(e))
@@ -2590,9 +5282,189 @@ class Finestra(QWidget):
         self._applica_karaoke(dati)
         self.lb_stato.setText("Karaoke caricato da {}.".format(os.path.basename(pj)))
 
+    def copia_numerata(self):
+        r = self.ultimo_ris
+        if not r or not r.get("tok") or not r.get("t0"):
+            QMessageBox.information(self, "Copia con numeri",
+                                    "Prima trascrivi un file o carica un karaoke.")
+            return
+        testo, n = testo_numerato(r["tok"], r["t0"])
+        QApplication.clipboard().setText(testo)
+        self.lb_stato.setText(
+            "Copiati {} segmenti numerati [N|tempo]. Chiedi al traduttore di tradurre solo il testo, "
+            "una riga per riga, tenendo i prefissi; poi incolla in TRADUZIONE e premi Applica.".format(n))
+
     def copia(self):
         QApplication.clipboard().setText(self.out.toPlainText())
         self.lb_stato.setText("Trascrizione originale copiata negli appunti.")
+
+    def applica_traduzione(self):
+        """Rende 'ufficiale' il testo del riquadro Traduzione (incollato o modificato a mano)."""
+        r = self.ultimo_ris
+        if not r or not r.get("tok") or not r.get("t0"):
+            QMessageBox.information(
+                self, "Traduzione",
+                "Prima trascrivi un file o carica un karaoke: la traduzione va agganciata ai tempi del giapponese.")
+            return
+        righe = self.out_trad.toPlainText().replace("\r", "").split("\n")
+        while righe and not righe[-1].strip():
+            righe.pop()
+        if not righe:
+            QMessageBox.information(self, "Traduzione", "Il riquadro della traduzione e' vuoto.")
+            return
+        tok, t0, t1 = r["tok"], r["t0"], r["t1"]
+        diviso = False
+        testo_riquadro = self.out_trad.toPlainText()
+        iv = leggi_intervalli_tempo(testo_riquadro)
+        if iv is not None:
+            # frasi con '[inizio -> fine]': il testo mostrato e' senza timestamp, i tempi decidono
+            # quando appare la frase; il riquadro non viene modificato
+            trad = dict(righe=iv[0], t0=iv[1], t1=iv[2], fissa=True)
+            r["trad"] = trad
+            self.trad_righe = list(trad["righe"])
+            self.t0_t, self.t1_t = list(trad["t0"]), list(trad["t1"])
+            self.ev_t.imposta(iv[3])
+            self.c5.setVisible(True)
+            self._sub_chiave = None
+            self._sub_set("")
+            self.aggiorna_pos(self.player.position())
+            self.lb_stato.setText("Traduzione applicata: {} frasi con i tempi del testo. Premi 'Salva "
+                                  "accanto' per scriverla nei file.".format(len(trad["righe"])))
+            return
+        segs = segmenti_giapponesi(tok["seg"])
+        num = leggi_numerate_tempi(testo_riquadro, len(segs))
+        if num is not None:
+            righe = num[0]
+        if num is None and len(segs) >= 3 and len(righe) < max(2, len(segs) // 3):
+            ris = QMessageBox.question(
+                self, "Traduzione senza a capo",
+                "La traduzione ha solo {} righe, mentre il giapponese ha {} segmenti: sembra un unico "
+                "paragrafo, che resterebbe sullo schermo per tutto il video.\n\n"
+                "Vuoi che la divida in frasi e la distribuisca sul tempo del giapponese?".format(
+                    len(righe), len(segs)))
+            if ris != QMessageBox.Yes:
+                return
+            righe = dividi_frasi("\n".join(righe))
+            diviso = True
+        if len(righe) == len(segs):
+            trad = dict(righe=righe, t0=[t0[a] for a, b in segs], t1=[t1[b - 1] for a, b in segs])
+            esito = "una riga per segmento, sincronizzata con il giapponese"
+            if num is not None and any(v is not None for v in num[3]):
+                # i tempi scritti nei prefissi [N|mm:ss.s] decidono quando mostrare la frase
+                a0 = [v if v is not None else t0[a] for v, (a, b) in zip(num[3], segs)]
+                prev = 0.0
+                for i in range(len(a0)):
+                    a0[i] = max(a0[i], prev)
+                    prev = a0[i]
+                a1 = []
+                for i, (a, b) in enumerate(segs):
+                    fine = t1[b - 1]
+                    prossimo = a0[i + 1] if i + 1 < len(a0) else None
+                    if fine <= a0[i]:
+                        fine = prossimo if prossimo is not None else a0[i] + 3.0
+                    if prossimo is not None:
+                        fine = min(fine, prossimo)
+                    a1.append(max(fine, a0[i]))
+                trad = dict(righe=righe, t0=a0, t1=a1, fissa=True)
+            if num is not None:
+                trad["num"] = True
+                esito = "{} segmenti su {} agganciati per numero ({})".format(
+                    num[1], len(segs),
+                    "tempi presi dai prefissi" if trad.get("fissa") else "tempi esatti")
+                if num[1] < len(segs):
+                    esito += ", {} senza traduzione (restano vuoti)".format(len(segs) - num[1])
+                if num[2]:
+                    esito += ", {} righe con numero non valido ignorate".format(num[2])
+        else:
+            ris = QMessageBox.question(
+                self, "Righe diverse dai segmenti",
+                "La traduzione ha {} righe, il giapponese {} segmenti.\n\n"
+                "Posso distribuire le righe sul tempo del giapponese in modo proporzionale "
+                "(sincronizzazione approssimativa). Procedo?".format(len(righe), len(segs)))
+            if ris != QMessageBox.Yes:
+                return
+            pesi = [float(len(h)) if any(c.isalnum() for c in h) else 0.3 for h in tok["h"]]
+            trad = righe_su_tempi(righe, t0, t1, pesi)
+            esito = "{} righe distribuite sul tempo (sincronizzazione approssimativa)".format(len(righe))
+        r["trad"] = trad
+        if diviso:
+            # l'unico caso in cui il testo cambia: l'utente ha chiesto di dividerlo in frasi
+            self._imposta_testi(r["orig"], r["hira"], r["span_o"], r["span_h"], r["t0"], r["t1"], r["tok"], trad)
+        else:
+            # Applica non tocca i campi: aggancia solo le frasi agli intervalli di tempo
+            if num is not None:
+                spans = spans_riquadro_numerato(testo_riquadro, len(segs))
+            else:
+                spans = spans_riquadro_righe(testo_riquadro, len(trad["righe"]))
+            self.trad_righe = list(trad["righe"])
+            self.t0_t, self.t1_t = list(trad["t0"]), list(trad["t1"])
+            self.ev_t.imposta(spans)
+            self.c5.setVisible(bool(spans))
+            self._sub_chiave = None
+            self._sub_set("")
+        self.aggiorna_pos(self.player.position())
+        self.lb_stato.setText("Traduzione applicata: {}. Premi 'Salva accanto' per scriverla nel .txt e nel .json.".format(esito))
+
+    def traduci_solo(self):
+        """Rifa' solo la traduzione dei segmenti gia' trascritti (nessun Whisper)."""
+        r = self.ultimo_ris
+        if not r or not r.get("tok") or not r.get("t0"):
+            QMessageBox.information(self, "Traduzione",
+                                    "Prima trascrivi un file o carica un karaoke: serve il giapponese da tradurre.")
+            return
+        if self._batch_attivo or (self.worker is not None and self.worker.isRunning()) \
+                or (self._trad_solo is not None and self._trad_solo.isRunning()):
+            QMessageBox.information(self, "Traduzione", "C'e' gia' un'operazione in corso: attendi che finisca.")
+            return
+        lingua = LINGUE[self.cb_lingua.currentIndex()][1]
+        if lingua in (None, "ja"):
+            QMessageBox.information(self, "Traduzione",
+                                    "Scegli come lingua una diversa dal giapponese: e' la lingua della traduzione.")
+            return
+        if self.out_trad.toPlainText().strip():
+            ris = QMessageBox.question(self, "Traduci",
+                                       "Il riquadro Traduzione contiene gia' del testo: verra' sostituito. Procedo?")
+            if ris != QMessageBox.Yes:
+                return
+        tok, t0, t1 = r["tok"], r["t0"], r["t1"]
+        segs = segmenti_giapponesi(tok["seg"])
+        testi = ["".join(tok["o"][a:b]).replace("\n", " ").strip() for a, b in segs]
+        tt0 = [t0[a] for a, b in segs]
+        tt1 = [t1[b - 1] for a, b in segs]
+        p = self._parametri(self.ed_file.text().strip())
+        p["batch"] = False
+        self.b_traduci.setEnabled(False)
+        self.lb_stato.setText("Traduco {} segmenti in '{}'...".format(len(testi), lingua))
+        _STOP.clear()
+        t = TraduttoreBatch(p, [(testi, tt0, tt1)])
+        t.stato.connect(self.lb_stato.setText)
+        t.fatto.connect(self._traduci_solo_fatto)
+        t.finito.connect(lambda: self.b_traduci.setEnabled(True))
+        self._trad_solo = t
+        t.start()
+
+    def _traduci_solo_fatto(self, k, trad, avviso):
+        r = self.ultimo_ris
+        if not trad or not trad.get("righe") or r is None:
+            self.lb_stato.setText("Traduzione interrotta." if _STOP.is_set()
+                                  else "Traduzione non riuscita.{}".format(avviso or ""))
+            return
+        trad = allinea_traduzione(r["t0"], r["t1"], trad)
+        r["trad"] = trad
+        # cambia solo il riquadro Traduzione: trascrizione e hiragana non si toccano
+        testo_t, span_t = testo_righe(trad["righe"])
+        self._prog = True
+        self.out_trad.setPlainText(testo_t)
+        self._prog = False
+        self.trad_righe = list(trad["righe"])
+        self.t0_t, self.t1_t = list(trad["t0"]), list(trad["t1"])
+        self.ev_t.imposta(span_t)
+        self.c5.setVisible(bool(span_t))
+        self._sub_chiave = None
+        self._sub_set("")
+        self.aggiorna_pos(self.player.position())
+        self.lb_stato.setText("Traduzione fatta ({} righe).{} Premi 'Salva accanto' per scriverla nei file.".format(
+            len(trad["righe"]), avviso or ""))
 
     def copia_traduzione(self):
         QApplication.clipboard().setText(self.out_trad.toPlainText())
@@ -2630,10 +5502,16 @@ class Finestra(QWidget):
             QMessageBox.warning(self, "File mancante", "Scegli prima un file audio/video valido.")
             return
 
+        txt_trad = self.out_trad.toPlainText()
+        tr_ris = (self.ultimo_ris or {}).get("trad")
+        if (tr_ris and tr_ris.get("righe") and self.ev_t.attivo
+                and not tr_ris.get("num") and not tr_ris.get("fissa")):
+            # traduzione generata dal programma (riquadro senza prefissi): il file li ha comunque
+            txt_trad = traduzione_numerata(tr_ris)
         testi = [
             ("_trascrizione.txt", self.out.toPlainText()),
             ("_hiragana.txt", self.out_hira.toPlainText()),
-            ("_traduzione.txt", self.out_trad.toPlainText()),
+            ("_traduzione.txt", txt_trad),
         ]
 
         testi = [(suff, t) for suff, t in testi if t.strip()]
@@ -2671,12 +5549,74 @@ class Finestra(QWidget):
             ", ".join(os.path.basename(base + s) for s in nomi)
         ))
 
+    def salva_voce_musica(self):
+        audio = self.ed_file.text().strip()
+
+        if not audio or not os.path.isfile(audio):
+            QMessageBox.warning(self, "File mancante", "Scegli prima un file audio/video valido.")
+            return
+
+        if self._batch_attivo or (self.worker is not None and self.worker.isRunning()) \
+                or (self._stem is not None and self._stem.isRunning()):
+            QMessageBox.information(self, "Operazione in corso", "Attendi la fine dell'operazione in corso.")
+            return
+
+        base = os.path.splitext(audio)[0]
+        dest_voce, dest_musica = base + "_voce.wav", base + "_musica.wav"
+        esistenti = [os.path.basename(f) for f in (dest_voce, dest_musica) if os.path.exists(f)]
+
+        if esistenti:
+            r = QMessageBox.question(
+                self, "Sovrascrivere?",
+                "Esistono gia' questi file:\n" + "\n".join(esistenti) + "\nVuoi sovrascriverli?"
+            )
+            if r != QMessageBox.Yes:
+                return
+
+        self.b_salva_stem.setEnabled(False)
+        self.b_avvia.setEnabled(False)
+        self.barra.setRange(0, 0)
+
+        t = SeparatoreStem(audio, self.cb_sep.currentData() or "demucs",
+                           self.cb_device.currentText(), dest_voce, dest_musica)
+        t.stato.connect(self.lb_stato.setText)
+        t.fatto.connect(lambda err, d=os.path.dirname(audio), v=dest_voce, m=dest_musica:
+                        self._salva_voce_musica_fatto(err, d, v, m))
+        self._stem = t
+        t.start()
+
+    def _salva_voce_musica_fatto(self, err, cartella, dest_voce, dest_musica):
+        self.b_salva_stem.setEnabled(True)
+        self.b_avvia.setEnabled(True)
+        self.barra.setRange(0, 1)
+
+        if err:
+            self.lb_stato.setText("Separazione non riuscita.")
+            QMessageBox.critical(self, "Separazione voce/musica", err)
+            return
+
+        self.lb_stato.setText("Salvato in {}: {}, {}".format(
+            cartella, os.path.basename(dest_voce), os.path.basename(dest_musica)))
+
     def libera(self):
         libera_modello()
         self.lb_stato.setText("Modello scaricato dalla memoria.")
 
     def closeEvent(self, e):
+        self._tm_frame.stop()
+        self._ferma_frame()
+        self._batch_stop = True
+        self._batch_attivo = False
+        if self._batch_trad is not None:
+            self._batch_trad.fermo = True
+            self._batch_trad.wait(1500)
+        if self._trad_solo is not None and self._trad_solo.isRunning():
+            self._trad_solo.fermo = True
+            self._trad_solo.wait(1500)
+        if self._stem is not None and self._stem.isRunning():
+            self._stem.wait(1500)
         self._salva_impostazioni()
+        ferma_llamaserver()
         self._fullscreen(False)
         if self.cont_fs is not None:
             self.cont_fs.hide()
@@ -2696,6 +5636,7 @@ class Finestra(QWidget):
 
 
 if __name__ == "__main__":
+    log_hira("avvio hiraFF (diagnostica del caricamento file attiva)")
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     imposta_palette_scura(app)
