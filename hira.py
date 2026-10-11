@@ -21,6 +21,8 @@ python -m pip install faster-whisper PyQt5 pykakasi numpy sentencepiece
 import os
 import re
 import sys
+import faulthandler
+faulthandler.enable(all_threads=True)   # su segfault stampa lo stack Python (riga esatta del crash)
 import json
 import collections
 import csv
@@ -111,6 +113,7 @@ from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QLineEdit, QPushButton, QComboBox, QCheckBox, QDoubleSpinBox, QTextEdit,
+    QPlainTextEdit,
     QFileDialog, QProgressBar, QMessageBox, QFrame, QSlider, QSplitter,
     QScrollArea, QShortcut, QStyle, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
     QListWidget, QListWidgetItem, QAbstractItemView,
@@ -118,7 +121,7 @@ from PyQt5.QtWidgets import (
 
 
 MODELLI = [
-    "tiny",
+    "kotoba-tech/kotoba-whisper-v2.0-faster",
     "base",
     "small",
     "medium",
@@ -248,6 +251,31 @@ def cerca_musica_separata(path):
     all'audio, se esiste; None altrimenti."""
     m = os.path.splitext(path)[0] + "_musica.wav"
     return m if os.path.isfile(m) else None
+
+
+def cerca_mka_voce(path):
+    """Restituisce il <nome>.mka con lo stesso nome del file (creato in precedenza da
+    'Salva voce e musica' / esporta_mka, con le tracce 'Voce' e 'Musica'), se esiste."""
+    if os.path.splitext(path)[1].lower() == ".mka":
+        return None                      # il file caricato e' gia' il .mka
+    m = os.path.splitext(path)[0] + ".mka"
+    return m if os.path.isfile(m) else None
+
+
+def indice_traccia_voce_mka(mka):
+    """Indice (tra le sole tracce audio) della traccia intitolata 'Voce' nel .mka.
+    esporta_mka() mette la voce per prima: e' il ripiego se i titoli mancano o ffprobe fallisce."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream_tags=title", "-of", "json", mka],
+            stdin=subprocess.DEVNULL, capture_output=True, check=True)
+        for i, st in enumerate(json.loads(r.stdout.decode(errors="replace") or "{}").get("streams", [])):
+            if ((st.get("tags") or {}).get("title") or "").strip().lower() == "voce":
+                return i
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        pass
+    return 0
 
 
 def _nuovo_stem(dest, motore):
@@ -437,6 +465,57 @@ LM_CTX_CAR = 1200
 # modalita' 'un solo passaggio': gruppi piu' larghi (bastano ~8K di contesto)
 LM_CTX_RIGHE_1 = 40
 LM_CTX_CAR_1 = 1800
+
+# chiave "neutrale" per i prompt salvati quando il backend non dipende da un modello
+# specifico (NLLB, oppure LM Studio senza nome modello): e' una stringa vuota, che in
+# JSON non si puo' usare come chiave di un oggetto, quindi i prompt vengono salvati come
+# LISTA di coppie [nome_modello, prompt] e convertiti in dict al caricamento.
+PROMPT_CHIAVE_NEUTRA = ""
+
+
+def _prompt_chiave(tipo, modello_nome=""):
+    """Chiave con cui il prompt personalizzato viene associato al modello nel JSON.
+
+    - lmstudio     -> il nome modello digitato nel campo (es. "qwen2.5-7b-instruct")
+    - llamaserver  -> il basename del file GGUF scelto
+    - ollama       -> l'identificativo del modello (es. "translategemma:4b")
+    - nllb / altro -> PROMPT_CHIAVE_NEUTRA (un solo prompt condiviso)
+    Il confronto e' case-insensitive (la normalizzazione avviene qui)."""
+    nome = (modello_nome or "").strip().lower()
+    if tipo == "ollama":
+        return nome
+    if tipo in ("lmstudio", "llamaserver"):
+        return nome
+    return PROMPT_CHIAVE_NEUTRA
+
+
+def _prompt_coppie_a_dict(coppie):
+    """Converte la lista [[nome, prompt], ...] salvata nel JSON in un dict."""
+    d = {}
+    if isinstance(coppie, list):
+        for c in coppie:
+            if (isinstance(c, (list, tuple)) and len(c) == 2
+                    and isinstance(c[0], str) and isinstance(c[1], str)):
+                d[c[0].strip().lower()] = c[1]
+    elif isinstance(coppie, dict):      # retrocompatibilita' con eventuale formato a dict
+        for k, v in coppie.items():
+            if isinstance(k, str) and isinstance(v, str):
+                d[k.strip().lower()] = v
+    return d
+
+
+def _prompt_identificatore(cb_trad, ed_lm_modello, ed_ls_gguf):
+    """Identificativo del modello corrente per l'archivio dei prompt, leggendo la GUI."""
+    tipo = MODELLI_TRAD[cb_trad.currentIndex()][1]
+    if tipo == "ollama":
+        nome = MODELLI_TRAD[cb_trad.currentIndex()][2]
+    elif tipo == "lmstudio":
+        nome = ed_lm_modello.text().strip()
+    elif tipo == "llamaserver":
+        nome = os.path.basename(ed_ls_gguf.text().strip())
+    else:
+        nome = ""
+    return _prompt_chiave(tipo, nome)
 NLLB_FILE = ["model.bin", "config.json", "shared_vocabulary.*", "sentencepiece.bpe.model"]
 # lingue per TranslateGemma: (nome, codice)
 LINGUE_GEMMA = {
@@ -462,6 +541,7 @@ C_ROSSO = "#ff2a2a"       # punto di riproduzione sulla sinusoide dei dB (scherm
 SUB_CURRENT = "#ff2a2a"       # picco di rosso del kanji/token pronunciato in questo istante
 SUB_TRAD_CURRENT = "#00b0ff"  # azzurro intenso: parte della traduzione che corrisponde al token rosso
 SUB_TRAD = "#bfe3ff"          # traduzione non ancora illuminata
+SUB_ZOOM = 1.45               # ingrandimento del kanji/token pronunciato in quel momento (1.0 = nessuno)
 SUB_PASSI = 16                # a quanti passi si divide la durata di un token (ridisegni del colore)
 WAVE_SPAN = 8.0           # secondi visibili nella sinusoide
 WAVE_CYCLES = 3           # oscillazioni visibili in tutta la larghezza (era 18, poi 6: ora lunghezza d'onda sestupla dell'originale)
@@ -673,6 +753,28 @@ def libera_modello():
     _svuota_cache_gpu()
 
 
+# --- filtro anti-allucinazioni: Whisper a volte entra in un ciclo e ripete all'infinito lo stesso
+# carattere o la stessa frase ("ああああ..." per un minuto). Si riconoscono le ripetizioni
+# anomale e si riducono a una sola copia; se il segmento e' solo ripetizione viene scartato.
+_RE_LOOP_1 = re.compile(r"(.)\1{14,}", re.S)          # stesso carattere >= 15 volte di fila
+_RE_LOOP_N = re.compile(r"(.{2,12}?)\1{5,}", re.S)    # gruppo di 2-12 caratteri ripetuto >= 6 volte
+
+
+def filtra_ripetizioni(testo):
+    """Restituisce (testo_pulito, modificato). Riduce a una copia i cicli di ripetizione tipici
+    delle allucinazioni di Whisper; le allungate normali (fino a ~14 caratteri uguali, i risolini,
+    'ありがとう' ripetuto poche volte) non vengono toccate."""
+    if not testo:
+        return testo, False
+    t = testo
+    for _ in range(3):
+        nuovo = _RE_LOOP_N.sub(r"\1", _RE_LOOP_1.sub(r"\1", t))
+        if nuovo == t:
+            break
+        t = nuovo
+    return t, t != testo
+
+
 def log_hira(msg):
     """Messaggi diagnostici in console (stderr), con l'ora: servono a capire dove si ferma il caricamento di un file."""
     print("[hira %s] %s" % (time.strftime("%H:%M:%S"), msg), file=sys.stderr, flush=True)
@@ -857,7 +959,7 @@ def _u16_slice(s, a, b):
     return s.encode("utf-16-le")[2 * a:2 * b].decode("utf-16-le")
 
 
-def allinea_traduzione(t0, t1, trad):
+def allinea_traduzione(t0, t1, trad, seg=None):
     """Riallinea i tempi delle righe tradotte a quelli dei token giapponesi.
 
     Le righe nascono da un secondo passaggio di whisper con tempi propri (di solito
@@ -873,6 +975,22 @@ def allinea_traduzione(t0, t1, trad):
     n = len(ta)
     if n == 0 or not (len(tb) == n == len(trad["righe"])):
         return trad
+
+    # Traduzione nata riga per riga dai segmenti giapponesi (una riga tradotta per ogni riga di
+    # kanji): ogni riga usa i tempi della sua riga di kanji, dal primo all'ultimo token, cosi'
+    # compare insieme al giapponese e non prima.
+    if trad.get("per_segmento") and seg is not None and len(seg) == len(t0):
+        intervalli = segmenti_giapponesi(seg)
+        if len(intervalli) == n:
+            na, nb, prev = [], [], 0.0
+            for a, b in intervalli:
+                x = max(t0[a], prev)
+                na.append(x)
+                nb.append(max(t1[b - 1], x))
+                prev = x
+            out = dict(trad)
+            out["t0"], out["t1"] = na, nb
+            return out
 
     assegn = [[] for _ in range(n)]
     for j in range(len(t0)):
@@ -917,7 +1035,17 @@ def segmenti_giapponesi(seg):
 
 
 _RE_PREF_NUM = re.compile(
-    r"^\s*[\[\(\uff08\u3010\uff3b]\s*(\d+)\s*(?:[|:/\uff5c\uff1a]\s*[\d:.,]+\s*)?[\]\)\uff09\u3011\uff3d]\s*(.*)$")
+    r"^\s*[\[\(\uff08\u3010\uff3b]\s*(\d+)\s*"
+    r"(?:[|:/\uff5c\uff1a]\s*[\d:.,]+\s*(?:(?:->|-->|\u2192)\s*[\d:.,]+\s*)?)?"
+    r"[\]\)\uff09\u3011\uff3d]\s*(.*)$")
+_RE_PREF_TEMPI = re.compile(
+    r"^\s*[\[\(\uff08\u3010\uff3b]\s*\d+\s*[|:/\uff5c\uff1a]\s*([\d:.,]+)"
+    r"(?:\s*(?:->|-->|\u2192)\s*([\d:.,]+))?")
+
+
+def prefisso_tempi(k, a, b):
+    """Prefisso '[N|inizio -> fine]' (stesso aspetto dei timestamp della trascrizione)."""
+    return "[{}|{} -> {}] ".format(k, fmt_tempo(a), fmt_tempo(max(a, b)))
 
 
 def testo_numerato(tok, t0):
@@ -953,7 +1081,7 @@ def leggi_numerate_tempi(testo, n_seg):
     piene = [r for r in grezze if r.strip()]
     if not piene or sum(1 for r in piene if _RE_PREF_NUM.match(r)) < 0.6 * len(piene):
         return None
-    trovate, ultimo, scartate, tempi = {}, None, 0, {}
+    trovate, ultimo, scartate, tempi, fini = {}, None, 0, {}, {}
     for r in grezze:
         m = _RE_PREF_NUM.match(r)
         if m:
@@ -961,18 +1089,23 @@ def leggi_numerate_tempi(testo, n_seg):
             if 1 <= n <= n_seg and n not in trovate:
                 trovate[n] = m.group(2).strip()
                 ultimo = n
-                mt = re.match(r"^\s*[\[\(\uff08\u3010\uff3b]\s*\d+\s*[|:/\uff5c\uff1a]\s*([\d:.,]+)", r)
+                mt = _RE_PREF_TEMPI.match(r)
                 if mt:
                     v = parse_tempo(mt.group(1))
                     if v is not None:
                         tempi[n] = v
+                        if mt.group(2):
+                            f = parse_tempo(mt.group(2))
+                            if f is not None:
+                                fini[n] = f
             else:
                 scartate += 1
                 ultimo = None
         elif ultimo is not None and r.strip():
             trovate[ultimo] += " " + r.strip()
     return ([trovate.get(i, "") for i in range(1, n_seg + 1)], len(trovate), scartate,
-            [tempi.get(i) for i in range(1, n_seg + 1)])
+            [tempi.get(i) for i in range(1, n_seg + 1)],
+            [fini.get(i) for i in range(1, n_seg + 1)])
 
 
 def spans_riquadro_numerato(testo, n_seg):
@@ -1135,7 +1268,7 @@ def karaoke_espandi(d):
             tok_h.append(h)
             tok_seg.append(n)
 
-    out = {k: v for k, v in d.items() if k not in ("s", "tr", "trf", "trn")}
+    out = {k: v for k, v in d.items() if k not in ("s", "tr", "trf", "trn", "trp")}
     if d.get("tr"):
         out["trad"] = dict(
             righe=[e[0] for e in d["tr"]],
@@ -1146,8 +1279,10 @@ def karaoke_espandi(d):
             out["trad"]["fissa"] = True
         if d.get("trn"):
             out["trad"]["num"] = True
+        if d.get("trp"):
+            out["trad"]["per_segmento"] = True
     if out.get("trad"):
-        out["trad"] = allinea_traduzione(t0, t1, out["trad"])
+        out["trad"] = allinea_traduzione(t0, t1, out["trad"], tok_seg)
     out.update(
         orig="".join(orig), hira="".join(hira),
         span_o=span_o, span_h=span_h, t0=t0, t1=t1,
@@ -1184,6 +1319,8 @@ def karaoke_compatto(r):
             d["trf"] = 1
         if tr.get("num"):
             d["trn"] = 1
+        if tr.get("per_segmento"):
+            d["trp"] = 1
 
     # verifica: la ricostruzione deve riprodurre esattamente testi e intervalli
     try:
@@ -1249,11 +1386,11 @@ def scrivi_karaoke_json(r, media, percorso):
 
 
 def traduzione_numerata(trad):
-    """Traduzione come righe '[N|mm:ss.s] testo' (stesso formato di 'Copia con numeri'):
-    e' il formato dei file _traduzione.txt, con il tempo di inizio di ogni frase."""
+    """Traduzione come righe '[N|mm:ss.s -> mm:ss.s] testo': e' il formato dei file
+    _traduzione.txt, con inizio e fine di ogni frase (come i timestamp dei kanji)."""
     return "\n".join(
-        "[{}|{}] {}".format(k, fmt_tempo(a), " ".join(str(rg).split()))
-        for k, (rg, a) in enumerate(zip(trad["righe"], trad["t0"]), 1))
+        prefisso_tempi(k, a, b) + " ".join(str(rg).split())
+        for k, (rg, a, b) in enumerate(zip(trad["righe"], trad["t0"], trad["t1"]), 1))
 
 
 def salva_risultato(r, media):
@@ -1371,6 +1508,28 @@ def _prompt_plamo(lingua, testo):
         "<|plamo:op|>input lang=Japanese\n{}\n"
         "<|plamo:op|>output lang={}\n"
     ).format(testo.replace("\n", " "), t)
+
+
+def prompt_default(tipo, modello_nome="", lingua="it"):
+    """Template di default per il campo 'Prompt personalizzato', con {testo} e {lingua}.
+    Serve a pre-popolare il campo della GUI: l'utente puo' poi modificarlo. I segnaposto
+    riconosciuti dai backend sono {testo} (obbligatorio), {lingua}, {lingua_cod}."""
+    t = LINGUE_GEMMA.get(lingua, ("Italian", "it"))[0]
+    nome = (modello_nome or "").lower()
+    if tipo == "ollama" or "translategemma" in nome:
+        return _prompt_gemma(lingua if lingua in LINGUE_GEMMA else "it", "{testo}")
+    if "plamo" in nome:
+        return _prompt_plamo(lingua if lingua in LINGUE_GEMMA else "it", "{testo}")
+    if "cat-translate" in nome:
+        return "Translate the following Japanese text into {lingua}.\n\n{testo}"
+    if tipo in ("lmstudio", "llamaserver"):
+        return (
+            "You are a professional Japanese to {lingua} translator of song lyrics, subtitles "
+            "and dialogue. Translate the following line faithfully and naturally; the line may be "
+            "a sentence fragment, so keep its meaning and tone. Reply with ONLY the {lingua} "
+            "translation of the requested line: no quotes, no notes, no explanations.\n\n{testo}"
+        )
+    return ""
 
 
 # ---------------------------------------------------------------- llama-server (llama.cpp)
@@ -1546,7 +1705,7 @@ def _llama_avvia(cfg, stato=None):
     return _LLAMA["url"]
 
 
-def _traduci_llamaserver(testi, lingua, cfg, progresso=None, stato=None):
+def _traduci_llamaserver(testi, lingua, cfg, progresso=None, stato=None, prompt_template=""):
     if lingua not in LINGUE_GEMMA:
         raise ValueError("lingua '{}' non supportata".format(lingua))
     if not any(testi):
@@ -1557,7 +1716,7 @@ def _traduci_llamaserver(testi, lingua, cfg, progresso=None, stato=None):
     nome = os.path.splitext(os.path.basename(cfg["gguf"]))[0]
     return _traduci_lmstudio(testi, lingua, url, nome, progresso, stato,
                              contesto_completo=bool(cfg.get("contesto")), tutto=bool(cfg.get("tutto")),
-                             veloce=bool(cfg.get("veloce")))
+                             veloce=bool(cfg.get("veloce")), prompt_template=prompt_template)
 
 
 def _ollama_url():
@@ -1617,9 +1776,10 @@ def _ollama_assicura_modello(nome, stato=None):
         raise RuntimeError("download del modello {} non riuscito: {}".format(nome, e))
 
 
-def _traduci_ollama(testi, lingua, nome_modello, progresso=None, stato=None):
+def _traduci_ollama(testi, lingua, nome_modello, progresso=None, stato=None, prompt_template=""):
     """Traduce dal giapponese con TranslateGemma tramite Ollama, una riga per richiesta
-    (quindi l'allineamento con i tempi e' garantito). Nessun limite di richieste."""
+    (quindi l'allineamento con i tempi e' garantito). Nessun limite di richieste.
+    Con 'prompt_template' personalizzato (deve contenere {testo}) sostituisce il prompt interno."""
     if lingua not in LINGUE_GEMMA:
         raise ValueError("lingua '{}' non supportata".format(lingua))
     tgt, tgt_cod = LINGUE_GEMMA[lingua]
@@ -1630,13 +1790,20 @@ def _traduci_ollama(testi, lingua, nome_modello, progresso=None, stato=None):
 
     _ollama_assicura_modello(nome_modello, stato)
 
+    usa_template = bool(prompt_template and "{testo}" in prompt_template)
 
     for n, i in enumerate(da_fare, 1):
         if stato and n == 1:
             stato("Carico {} in Ollama (la prima richiesta puo' richiedere un po')...".format(nome_modello))
+        if usa_template:
+            p = (prompt_template.replace("{testo}", testi[i].replace("\n", " "))
+                                .replace("{lingua}", tgt)
+                                .replace("{lingua_cod}", tgt_cod))
+        else:
+            p = _prompt_gemma(lingua, testi[i])
         r = _ollama_json("/api/generate", dict(
             model=nome_modello,
-            prompt=_prompt_gemma(lingua, testi[i]),
+            prompt=p,
             stream=False,
             options=dict(temperature=0.0, num_predict=400),
         ), timeout=600)
@@ -2004,14 +2171,19 @@ def _traduci_lm_contesto(testi, lingua, base, modello, progresso=None, stato=Non
     return risultati
 
 
-def _traduci_lmstudio(testi, lingua, url, modello, progresso=None, stato=None, contesto=2, contesto_completo=False, tutto=False, veloce=False):
+def _traduci_lmstudio(testi, lingua, url, modello, progresso=None, stato=None, contesto=2, contesto_completo=False, tutto=False, veloce=False,
+                      prompt_template=""):
     """Traduce dal giapponese con un modello servito da LM Studio (API OpenAI), una riga per
     richiesta: l'allineamento con i tempi e' garantito. Con i modelli generici si passano
     anche le righe vicine come contesto (da non tradurre), utile per i versi spezzati;
-    con TranslateGemma si usa il suo prompt specifico, senza altro."""
+    con TranslateGemma si usa il suo prompt specifico, senza altro.
+    'prompt_template' (con {testo}, {lingua}, {lingua_cod}) sostituisce il prompt solo nel
+    percorso riga-per-riga: i metodi a gruppi hanno prompt strutturati che non possono essere
+    rimpiazzati senza rompere il riallineamento."""
     if lingua not in LINGUE_GEMMA:
         raise ValueError("lingua '{}' non supportata".format(lingua))
     tgt = LINGUE_GEMMA[lingua][0]
+    tgt_cod = LINGUE_GEMMA[lingua][1]
     risultati = ["" if not t else None for t in testi]
     da_fare = [i for i, t in enumerate(testi) if t]
     if not da_fare:
@@ -2031,8 +2203,11 @@ def _traduci_lmstudio(testi, lingua, url, modello, progresso=None, stato=None, c
         stato("Traduco con LM Studio ({})...".format(modello))
     gemma = "translategemma" in modello.lower()
     plamo = "plamo" in modello.lower()
+    # il template personalizzato vale solo per la traduzione riga per riga: se chiedi un
+    # metodo a gruppi ('un solo passaggio' o 'contesto completo') quelli restano interni
+    usa_template = bool(prompt_template and "{testo}" in prompt_template)
     _STAT_TRAD["metodo"] = "riga per riga"
-    if (contesto_completo or veloce) and not gemma and not plamo:
+    if (contesto_completo or veloce) and not gemma and not plamo and not usa_template:
         if veloce:
             _STAT_TRAD["metodo"] = "un solo passaggio (numerato)"
             return _traduci_lm_numerato(testi, lingua, base, modello, progresso, stato, tutto=tutto)
@@ -2048,13 +2223,18 @@ def _traduci_lmstudio(testi, lingua, url, modello, progresso=None, stato=None, c
 
     for n, i in enumerate(da_fare, 1):
         riga = testi[i].replace("\n", " ")
-        if plamo:
+        if usa_template:
+            u = (prompt_template.replace("{testo}", riga)
+                               .replace("{lingua}", tgt)
+                               .replace("{lingua_cod}", tgt_cod))
+            messaggi = [dict(role="user", content=u)]
+        elif plamo:
             out = _pulisci_lm(_lm_completion(base, modello, _prompt_plamo(lingua, riga), 400))
             risultati[i] = out or None
             if progresso:
                 progresso(n, len(da_fare))
             continue
-        if gemma:
+        elif gemma:
             messaggi = [dict(role="user", content=_prompt_gemma(lingua, riga))]
         else:
             prec = [testi[j].replace("\n", " ") for j in range(max(0, i - contesto), i) if testi[j]]
@@ -2083,22 +2263,25 @@ def _traduci_lmstudio(testi, lingua, url, modello, progresso=None, stato=None, c
     return risultati
 
 
-def traduci_locale(testi, lingua, device="auto", progresso=None, stato=None, modello=None, lm=None):
+def traduci_locale(testi, lingua, device="auto", progresso=None, stato=None, modello=None, lm=None,
+                   prompt_template=""):
     """Traduzione locale dal giapponese. 'modello' e' una voce di MODELLI_TRAD
     (nome, tipo, id): NLLB (CTranslate2) oppure TranslateGemma (Ollama).
+    'prompt_template', se contiene {testo}, sostituisce il prompt interno dei backend LLM
+    (NLLB non usa prompt testuali e lo ignora).
     Restituisce una lista lunga come 'testi' ("" per le righe vuote, None se senza risultato)."""
     nome, tipo, ident = modello or MODELLI_TRAD[0]
     _STAT_TRAD["modello"] = ident or nome
     _STAT_TRAD["metodo"] = {"nllb": "NLLB", "ollama": "riga per riga (Ollama)"}.get(tipo, tipo)
     if tipo == "llamaserver":
-        return _traduci_llamaserver(testi, lingua, lm or {}, progresso, stato)
+        return _traduci_llamaserver(testi, lingua, lm or {}, progresso, stato, prompt_template)
     if tipo == "lmstudio":
         lm = lm or {}
         return _traduci_lmstudio(testi, lingua, lm.get("url", ""), lm.get("modello", ""), progresso, stato,
                                  contesto_completo=bool(lm.get("contesto")), tutto=bool(lm.get("tutto")),
-                                 veloce=bool(lm.get("veloce")))
+                                 veloce=bool(lm.get("veloce")), prompt_template=prompt_template)
     if tipo == "ollama":
-        return _traduci_ollama(testi, lingua, ident, progresso, stato)
+        return _traduci_ollama(testi, lingua, ident, progresso, stato, prompt_template)
     return _traduci_nllb(testi, lingua, device, progresso, stato, repo=ident)
 
 
@@ -2132,6 +2315,95 @@ def _progresso_trad(p, stato):
     return f
 
 
+_FINE_FRASE = tuple("。！？!?…♪♫」』）)")
+
+
+def unisci_segmenti_per_traduzione(testi, tt0, tt1, gap_max=1.2, car_max=90, durata_max=14.0):
+    """Riunisce segmenti consecutivi che sembrano la stessa frase, prima di darli al traduttore.
+
+    Senza il filtro VAD "musica" Whisper spezza spesso le frasi in frammenti brevi e il modello
+    li traduce male. Un segmento si attacca al precedente se questo non finisce con una
+    punteggiatura di fine frase, se la pausa tra i due e' breve e il gruppo non diventa troppo
+    lungo. Le righe vuote restano separate. Restituisce (testi, t0, t1, gruppi): i tempi sono
+    quelli del primo e dell'ultimo segmento; 'gruppi' e' la lista, per ogni gruppo, degli indici
+    dei segmenti originali (serve a rimettere la traduzione una riga per segmento)."""
+    g_testi, g_t0, g_t1, gruppi = [], [], [], []
+    for n, (t, a, b) in enumerate(zip(testi, tt0, tt1)):
+        if g_testi and t and g_testi[-1]:
+            prec = g_testi[-1]
+            if (not prec.endswith(_FINE_FRASE)
+                    and a - g_t1[-1] <= gap_max
+                    and len(prec) + len(t) <= car_max
+                    and b - g_t0[-1] <= durata_max):
+                g_testi[-1] = prec + t
+                g_t1[-1] = b
+                gruppi[-1].append(n)
+                continue
+        g_testi.append(t)
+        g_t0.append(a)
+        g_t1.append(b)
+        gruppi.append([n])
+    return g_testi, g_t0, g_t1, gruppi
+
+
+_PUNT_TAGLIO = tuple(",;:.!?…—–、。，；：！？")
+
+
+def dividi_traduzione(testo, pesi, lingua):
+    """Divide la traduzione di una frase unita in tanti pezzi quanti sono i segmenti originali
+    (uno per peso). I tagli cadono sui confini di parola, in proporzione alla lunghezza del
+    giapponese di ciascun segmento, preferendo le punteggiature vicine al punto ideale.
+    E' un'approssimazione: l'ordine delle parole cambia da una lingua all'altra."""
+    n = len(pesi)
+    testo = (testo or "").strip()
+    if n <= 1:
+        return [testo]
+    unita = list(testo) if lingua == "zh" else re.findall(r"\S+\s*", testo)
+    if len(unita) < n:                       # troppo corta per tutti: un'unita' per segmento
+        return [u.strip() for u in unita] + [""] * (n - len(unita))
+    fine, pos = [], 0
+    for u in unita:
+        pos += len(u)
+        fine.append(pos)
+    totale = float(fine[-1]) or 1.0
+    somma = float(sum(pesi)) or 1.0
+    tagli, prec, cum = [], 0, 0.0
+    for k in range(n - 1):
+        cum += pesi[k]
+        bersaglio = cum / somma * totale
+        lo, hi = prec + 1, len(unita) - (n - 1 - k)     # ne restano almeno 1 per ogni pezzo rimasto
+        migliore, mig_d = lo, None
+        for c in range(lo, hi + 1):
+            d = abs(fine[c - 1] - bersaglio)
+            if unita[c - 1].rstrip()[-1:] in _PUNT_TAGLIO:
+                d -= 0.12 * totale                       # meglio tagliare dopo una virgola/punto
+            if mig_d is None or d < mig_d:
+                migliore, mig_d = c, d
+        tagli.append(migliore)
+        prec = migliore
+    pezzi, a = [], 0
+    for c in tagli + [len(unita)]:
+        pezzi.append("".join(unita[a:c]).strip())
+        a = c
+    return pezzi
+
+
+def espandi_traduzione_gruppi(righe_g, gruppi, testi_orig, lingua):
+    """Da una traduzione per gruppo a una traduzione per segmento originale (None se il gruppo
+    non e' stato tradotto)."""
+    out = [None] * len(testi_orig)
+    for r, idx in zip(righe_g, gruppi):
+        if r is None:
+            continue
+        if len(idx) == 1:
+            out[idx[0]] = r
+            continue
+        pezzi = dividi_traduzione(r, [max(1, len(testi_orig[i])) for i in idx], lingua)
+        for i, pz in zip(idx, pezzi):
+            out[i] = pz
+    return out
+
+
 def traduzione_segmenti(p, testi, tt0, tt1, stato=None):
     """Traduce i segmenti giapponesi con il modello scelto in 'p' (impostazioni del Worker).
     Restituisce (trad, avviso): 'trad' e' un dict(righe, t0, t1) con una riga per segmento,
@@ -2139,6 +2411,18 @@ def traduzione_segmenti(p, testi, tt0, tt1, stato=None):
     avviso, righe_tmp = "", None
     _STAT_TRAD.clear()
     testi = [pulisci_per_ai(t) for t in testi]
+    # il modello traduce meglio frasi intere: unisco i frammenti, traduco, poi rimetto la traduzione
+    # una riga per ogni segmento giapponese (altrimenti una riga tradotta coprirebbe due righe di kanji)
+    testi_o, tt0_o, tt1_o, gruppi = testi, tt0, tt1, None
+    # I modelli grossi (LM Studio, llama.cpp) ricevono gia' le righe vicine come contesto: unire i
+    # frammenti e poi rispezzare la traduzione in proporzione alla lunghezza del giapponese produce
+    # righe monche (es. un 'はい' di 0,3 s che riceve 'the'), quindi li lascio riga per riga.
+    tipo_mod = MODELLI_TRAD[min(max(int(p.get("trad_modello", 0)), 0), len(MODELLI_TRAD) - 1)][1]
+    if (p.get("unisci_frasi", tipo_mod not in ("lmstudio", "llamaserver"))
+            and len(testi) == len(tt0) == len(tt1)):
+        testi, tt0, tt1, gruppi = unisci_segmenti_per_traduzione(testi, list(tt0), list(tt1))
+        if len(testi) != len(testi_o):
+            log_hira("traduzione: unite %d righe in %d frasi" % (len(testi_o), len(testi)))
     try:
         righe_tmp = traduci_locale(
             testi, p["lingua"], p["device"],
@@ -2147,6 +2431,7 @@ def traduzione_segmenti(p, testi, tt0, tt1, stato=None):
                     tutto=p.get("lm_tutto", False), veloce=p.get("lm_veloce", True),
                     exe=p.get("ls_exe", ""), gguf=p.get("ls_gguf", ""), ctx=p.get("ls_ctx", ""),
                     ngl=p.get("ls_ngl", ""), extra=p.get("ls_extra", "")),
+            prompt_template=p.get("prompt_trad", ""),
             progresso=_progresso_trad(p, stato),
             stato=stato)
     except Interrotto:
@@ -2160,12 +2445,18 @@ def traduzione_segmenti(p, testi, tt0, tt1, stato=None):
         if not p.get("batch"):
             ferma_llamaserver()
 
+    if gruppi is not None:
+        if righe_tmp is not None:
+            righe_tmp = espandi_traduzione_gruppi(righe_tmp, gruppi, testi_o, p.get("lingua"))
+        testi, tt0, tt1 = testi_o, tt0_o, tt1_o      # da qui in poi una riga per segmento originale
+
     trad = None
     if righe_tmp is not None:
         richieste = [i for i, t in enumerate(testi) if t]
         ko = [i for i in richieste if righe_tmp[i] is None]
         if richieste and len(ko) < len(richieste):
-            trad = dict(righe=[r if r is not None else testi[i] for i, r in enumerate(righe_tmp)], t0=tt0, t1=tt1)
+            trad = dict(righe=[r if r is not None else testi[i] for i, r in enumerate(righe_tmp)], t0=tt0, t1=tt1,
+                        per_segmento=True)
             if ko:
                 avviso += " (traduzione: {} righe su {} senza risultato, lasciate in giapponese)".format(
                     len(ko), len(richieste))
@@ -2292,11 +2583,13 @@ class Worker(QThread):
                 if _cache["model"] is not None:
                     libera_whisper()
 
+                log_hira("whisper: carico %s su %s/%s" % (p["modello"], device, compute_type))
                 model = WhisperModel(
                     p["modello"],
                     device=device,
                     compute_type=compute_type,
                 )
+                log_hira("whisper: modello caricato")
 
                 _cache["key"] = key
                 _cache["model"] = model
@@ -2445,7 +2738,51 @@ class Worker(QThread):
             voce_persistente = None
             musica_persistente = None
             avviso_pre = ""
-            if p.get("demucs"):
+
+            # Spunta "usa il .mka": la voce isolata e' gia' nella traccia 'Voce' di <nome>.mka
+            # (creato in precedenza): la si estrae e si salta del tutto la separazione.
+            mka_ok = False
+            if p.get("usa_mka"):
+                mka = cerca_mka_voce(p["file"])
+                if not mka:
+                    avviso_pre = " (nessun file .mka con lo stesso nome accanto all'audio)"
+                    self.stato.emit("Nessun .mka con lo stesso nome: proseguo senza.")
+                else:
+                    tmp2 = None
+                    try:
+                        idx = indice_traccia_voce_mka(mka)
+                        self.stato.emit("Uso la traccia Voce di {} (niente separazione)...".format(
+                            os.path.basename(mka)))
+                        tmp2 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+                        cmd = ["ffmpeg", "-y", "-v", "error"]
+                        if p["inizio"] > 0:
+                            cmd += ["-ss", str(p["inizio"])]
+                        cmd += ["-i", mka]
+                        if p["fine"] > p["inizio"]:
+                            cmd += ["-t", str(p["fine"] - p["inizio"])]
+                        cmd += ["-map", "0:a:%d" % idx, "-ar", "16000", "-ac", "1", tmp2]
+                        subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, capture_output=True)
+                        if tmp and os.path.exists(tmp):
+                            try:
+                                os.remove(tmp)
+                            except OSError:
+                                pass
+                        tmp = tmp2           # va ripulito alla fine
+                        path = tmp2
+                        voce_isolata = True
+                        mka_ok = True
+                        log_hira("whisper: uso la traccia Voce #%d di %s" % (idx, mka))
+                    except Exception as e:
+                        if tmp2 and os.path.exists(tmp2):
+                            try:
+                                os.remove(tmp2)
+                            except OSError:
+                                pass
+                        det = (getattr(e, "stderr", b"") or b"")
+                        det = det.decode(errors="replace").strip()[-200:] if isinstance(det, bytes) else str(e)
+                        avviso_pre = " (traccia Voce del .mka non utilizzabile: {})".format(det or e)
+
+            if p.get("demucs") and not mka_ok:
                 motore = p.get("separatore") or "demucs"
                 nome_sep = nome_separatore(motore)
                 riuso = p.get("riusa_voce", True)
@@ -2529,6 +2866,18 @@ class Worker(QThread):
 
             use_words = bool(p["parole"])
 
+            # Kotoba e i modelli distillati hanno un decoder di soli 2 layer: il calcolo dei tempi
+            # per parola di faster-whisper (find_alignment) usa "alignment heads" pensate per il
+            # modello completo e puo' mandare in segfault CTranslate2 (non intercettabile con
+            # try/except). Con questi modelli si resta ai tempi per segmento.
+            _nome_mod = str(p["modello"]).lower()
+            if use_words and ("kotoba" in _nome_mod or "distil" in _nome_mod):
+                use_words = False
+                log_hira("whisper: tempi per parola disattivati con %s (crash noto in find_alignment); "
+                         "uso i tempi per segmento. Per il karaoke per parola usa large-v3." % p["modello"])
+                self.stato.emit("Con Kotoba i tempi per parola non sono affidabili: uso i tempi per segmento "
+                                "(per il karaoke per parola scegli large-v3).")
+
             # Lingua diversa dal giapponese + "doppio passaggio": il testo giapponese
             # (kanji + hiragana, con tempi per parola) si ricava con un passaggio in
             # giapponese; il testo nella lingua scelta (es. italiano) con un secondo.
@@ -2538,7 +2887,7 @@ class Worker(QThread):
             # Musica (anche con voce isolata): il filtro VAD e le soglie "no speech" / compressione
             # scartano spesso i testi cantati, quindi si rilassano; con la voce isolata il VAD resta
             # attivo ma piu' sensibile, con la musica ancora presente viene disattivato.
-            musica = bool(p.get("musica")) or bool(p.get("demucs"))
+            musica = bool(p.get("musica")) or bool(p.get("demucs")) or mka_ok
 
             def _opzioni(lang, con_prompt, musica_forzata=None, task="transcribe"):
                 musica_eff = musica if musica_forzata is None else bool(musica_forzata)
@@ -2553,6 +2902,19 @@ class Worker(QThread):
                     temperature=0.0,
                     compression_ratio_threshold=2.0,
                 )
+                # Kotoba-whisper (e i modelli distillati in genere) e' addestrato su finestre da
+                # ~15 s: con le finestre da 30 s di default trascrive peggio. chunk_length esiste
+                # solo nelle versioni recenti di faster-whisper, quindi lo passo solo se supportato.
+                if "kotoba" in p["modello"].lower() or "distil" in p["modello"].lower():
+                    try:
+                        import inspect
+                        if "chunk_length" in inspect.signature(model.transcribe).parameters:
+                            o["chunk_length"] = 15
+                        else:
+                            log_hira("whisper: questa versione di faster-whisper non supporta "
+                                     "chunk_length (aggiornala con: pip install -U faster-whisper)")
+                    except (TypeError, ValueError):
+                        pass
                 if musica_eff:
                     o.update(
                         no_speech_threshold=None,
@@ -2567,6 +2929,7 @@ class Worker(QThread):
                 return o
 
             def _consume(lang, word_timestamps, con_prompt=True, musica_forzata=None, task="transcribe"):
+                log_hira("whisper: avvio trascrizione (parole=%s, lingua=%s)" % (word_timestamps, lang))
                 segments_iter, info = model.transcribe(
                     path,
                     word_timestamps=word_timestamps,
@@ -2619,9 +2982,20 @@ class Worker(QThread):
 
             segmenti = []
             precedente = None
+            n_ripetuti = 0
 
             for seg in raw_segments:
                 testo = (getattr(seg, "text", "") or "").strip()
+
+                # ciclo di ripetizione (allucinazione): lo riduco; se resta quasi nulla scarto il segmento
+                modificato = False
+                if testo and p.get("filtro_ripetizioni", True):
+                    pulito, modificato = filtra_ripetizioni(testo)
+                    if modificato:
+                        n_ripetuti += 1
+                        testo = pulito.strip()
+                        if len(testo) <= 3:
+                            testo = ""
 
                 if not testo or testo == precedente:
                     continue
@@ -2633,6 +3007,11 @@ class Worker(QThread):
 
                 toks = []
                 words = getattr(seg, "words", None)
+                if modificato:
+                    # il testo non corrisponde piu' alle parole originali e la durata del segmento
+                    # era gonfiata dal ciclo: tempi ridistribuiti su una durata plausibile
+                    words = None
+                    s1 = min(s1, s0 + max(1.5, 0.4 * len(testo)))
 
                 if use_words and words:
                     for i, w in enumerate(words):
@@ -2657,6 +3036,10 @@ class Worker(QThread):
                     toks = [(testo, testo, s0, s1)]
 
                 segmenti.append((s0, s1, toks))
+
+            if n_ripetuti:
+                log_hira("whisper: %d segmenti con ripetizioni anomale corretti o scartati" % n_ripetuti)
+                avviso += " ({} segmenti con ripetizioni anomale corretti o scartati)".format(n_ripetuti)
 
             prev = 0.0
             for n, (s0, s1, toks) in enumerate(segmenti):
@@ -2694,8 +3077,10 @@ class Worker(QThread):
             da_tradurre = None
             if doppio and segmenti:
                 testi_da_tradurre = ["".join(tok[0] for tok in toks).strip() for _, _, toks in segmenti]
-                tt0 = [s[0] for s in segmenti]
-                tt1 = [s[1] for s in segmenti]
+                # tempi della traduzione = tempi dei token giapponesi (dal primo all'ultimo), non quelli
+                # del segmento Whisper: quelli iniziano spesso molto prima della prima parola cantata
+                tt0 = [(toks[0][2] if toks else s0) for s0, s1, toks in segmenti]
+                tt1 = [(max(toks[-1][3], toks[0][2]) if toks else s1) for s0, s1, toks in segmenti]
 
                 if p.get("solo_trascrizione"):
                     # batch a due fasi: le traduzioni si fanno dopo, per tutti i file insieme
@@ -2753,7 +3138,13 @@ class Worker(QThread):
                     pos_h += l16(sep)
 
                 if p["timestamp"]:
-                    et = "[{} -> {}] ".format(fmt_tempo(s0), fmt_tempo(s1))
+                    # tempi del primo e dell'ultimo token (gli stessi del _karaoke.json), non i confini del
+                    # segmento Whisper: cosi' il testo con timestamp coincide con quando appaiono i kanji
+                    if toks:
+                        t_ini, t_fin = toks[0][2], max(toks[-1][3], toks[0][2])
+                    else:
+                        t_ini, t_fin = s0, s1
+                    et = "[{} -> {}] ".format(fmt_tempo(t_ini), fmt_tempo(t_fin))
                     po.append(et)
                     ph.append(et)
                     pos_o += l16(et)
@@ -2784,7 +3175,7 @@ class Worker(QThread):
                 avviso=avviso,
                 da_tradurre=da_tradurre,
                 tok=dict(o=tok_o, h=tok_h, seg=tok_seg),
-                trad=allinea_traduzione([t[0] for t in tempi], [t[1] for t in tempi], trad),
+                trad=allinea_traduzione([t[0] for t in tempi], [t[1] for t in tempi], trad, tok_seg),
                 # tracce pulite prodotte/salvate da questa trascrizione: la voce (e la musica)
                 # sono gia' accanto all'audio come <nome>_voce.wav / <nome>_musica.wav, percio'
                 # 'Salva voce e musica' e l'export .mka non devono rifare la separazione
@@ -3384,8 +3775,9 @@ class VideoSchermo(QGraphicsView):
         chiave = (self._sub_html, larg, px)
 
         if self._sub_cache is None or self._sub_cache[0] != chiave:
-            nero = re.sub(r"color:\s*#[0-9a-fA-F]{6}", "color:#000000", self._sub_html)
-            self._sub_cache = (chiave, self._doc(self._sub_html, larg, px),
+            html = self._sub_html.replace("@@ZOOM@@", str(max(px, int(px * SUB_ZOOM))))
+            nero = re.sub(r"color:\s*#[0-9a-fA-F]{6}", "color:#000000", html)
+            self._sub_cache = (chiave, self._doc(html, larg, px),
                                self._doc(nero, larg, px))
 
         _, doc, doc_nero = self._sub_cache
@@ -3703,6 +4095,39 @@ class Finestra(QWidget):
         rt.addStretch(2)
         l1.addLayout(rt)
 
+        # --- prompt personalizzato per i backend LLM (LM Studio / llama.cpp / Ollama)
+        rp = QHBoxLayout()
+        self.lb_prompt_trad = QLabel("Prompt personalizzato")
+        self.b_prompt_trad_default = QPushButton("Default")
+        self.b_prompt_trad_default.setToolTip(
+            "Popola il campo con il template predefinito per il backend scelto.\n"
+            "Segnaposto: {testo} (obbligatorio), {lingua}, {lingua_cod}.\n"
+            "Se il campo resta vuoto si usa il prompt interno del backend.")
+        self.b_prompt_trad_default.clicked.connect(self._prompt_trad_default)
+        rp.addWidget(self.lb_prompt_trad)
+        rp.addStretch(1)
+        rp.addWidget(self.b_prompt_trad_default)
+        l1.addLayout(rp)
+
+        # archivio dei prompt personalizzati: chiave = identificativo del modello
+        # (nome LM Studio / GGUF / modello Ollama), valore = testo del prompt.
+        self._prompt_per_modello = {}
+        # ultima chiave associata al contenuto attuale del campo: serve a spostare il
+        # prompt quando cambia il nome del modello o si sceglie un altro backend
+        self._prompt_chiave_corrente = None
+
+        self.ed_prompt_trad = QPlainTextEdit()
+        self.ed_prompt_trad.setPlaceholderText(
+            "Vuoto = prompt interno del backend. Es. per CAT-Translate:\n"
+            "Translate the following Japanese text into {lingua}.\n\n{testo}")
+        self.ed_prompt_trad.setToolTip(
+            "Sostituisce il prompt inviato al modello, nella traduzione riga per riga.\n"
+            "Deve contenere {testo}; puoi usare anche {lingua} (nome) e {lingua_cod} (codice).\n"
+            "Non si applica a NLLB (che non usa prompt) ne' ai metodi a gruppi di LM Studio\n"
+            "('un solo passaggio' / 'contesto completo'), che hanno prompt numerati interni.")
+        self.ed_prompt_trad.setFixedHeight(90)
+        l1.addWidget(self.ed_prompt_trad)
+
         rl = QHBoxLayout()
         self.lb_lm = QLabel("LM Studio")
         self.ed_lm_url = QLineEdit(LM_URL_PREDEFINITO)
@@ -3786,7 +4211,14 @@ class Finestra(QWidget):
         rc.addWidget(self.ed_ls_ngl, 1)
         rc.addWidget(self.ed_ls_extra, 3)
         l1.addLayout(rc)
-        self.cb_trad.currentIndexChanged.connect(self._trad_ui)
+        # al cambio di modello di traduzione il campo prompt personalizzato viene
+        # salvato nell'archivio per-modello e sostituito con il prompt dell'altro
+        # modello (se presente); _trad_ui fa anche l'abilitazione dei campi
+        self.cb_trad.currentIndexChanged.connect(self._cambio_trad_modello)
+        # il nome del modello LM Studio fa parte della chiave dell'archivio prompt:
+        # quando cambia, spostiamo il prompt sotto la nuova chiave
+        self.ed_lm_modello.editingFinished.connect(self._cambio_chiave_prompt)
+        self.ed_ls_gguf.textChanged.connect(self._cambio_chiave_prompt)
         self._trad_ui()
 
         self.ck_musica = QCheckBox(
@@ -3805,6 +4237,23 @@ class Finestra(QWidget):
             "BS-RoFormer: python -m pip install \"audio-separator[gpu]\"  (o [cpu])\n"
             "Se il motore non e' disponibile si usa l'audio originale. Implica le impostazioni 'musica'.")
         l1.addWidget(self.ck_demucs)
+
+        self.ck_usa_mka = QCheckBox(
+            "Usa la traccia Voce del .mka con lo stesso nome (salta la separazione)")
+        self.ck_usa_mka.setToolTip(
+            "Se accanto al file c'e' <nome>.mka (creato con 'Salva voce e musica' / esportazione .mka),\n"
+            "trascrive la sua traccia 'Voce' senza rifare la separazione con Demucs/BS-RoFormer.\n"
+            "Se il .mka non esiste si prosegue come se la spunta fosse disattiva (separando la voce\n"
+            "solo se e' attiva anche 'Isola prima la voce'). Implica le impostazioni 'musica'.")
+        l1.addWidget(self.ck_usa_mka)
+
+        self.ck_filtro_rip = QCheckBox("Filtro anti-ripetizioni (allucinazioni di Whisper)")
+        self.ck_filtro_rip.setChecked(True)
+        self.ck_filtro_rip.setToolTip(
+            "Riduce o scarta i segmenti in cui Whisper entra in un ciclo e ripete all'infinito lo\n"
+            "stesso carattere o la stessa frase (es. 'ああああ...' per un minuto).\n"
+            "Toglilo se vuoi la trascrizione grezza, senza alcuna correzione.")
+        l1.addWidget(self.ck_filtro_rip)
 
         rs = QHBoxLayout()
         self.lb_sep = QLabel("Motore di separazione")
@@ -4182,6 +4631,11 @@ class Finestra(QWidget):
 
         self.ultima_cartella = ""
         self._carica_impostazioni()
+        # senza config (primo avvio o JSON non valido) la chiave corrente non e' stata
+        # impostata: senza questo i prompt non verrebbero mai salvati nella sessione
+        if self._prompt_chiave_corrente is None:
+            self._prompt_chiave_corrente = _prompt_identificatore(
+                self.cb_trad, self.ed_lm_modello, self.ed_ls_gguf)
         # dopo il caricamento della configurazione i campi llama-server possono essere
         # stati popolati ma restare grigi: riappliciamo lo stato di abilitazione
         # (con la lingua salvata "giapponese" cb_trad risulta disabilitato e _trad_ui
@@ -4190,6 +4644,11 @@ class Finestra(QWidget):
 
     # ------------------------------------------------------------ impostazioni
     def _impostazioni(self):
+        # se siamo nel pieno di un caricamento della configurazione il campo prompt
+        # contiene ancora il testo del modello precedente: non va associato alla
+        # nuova chiave (lo fara' _carica_impostazioni alla fine)
+        if not getattr(self, "_no_touch", False):
+            self._prompt_salva_corrente()
         return dict(
             modello=self.cb_modello.currentText(),
             lingua=LINGUE[self.cb_lingua.currentIndex()][1] or "auto",
@@ -4201,6 +4660,8 @@ class Finestra(QWidget):
             doppio=self.ck_doppio.isChecked(),
             musica=self.ck_musica.isChecked(),
             demucs=self.ck_demucs.isChecked(),
+            usa_mka=self.ck_usa_mka.isChecked(),
+            filtro_ripetizioni=self.ck_filtro_rip.isChecked(),
             separatore=self.cb_sep.currentData(),
             batch_salta=self.ck_salta.isChecked(),
             trad_modello=self.cb_trad.currentIndex(),
@@ -4215,6 +4676,12 @@ class Finestra(QWidget):
             ls_ctx=self.ed_ls_ctx.text().strip(),
             ls_ngl=self.ed_ls_ngl.text().strip(),
             ls_extra=self.ed_ls_extra.text().strip(),
+            prompt_trad=self.ed_prompt_trad.toPlainText(),
+            # archivio dei prompt personalizzati indicizzato per modello: lista di
+            # coppie [chiave, testo] (la chiave puo' essere "" per i backend che non
+            # dipendono da un modello specifico; in JSON le chiavi "" non possono
+            # stare in un oggetto, quindi si usa la lista)
+            prompt_per_modello=[[k, v] for k, v in sorted(self._prompt_per_modello.items())],
             prompt_iniziale=self.ed_prompt.text(),
             sottotitoli=self.cb_sub.currentIndex(),
             velocita=self.cb_vel.currentText(),
@@ -4224,6 +4691,10 @@ class Finestra(QWidget):
         )
 
     def _salva_impostazioni(self):
+        # il campo prompt puo' essere stato modificato senza che sia cambiato il
+        # backend o il nome modello: prima di scrivere il JSON lo associamo alla
+        # chiave del modello corrente cosi' l'archivio per-modello e' aggiornato
+        self._prompt_salva_corrente()
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
                 json.dump(self._impostazioni(), fh, ensure_ascii=False, indent=2)
@@ -4232,11 +4703,23 @@ class Finestra(QWidget):
 
     def _carica_impostazioni(self):
         try:
+            self._carica_impostazioni_interno()
+        finally:
+            self._no_touch = False      # mai lasciarlo bloccato se il caricamento fallisce
+
+    def _carica_impostazioni_interno(self):
+        # durante il popolamento dei campi i segnali textChanged/currentIndexChanged
+        # non devono spostare i prompt nell'archivio (la chiave "corrente" viene
+        # impostata una volta sola alla fine, quando tutti i campi sono compilati)
+        self._no_touch = True
+        try:
             with open(CONFIG_FILE, encoding="utf-8") as fh:
                 d = json.load(fh)
         except (OSError, ValueError):
+            self._no_touch = False
             return
         if not isinstance(d, dict):
+            self._no_touch = False
             return
 
         def combo(cb, valore):
@@ -4275,7 +4758,8 @@ class Finestra(QWidget):
         for ck, k in ((self.ck_timestamp, "timestamp"), (self.ck_acapo, "a_capo"),
                       (self.ck_parole, "parole"), (self.ck_prefisso, "prefisso"),
                       (self.ck_doppio, "doppio"), (self.ck_musica, "musica"),
-                      (self.ck_demucs, "demucs"), (self.ck_salta, "batch_salta"),
+                      (self.ck_demucs, "demucs"), (self.ck_usa_mka, "usa_mka"), (self.ck_filtro_rip, "filtro_ripetizioni"),
+                      (self.ck_salta, "batch_salta"),
                       (self.ck_lm_ctx, "lm_contesto"),
                       (self.ck_lm_tutto, "lm_tutto"),
                       (self.ck_lm_veloce, "lm_veloce"),
@@ -4283,6 +4767,17 @@ class Finestra(QWidget):
             spunta(ck, k)
         if isinstance(d.get("prompt_iniziale"), str):
             self.ed_prompt.setText(d["prompt_iniziale"])
+        # archivio prompt per-modello: va caricato DOPO cb_trad / lm_modello / ls_gguf,
+        #che ne determinano la chiave; se assente (vecchie versioni) si usa il campo
+        # "prompt_trad" e lo si associa alla chiave del modello corrente
+        pmm = _prompt_coppie_a_dict(d.get("prompt_per_modello"))
+        if not pmm and isinstance(d.get("prompt_trad"), str) and d["prompt_trad"].strip():
+            pmm[_prompt_identificatore(self.cb_trad, self.ed_lm_modello,
+                                       self.ed_ls_gguf)] = d["prompt_trad"]
+        self._prompt_per_modello = pmm
+        chiavi = _prompt_identificatore(self.cb_trad, self.ed_lm_modello, self.ed_ls_gguf)
+        self._prompt_chiave_corrente = chiavi
+        self.ed_prompt_trad.setPlainText(pmm.get(chiavi, ""))
         sub = d.get("sottotitoli")
         if isinstance(sub, int) and 0 <= sub < self.cb_sub.count():
             self.cb_sub.setCurrentIndex(sub)
@@ -4297,6 +4792,8 @@ class Finestra(QWidget):
                 and fin[0] >= 400 and fin[1] >= 300):
             scr = QApplication.primaryScreen().availableGeometry()
             self.resize(min(fin[0], scr.width()), min(fin[1], scr.height()))
+        # caricamento completato: ora i segnali dei campi possono aggiornare l'archivio
+        self._no_touch = False
 
     # ------------------------------------------------------------------ file
     def dragEnterEvent(self, e):
@@ -4611,17 +5108,41 @@ class Finestra(QWidget):
                 c1 -= 1
         return c0, c1
 
-    def _html_trad(self, testo, cut, c1=None, passo=None):
-        if c1 is not None and passo is not None:
-            parti = ((testo[:cut], C_SPOKEN),
-                     (testo[cut:c1], self._colore_traduzione(passo)),
-                     (testo[c1:], SUB_TRAD))
-        else:
-            parti = ((testo[:cut], C_SPOKEN), (testo[cut:], SUB_TRAD))
-        out = ""
-        for frag, col in parti:
-            if frag:
-                out += '<span style="color:%s;">%s</span>' % (col, escape(frag))
+    TRAD_CODA = ((1, 0.55), (2, 0.2))   # lettere appena superate: (distanza, quanto restano azzurre)
+
+    def _lettera_trad(self, i, t):
+        """Indice della lettera della riga tradotta i raggiunta al tempo t: avanza lettera per lettera
+        seguendo il giapponese cantato; len(testo) = riga finita. Gli spazi si saltano."""
+        testo = self.trad_righe[i]
+        n = len(testo)
+        if n == 0 or t >= self.t1_t[i]:
+            return n
+        h = min(n - 1, int(self._frazione_trad(i, t) * n))
+        while h < n and testo[h].isspace():
+            h += 1
+        return h if h < n else n
+
+    def _html_trad(self, testo, h):
+        """Traduzione con la sola lettera h in azzurro intenso (e una breve scia che sfuma sulle 2
+        precedenti); prima e' del colore delle parole pronunciate, dopo di quello non ancora illuminato."""
+        n = len(testo)
+        colori = {}
+        if h < n:                 # riga finita: tutto uguale, niente lettera illuminata
+            colori[h] = SUB_TRAD_CURRENT
+            for dist, forza in self.TRAD_CODA:
+                colori[h - dist] = self._mix(C_SPOKEN, SUB_TRAD_CURRENT, forza)
+        colori = {j: c for j, c in colori.items() if 0 <= j < n and not testo[j].isspace()}
+        out, j = "", 0
+        while j < n:
+            if j in colori:
+                out += '<span style="color:%s;">%s</span>' % (colori[j], escape(testo[j]))
+                j += 1
+                continue
+            col = C_SPOKEN if j < h else SUB_TRAD
+            f = j
+            while j < n and j not in colori and (C_SPOKEN if j < h else SUB_TRAD) == col:
+                j += 1
+            out += '<span style="color:%s;">%s</span>' % (col, escape(testo[f:j]))
         return '<div style="white-space: pre-wrap;">%s</div>' % out
 
     def _html_riga(self, tok, a, b, idx, in_corso, corrente=None):
@@ -4634,8 +5155,16 @@ class Finestra(QWidget):
                 col = C_SPOKEN
             else:
                 col = "#ffffff"
-            out.append('<span style="color:%s;">%s</span>' % (col, tx))
-        return '<div style="white-space: pre-wrap;">%s</div>' % "".join(out)
+            if i == idx and corrente and SUB_ZOOM > 1.0:
+                # token in riproduzione: piu' grande, come nei karaoke (@@ZOOM@@ lo sostituisce
+                # VideoSchermo con i pixel reali, che dipendono dalla dimensione dello schermo)
+                out.append('<span style="color:%s;font-size:@@ZOOM@@px;">%s</span>' % (col, tx))
+            else:
+                out.append('<span style="color:%s;">%s</span>' % (col, tx))
+        # carattere invisibile con la stessa dimensione dello zoom: tiene fissa l'altezza della riga,
+        # cosi' i sottotitoli non "saltano" quando il token ingrandito compare e scompare
+        riserva = '<span style="font-size:@@ZOOM@@px;">&#8203;</span>' if SUB_ZOOM > 1.0 else ""
+        return '<div style="white-space: pre-wrap;">%s%s</div>' % (riserva, "".join(out))
 
     def _aggiorna_sub(self, t):
         if not self.tok_sub or not self.t0:
@@ -4662,14 +5191,7 @@ class Finestra(QWidget):
         if mostra_tr:
             it = bisect_right(self.t0_t, t) - 1
             if it >= 0 and t <= self.t1_t[it] + 1.5:
-                n_car = len(self.trad_righe[it])
-                c0 = c1 = 0
-                if k_c is not None:
-                    c0, c1 = self._intervallo_trad(it, k_c[0])
-                if c1 > c0:
-                    chiave_tr = (it, c0, c1)      # tratto azzurro = dove i kanji sono rossi
-                else:
-                    chiave_tr = (it, int(round(n_car * self._frazione_trad(it, t))), None)
+                chiave_tr = (it, self._lettera_trad(it, t))   # lettera azzurra = punto raggiunto dal canto
 
         chiave = None
         if chiave_jp is not None or chiave_tr is not None:
@@ -4692,11 +5214,7 @@ class Finestra(QWidget):
             if m in (0, 2, 4):
                 righe.append(self._html_riga(self.tok_sub["h"], a, b, idx, in_corso, corrente))
         if chiave_tr is not None:
-            if chiave_tr[2] is not None and k_c:
-                righe.append(self._html_trad(self.trad_righe[chiave_tr[0]], chiave_tr[1],
-                                             chiave_tr[2], k_c[1]))
-            else:
-                righe.append(self._html_trad(self.trad_righe[chiave_tr[0]], chiave_tr[1]))
+            righe.append(self._html_trad(self.trad_righe[chiave_tr[0]], chiave_tr[1]))
         self._sub_set("".join(righe))
 
     @staticmethod
@@ -4874,8 +5392,11 @@ class Finestra(QWidget):
             ls_ctx=self.ed_ls_ctx.text().strip(),
             ls_ngl=self.ed_ls_ngl.text().strip(),
             ls_extra=self.ed_ls_extra.text().strip(),
+            prompt_trad=self.ed_prompt_trad.toPlainText().strip(),
             musica=self.ck_musica.isChecked(),
             demucs=self.ck_demucs.isChecked(),
+            usa_mka=self.ck_usa_mka.isChecked(),
+            filtro_ripetizioni=self.ck_filtro_rip.isChecked(),
             separatore=self.cb_sep.currentData(),
             prompt_iniziale=self.ed_prompt.text().strip(),
         )
@@ -5152,7 +5673,7 @@ class Finestra(QWidget):
         lav["fatto"] = True
         it = self.lst_batch.item(lav["i"])
         r = lav["r"]
-        r["trad"] = allinea_traduzione(r["t0"], r["t1"], trad)
+        r["trad"] = allinea_traduzione(r["t0"], r["t1"], trad, (r.get("tok") or {}).get("seg"))
         r["avviso"] = (r.get("avviso", "") + avviso)
         try:
             salva_risultato(r, lav["path"])
@@ -5275,7 +5796,64 @@ class Finestra(QWidget):
         self.ck_doppio.setEnabled(cod not in (None, "ja"))
         self.cb_trad.setEnabled(cod not in (None, "ja"))
         self.lb_trad.setEnabled(cod not in (None, "ja"))
+        # se la lingua e' il giapponese non c'e' nulla da tradurre: il menu cb_trad viene
+        # spento e di conseguenza anche i suoi campi restano spenti finche' non scegli
+        # una lingua diversa; li riaccendiamo quando 'auto' o una lingua di traduzione
+        if cod not in (None, "ja"):
+            self._trad_ui()
+
+    def _prompt_salva_corrente(self, chiave=None):
+        """Memorizza il contenuto del campo 'Prompt personalizzato' nell'archivio.
+        Senza 'chiave' usa quella del modello attualmente selezionato nella GUI; nei
+        cambi di modello va passata la chiave del modello che si sta LASCIANDO."""
+        # all'avvio, prima che la configurazione sia stata letta, il campo contiene
+        # solo il placeholder: non va salvato sotto nessuna chiave
+        if getattr(self, "_no_touch", False) or self._prompt_chiave_corrente is None:
+            return
+        if chiave is None:
+            chiave = _prompt_identificatore(self.cb_trad, self.ed_lm_modello, self.ed_ls_gguf)
+        testo = self.ed_prompt_trad.toPlainText()
+        if testo.strip():
+            self._prompt_per_modello[chiave] = testo
+        else:
+            self._prompt_per_modello.pop(chiave, None)
+        self._prompt_chiave_corrente = chiave
+
+    def _cambio_trad_modello(self, *_):
+        """Al cambio di backend/modello di traduzione: salva il prompt del modello
+        che si sta lasciando e carica quello (se esiste) del modello scelto."""
+        # durante _carica_impostazioni i segnali non devono toccare l'archivio:
+        # al termine del caricamento ci pensa _carica_impostazioni stessa
+        if getattr(self, "_no_touch", False) or self._prompt_chiave_corrente is None:
+            self._trad_ui()
+            return
+        self._prompt_salva_corrente(self._prompt_chiave_corrente)   # VECCHIA chiave
+        nuova = _prompt_identificatore(self.cb_trad, self.ed_lm_modello, self.ed_ls_gguf)
+        self.ed_prompt_trad.setPlainText(self._prompt_per_modello.get(nuova, ""))
+        self._prompt_chiave_corrente = nuova
         self._trad_ui()
+
+    def _cambio_chiave_prompt(self, *_):
+        """Il nome del modello (LM Studio) o il GGUF (llama.cpp) fanno parte della
+        chiave dell'archivio: quando cambiano, il prompt del modello lasciato resta
+        salvato e si carica quello (se esiste) del nuovo modello."""
+        if getattr(self, "_no_touch", False) or self._prompt_chiave_corrente is None:
+            return
+        vecchio = self._prompt_chiave_corrente
+        nuova = _prompt_identificatore(self.cb_trad, self.ed_lm_modello, self.ed_ls_gguf)
+        if vecchio == nuova:
+            return
+        self._prompt_salva_corrente(vecchio)
+        self.ed_prompt_trad.setPlainText(self._prompt_per_modello.get(nuova, ""))
+        self._prompt_chiave_corrente = nuova
+
+    def _prompt_trad_default(self):
+        """Riempie il campo 'Prompt personalizzato' con il template del backend scelto."""
+        tipo = MODELLI_TRAD[self.cb_trad.currentIndex()][1]
+        lingua = LINGUE[self.cb_lingua.currentIndex()][1] or "it"
+        nome = self.ed_lm_modello.text().strip() or os.path.basename(self.ed_ls_gguf.text().strip())
+        self.ed_prompt_trad.setPlainText(prompt_default(tipo, nome, lingua))
+        self._prompt_salva_corrente()
 
     def _trad_ui(self, *_):
         """I campi del backend di traduzione sono attivi solo se e' scelto quel backend.
@@ -5283,6 +5861,7 @@ class Finestra(QWidget):
         giapponese non passa dalla traduzione), ma i campi vanno lasciati modificabili:
         servono comunque per preparare/conservare la configurazione."""
         tipo = MODELLI_TRAD[self.cb_trad.currentIndex()][1]
+        att = self.cb_trad.isEnabled()
         lm, ls = tipo == "lmstudio", tipo == "llamaserver"
         for w in (self.lb_lm, self.ed_lm_url, self.ed_lm_modello):
             w.setEnabled(lm)
@@ -5291,6 +5870,10 @@ class Finestra(QWidget):
         for w in (self.lb_ls, self.ed_ls_exe, self.b_ls_exe, self.ed_ls_gguf, self.b_ls_gguf,
                   self.ed_ls_ctx, self.ed_ls_ngl, self.ed_ls_extra):
             w.setEnabled(ls)
+        # il prompt personalizzato non serve a NLLB (che non usa prompt testuali)
+        attivo = tipo in ("lmstudio", "llamaserver", "ollama") and att
+        for w in (self.lb_prompt_trad, self.ed_prompt_trad, self.b_prompt_trad_default):
+            w.setEnabled(attivo)
 
     def _sfoglia_ls_exe(self):
         ini = cartella_iniziale(self.ed_ls_exe.text(), CARTELLE_LLAMA_EXE)
@@ -5319,8 +5902,8 @@ class Finestra(QWidget):
                 # traduzione numerata: il riquadro conserva i prefissi [N|mm:ss.s]; le
                 # evidenziazioni coprono solo il testo, dopo il prefisso
                 parti, span_t, pos = [], [], 0
-                for k, (rg, ta) in enumerate(zip(trad["righe"], trad["t0"]), 1):
-                    pref = "[{}|{}] ".format(k, fmt_tempo(ta))
+                for k, (rg, ta, tb) in enumerate(zip(trad["righe"], trad["t0"], trad["t1"]), 1):
+                    pref = prefisso_tempi(k, ta, tb)
                     parti.append(pref + rg)
                     span_t.append((pos + l16(pref), pos + l16(pref) + l16(rg)))
                     pos += l16(pref) + l16(rg) + 1
@@ -5601,7 +6184,7 @@ class Finestra(QWidget):
                     prev = a0[i]
                 a1 = []
                 for i, (a, b) in enumerate(segs):
-                    fine = t1[b - 1]
+                    fine = num[4][i] if num[4][i] is not None else t1[b - 1]
                     prossimo = a0[i + 1] if i + 1 < len(a0) else None
                     if fine <= a0[i]:
                         fine = prossimo if prossimo is not None else a0[i] + 3.0
@@ -5692,7 +6275,7 @@ class Finestra(QWidget):
             self.lb_stato.setText("Traduzione interrotta." if _STOP.is_set()
                                   else "Traduzione non riuscita.{}".format(avviso or ""))
             return
-        trad = allinea_traduzione(r["t0"], r["t1"], trad)
+        trad = allinea_traduzione(r["t0"], r["t1"], trad, (r.get("tok") or {}).get("seg"))
         r["trad"] = trad
         # cambia solo il riquadro Traduzione: trascrizione e hiragana non si toccano
         testo_t, span_t = testo_righe(trad["righe"])
