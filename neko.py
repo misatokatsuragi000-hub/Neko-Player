@@ -3134,7 +3134,7 @@ SUB_TRAD = "#bfe3ff"     # traduzione non ancora illuminata
 
 
 _RE_TS_SUB = re.compile(
-    r"^\s*\[\s*\d+\s*[|\uff5c:/]\s*[\d:.,]+\s*\]\s*"
+    r"^\s*\[\s*\d+\s*[|\uff5c:/]\s*[\d:.,]+\s*(?:(?:->|-->|\u2192)\s*[\d:.,]+\s*)?\]\s*"
     r"|^\s*\[\s*[\d:.,]+\s*(?:->|-->|\u2192)\s*\[?\s*[\d:.,]+\s*\]\s*")
 
 
@@ -3151,7 +3151,18 @@ def l16(s):
     return len(s.encode("utf-16-le")) // 2
 
 
-def allinea_traduzione(t0, t1, trad):
+def _segmenti_giapponesi(seg):
+    """Da tok['seg'] (indice di segmento per ogni token) a una lista di intervalli [a, b) di token."""
+    out = []
+    for i, sg in enumerate(seg):
+        if i == 0 or sg != seg[i - 1]:
+            out.append([i, i + 1])
+        else:
+            out[-1][1] = i + 1
+    return out
+
+
+def allinea_traduzione(t0, t1, trad, seg=None):
     """Riallinea i tempi delle righe tradotte a quelli dei token giapponesi.
 
     Le righe nascono da un secondo passaggio di whisper con tempi propri (di solito
@@ -3167,6 +3178,21 @@ def allinea_traduzione(t0, t1, trad):
     n = len(ta)
     if n == 0 or not (len(tb) == n == len(trad["righe"])):
         return trad
+
+    # Traduzione nata riga per riga dai segmenti giapponesi: ogni riga usa i tempi della sua riga
+    # di kanji (dal primo all'ultimo token), cosi' compare insieme al giapponese e non prima.
+    if trad.get("per_segmento") and seg is not None and len(seg) == len(t0):
+        intervalli = _segmenti_giapponesi(seg)
+        if len(intervalli) == n:
+            na, nb, prev = [], [], 0.0
+            for a, b in intervalli:
+                x = max(t0[a], prev)
+                na.append(x)
+                nb.append(max(t1[b - 1], x))
+                prev = x
+            out = dict(trad)
+            out["t0"], out["t1"] = na, nb
+            return out
 
     assegn = [[] for _ in range(n)]
     for j in range(len(t0)):
@@ -3234,7 +3260,7 @@ def karaoke_espandi(d):
             tok_h.append(h)
             tok_seg.append(n)
 
-    out = {k: v for k, v in d.items() if k not in ("s", "tr", "trf", "trn")}
+    out = {k: v for k, v in d.items() if k not in ("s", "tr", "trf", "trn", "trp")}
     if d.get("tr"):
         out["trad"] = dict(
             righe=[e[0] for e in d["tr"]],
@@ -3245,8 +3271,10 @@ def karaoke_espandi(d):
             out["trad"]["fissa"] = True
         if d.get("trn"):
             out["trad"]["num"] = True
+        if d.get("trp"):
+            out["trad"]["per_segmento"] = True
     if out.get("trad"):
-        out["trad"] = allinea_traduzione(t0, t1, out["trad"])
+        out["trad"] = allinea_traduzione(t0, t1, out["trad"], tok_seg)
     out.update(
         orig="".join(orig), hira="".join(hira),
         span_o=span_o, span_h=span_h, t0=t0, t1=t1,
@@ -3320,6 +3348,20 @@ class KaraokeSubs:
         ca, cb = self._prog_jp(a), self._prog_jp(b)
         f = (self._prog_jp(t) - ca) / (cb - ca) if cb - ca > 1e-9 else (t - a) / (b - a)
         return min(1.0, max(0.0, f))
+
+    TRAD_CODA = ((1, 0.55), (2, 0.2))   # lettere appena superate: (distanza, quanto resta azzurro)
+
+    def _lettera_trad(self, i, t):
+        """Indice della lettera della riga tradotta i raggiunta al tempo t (avanza lettera per lettera,
+        seguendo il giapponese cantato); len(testo) = riga finita. Gli spazi si saltano."""
+        testo = self.tr[i]
+        n = len(testo)
+        if n == 0 or t >= self.t1_t[i]:
+            return n
+        h = min(n - 1, int(self._frazione_trad(i, t) * n))
+        while h < n and testo[h].isspace():
+            h += 1
+        return h if h < n else n
 
     def _intervallo_trad(self, i, idx):
         """Intervallo [c0, c1) di caratteri della riga tradotta i che corrisponde al token giapponese
@@ -3396,13 +3438,7 @@ class KaraokeSubs:
         if self.tr:
             it = bisect_right(self.t0_t, t) - 1
             if it >= 0 and t <= self.t1_t[it] + 1.5:
-                c0 = c1 = 0
-                if k_c is not None:
-                    c0, c1 = self._intervallo_trad(it, k_c[0])
-                if c1 > c0:
-                    k_tr = (it, c0, c1)       # tratto azzurro = dove i kanji sono rossi
-                else:
-                    k_tr = (it, int(round(len(self.tr[it]) * self._frazione_trad(it, t))), None)
+                k_tr = (it, self._lettera_trad(it, t))    # lettera azzurra = punto raggiunto dal canto
         return (k_jp, k_tr, k_z, k_c)
 
     def _riga(self, tok, a, b, idx, nascondi=None, corrente=None):
@@ -3430,17 +3466,27 @@ class KaraokeSubs:
         if k_tr is not None:
             testo = self.tr[k_tr[0]]
             out = ""
-            if k_tr[2] is not None and k_c:
-                c0, c1 = k_tr[1], k_tr[2]
-                parti = ((testo[:c0], SUB_SPOKEN),
-                         (testo[c0:c1], self._colore_traduzione(k_c[1])),
-                         (testo[c1:], SUB_TRAD))
-            else:
-                cut = k_tr[1]
-                parti = ((testo[:cut], SUB_SPOKEN), (testo[cut:], SUB_TRAD))
-            for frag, col in parti:
-                if frag:
-                    out += '<span style="color:%s;">%s</span>' % (col, escape(frag))
+            h = k_tr[1]
+            n = len(testo)
+            # lettere singole: quella raggiunta e' azzurro intenso, le 2 precedenti sfumano verso il
+            # colore delle gia' pronunciate; il resto e' gia' detto / non ancora detto
+            colori = {}
+            if h < n:                 # riga finita: tutto uguale, niente lettera illuminata
+                colori[h] = SUB_TRAD_CURRENT
+                for dist, forza in self.TRAD_CODA:
+                    colori[h - dist] = mix_colore(SUB_SPOKEN, SUB_TRAD_CURRENT, forza)
+            colori = {j: c for j, c in colori.items() if 0 <= j < n and not testo[j].isspace()}
+            j = 0
+            while j < n:
+                if j in colori:
+                    out += '<span style="color:%s;">%s</span>' % (colori[j], escape(testo[j]))
+                    j += 1
+                    continue
+                col = SUB_SPOKEN if j < h else SUB_TRAD
+                f = j
+                while j < n and j not in colori and (SUB_SPOKEN if j < h else SUB_TRAD) == col:
+                    j += 1
+                out += '<span style="color:%s;">%s</span>' % (col, escape(testo[f:j]))
             righe.append('<div style="white-space: pre-wrap;">%s</div>' % out)
         return "".join(righe)
 
@@ -3789,6 +3835,10 @@ class NekoPlayer(QMainWindow):
         self.vsync_enabled = self._leggi_config_bool("vsync_display", True)   # anti-tearing (spunta nel menu, al riavvio)
         self._audio_only = False    # file solo audio: schermo nero + onda dei dB + karaoke
         self._audio_path = None
+        self._audio_tracks = [dict(label="audio originale", src=None, ready=True)]   # tracce audio alternative (.mka con lo stesso nome)
+        self._audio_track_idx = 0
+        self._audio_track = None        # percorso della traccia attiva (per l'onda dei dB)
+        self._pending_audio_seek = None # (posizione ms, in riproduzione) da ripristinare dopo il cambio traccia
         self._env_threads = []
         self._wave_anchor = None
         self._wave_last_t = 0.0
@@ -3890,6 +3940,11 @@ class NekoPlayer(QMainWindow):
         self.audio_clock_timer.start()
         self.init_ui()
         self.apply_theme_color(self.theme_color)
+        if BYPASS_WM:
+            # Default: centra la finestra SOLO come punto di partenza, prima di
+            # load_settings(), così che le posizioni salvate nel config abbiano l'ultima parola.
+            area = QApplication.primaryScreen().availableGeometry()
+            self.move(area.center() - QPoint(self.width() // 2, self.height() // 2))
         self.load_settings()
         self._mouse_poll_timer = QTimer(self)
         self._mouse_poll_timer.setInterval(250)
@@ -3898,9 +3953,6 @@ class NekoPlayer(QMainWindow):
         QApplication.instance().installEventFilter(self)
         self._restore_stub = RestoreStub()     # serve solo senza window manager, ma esiste sempre (la spunta cambia a runtime)
         self._restore_stub.restore_requested.connect(self._restore_from_stub)
-        if BYPASS_WM:
-            area = QApplication.primaryScreen().availableGeometry()
-            self.move(area.center() - QPoint(self.width() // 2, self.height() // 2))
         if initial_video and os.path.isfile(initial_video):
             self.play_video_file(initial_video)
 
@@ -5831,8 +5883,9 @@ class NekoPlayer(QMainWindow):
                 win_w, win_h = nw, nh
             norm_w, norm_h = win_w, win_h       # geometria normale (prima di sostituirla con quella minimal)
             # formato con posizioni separate: window_x/y e window_width/height sono SEMPRE quelli normali
-            separate = isinstance(config_data.get("window_minimal_x"), int) and isinstance(config_data.get("window_minimal_y"), int)
             if self._minimal_on:
+                # la finestra va dimensionata con le misure minimal; se si resta quelle normali
+                # il resize verrebbe limitato al minimo normale e poi spostato in posizione normale
                 win_w, win_h = self._minimal_size
             if isinstance(win_w, int) and isinstance(win_h, int) and win_w > 0 and win_h > 0:
                 area = QApplication.primaryScreen().availableGeometry()
@@ -5849,9 +5902,10 @@ class NekoPlayer(QMainWindow):
                 win_x -= shift.x()
                 win_y -= shift.y()
                 vgeo = QApplication.primaryScreen().virtualGeometry()
-                if self._minimal_on and separate and self._minimal_pos is not None:
-                    # si parte in minimal: la finestra va nella posizione minimal, quella normale resta in memoria
-                    # (insieme alle dimensioni normali) per quando si esce da minimal
+                if self._minimal_on and self._minimal_pos is not None:
+                    # si parte in minimal: la finestra va nella posizione minimal salvata nel json
+                    # (window_minimal_x/y); quella normale (window_x/y) resta solo in memoria
+                    # (insieme alle dimensioni normali) per il ripristino all'uscita da minimal
                     if isinstance(norm_w, int) and isinstance(norm_h, int) and norm_w > 0 and norm_h > 0:
                         self._normal_size_before_minimal = (norm_w, norm_h)
                     nx = max(vgeo.left(), min(win_x, vgeo.right() - (self._normal_size_before_minimal or (0, 0))[0] + 1))
@@ -5863,6 +5917,12 @@ class NekoPlayer(QMainWindow):
                 self.move(x, y)
                 if not self._minimal_on:
                     self._normal_pos_before_minimal = QPoint(x, y)
+            elif self._minimal_on and self._minimal_pos is not None:
+                # condizione all'avvio: se il player parte in minimal e non c'e' una posizione
+                # normale salvata, applica la posizione minimal presa dal json
+                mp = self._clamp_pos_to_screens(self._minimal_pos, (self.width(), self.height()))
+                self.move(mp)
+                self._normal_pos_before_minimal = QPoint(mp)
 
             saved_model = config_data.get("last_model", "")
             if saved_model and os.path.isfile(saved_model):
@@ -5967,6 +6027,9 @@ class NekoPlayer(QMainWindow):
         elif key == Qt.Key_M:
             self.toggle_mute()
             event.accept()
+        elif key == Qt.Key_E:
+            self.cycle_audio_track()
+            event.accept()
         elif key in (Qt.Key_Plus, Qt.Key_Equal):
             self.slider_volume.setValue(min(100, self.slider_volume.value() + 5))
             event.accept()
@@ -6038,6 +6101,118 @@ class NekoPlayer(QMainWindow):
                     del self.resume_positions[k]
         except Exception: pass
 
+    # ------------------------------------------------------------ tracce audio .mka
+    def _find_mka_tracks(self, file_path):
+        """File .mka nella stessa cartella con lo stesso nome del video: '<nome>.mka', '<nome>.xxx.mka',
+        '<nome>_voce.mka', '<nome>_musica.mka'. Il file stesso e' escluso."""
+        folder = os.path.dirname(file_path)
+        stem = os.path.splitext(os.path.basename(file_path))[0]
+        trovati = []
+        try: nomi = os.listdir(folder)
+        except OSError: return []
+        for nome in nomi:
+            base, ext = os.path.splitext(nome)
+            if ext.lower() != ".mka": continue
+            full = os.path.join(folder, nome)
+            if os.path.abspath(full) == os.path.abspath(file_path) or not os.path.isfile(full): continue
+            if base == stem or base.startswith(stem + ".") or base in (stem + "_voce", stem + "_musica"):
+                trovati.append(full)
+        trovati.sort(key=lambda f: (os.path.splitext(os.path.basename(f))[0] != stem, os.path.basename(f).lower()))
+        return trovati
+
+    @staticmethod
+    def _mka_stream_titles(mka):
+        """Titoli delle tracce audio di un .mka (hira ci mette 'Voce' e 'Musica'); [""] se ffprobe fallisce."""
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "a",
+                 "-show_entries", "stream_tags=title", "-of", "json", mka],
+                stdin=subprocess.DEVNULL, capture_output=True, check=True, timeout=20)
+            st = json.loads(r.stdout.decode(errors="replace") or "{}").get("streams", [])
+            return [((x.get("tags") or {}).get("title") or "").strip() for x in st] or [""]
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return [""]
+
+    def _extract_mka_streams(self, tracks):
+        """Thread: estrae in file wav temporanei le tracce dei .mka multitraccia (Qt5 non sa scegliere
+        la traccia di un file), una dopo l'altra; ogni voce diventa utilizzabile appena e' pronta."""
+        import hashlib, tempfile
+        cache = os.path.join(tempfile.gettempdir(), "neko_mka_cache")
+        try: os.makedirs(cache, exist_ok=True)
+        except OSError: return
+        for t in tracks:
+            if t["ready"]: continue
+            try: key = f"{os.path.abspath(t['mka'])}|{os.path.getmtime(t['mka'])}|{t['idx']}"
+            except OSError: continue
+            dest = os.path.join(cache, hashlib.md5(key.encode("utf-8")).hexdigest() + ".wav")
+            if not os.path.isfile(dest):
+                tmp = dest + ".part.wav"
+                try:
+                    subprocess.run(["ffmpeg", "-y", "-v", "error", "-nostdin", "-i", t["mka"],
+                                    "-map", f"0:a:{t['idx']}", "-vn", "-c:a", "pcm_s16le", tmp],
+                                   check=True, stdin=subprocess.DEVNULL, capture_output=True)
+                    os.replace(tmp, dest)
+                except (OSError, subprocess.SubprocessError):
+                    try: os.remove(tmp)
+                    except OSError: pass
+                    continue
+            t["src"], t["ready"] = dest, True
+
+    def _setup_audio_tracks(self, file_path):
+        """Elenco delle tracce alternative: ogni traccia dei .mka con lo stesso nome (Voce, Musica...).
+        Resta attivo l'audio del file; le tracce dei .mka multitraccia si estraggono in background."""
+        tracks = [dict(label="audio originale", src=None, ready=True)]
+        da_estrarre = False
+        for mka in self._find_mka_tracks(file_path):
+            nome = os.path.basename(mka)
+            titoli = self._mka_stream_titles(mka)
+            if len(titoli) == 1:
+                tracks.append(dict(label=nome, src=mka, ready=True))      # un solo flusso: si suona il .mka
+            else:
+                for k, tit in enumerate(titoli):
+                    tracks.append(dict(label=f"{nome} - {tit or 'traccia ' + str(k + 1)}", src=None, ready=False,
+                                       mka=mka, idx=k))
+                    da_estrarre = True
+        self._audio_tracks = tracks
+        self._audio_track_idx = 0
+        self._audio_track = None
+        self._pending_audio_seek = None
+        if da_estrarre:
+            threading.Thread(target=self._extract_mka_streams, args=(tracks,), daemon=True).start()
+        n = len(tracks) - 1
+        return f"  ·  {n} traccia/e audio extra (E per cambiare)" if n else ""
+
+    def cycle_audio_track(self):
+        """Tasto E: passa alla traccia audio successiva (audio del file -> Voce -> Musica -> ... -> file)."""
+        if len(self._audio_tracks) <= 1:
+            self.status.showMessage("Nessun file .mka con lo stesso nome del video", 2500)
+            return
+        original = self._audio_path if self._audio_only else self.worker.video_path
+        if not original: return
+        nuovo = (self._audio_track_idx + 1) % len(self._audio_tracks)
+        track = self._audio_tracks[nuovo]
+        if not track["ready"]:
+            self.status.showMessage(f"Preparo la traccia: {track['label']} (estrazione in corso, riprova tra poco)", 2500)
+            return
+        self._audio_track_idx = nuovo
+        src = track["src"] or original
+        pos = self.audio_player.position()
+        playing = self.audio_player.state() == QMediaPlayer.PlayingState
+        self.worker.audio_clock = None
+        self._audio_last_pos = None
+        self._pending_audio_seek = (pos, playing)
+        self.audio_player.setMedia(QMediaContent(QUrl.fromLocalFile(src)))
+        self._audio_track = src if self._audio_only else None
+        if self._audio_only:      # l'onda dei dB segue la traccia che si sente
+            self._stop_envelope_threads()
+            self.wave_overlay.set_envelope(None)
+            th = AudioEnvelopeThread(src, self)
+            th.ready.connect(self._on_envelope_ready)
+            th.finished.connect(lambda t=th: self._env_threads.remove(t) if t in self._env_threads else None)
+            self._env_threads.append(th)
+            th.start()
+        self.status.showMessage(f"Traccia audio {nuovo + 1}/{len(self._audio_tracks)}: {track['label']}", 3000)
+
     def play_video_file(self, file_path):
         if os.path.splitext(file_path)[1].lower().lstrip(".") in AUDIO_EXTS:
             return self.play_audio_file(file_path)
@@ -6050,13 +6225,14 @@ class NekoPlayer(QMainWindow):
         self.worker.audio_clock = None
         self._audio_last_pos = None
         has_subs = self._load_subtitles(file_path)
+        tracce = self._setup_audio_tracks(file_path)
         url = QUrl.fromLocalFile(file_path)
         self.audio_player.setMedia(QMediaContent(url))
         self.worker.set_video(file_path)
         self._set_media_loaded(True)
         self.btn_play_pause.set_playing(True)
         self.status.showMessage(f"In riproduzione: {os.path.basename(file_path)}"
-                                + ("  ·  sottotitoli karaoke caricati" if has_subs else ""))
+                                + ("  ·  sottotitoli karaoke caricati" if has_subs else "") + tracce)
         self._update_display_target()
         self.audio_player.play()
         self.worker.start()
@@ -6091,6 +6267,8 @@ class NekoPlayer(QMainWindow):
         self._wave_anchor = None
         self._wave_last_t = 0.0
         has_subs = self._load_subtitles(file_path)
+        tracce = self._setup_audio_tracks(file_path)
+        self._audio_track = file_path
         self.audio_player.setMedia(QMediaContent(QUrl.fromLocalFile(file_path)))
         self._set_media_loaded(True)
         self.btn_play_pause.set_playing(True)
@@ -6105,7 +6283,7 @@ class NekoPlayer(QMainWindow):
         th.start()
         self._wave_timer.start()
         self.status.showMessage(f"In riproduzione (audio): {os.path.basename(file_path)}"
-                                + ("  ·  sottotitoli karaoke caricati" if has_subs else ""))
+                                + ("  ·  sottotitoli karaoke caricati" if has_subs else "") + tracce)
         self.audio_player.play()
         saved_ms = self.resume_positions.get(file_path, 0)
         if saved_ms > 2000:
@@ -6137,7 +6315,7 @@ class NekoPlayer(QMainWindow):
             except TypeError: pass
 
     def _on_envelope_ready(self, path, db):
-        if self._audio_only and path == self._audio_path:
+        if self._audio_only and path == (self._audio_track or self._audio_path):
             self.wave_overlay.set_envelope(db)
 
     def _tick_audio_mode(self):
@@ -6167,6 +6345,12 @@ class NekoPlayer(QMainWindow):
                     sl.update()
 
     def _on_audio_status(self, status):
+        if self._pending_audio_seek is not None and status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
+            pos, playing = self._pending_audio_seek
+            self._pending_audio_seek = None
+            self.audio_player.setPosition(pos)
+            if playing: self.audio_player.play()
+            return
         if not self._audio_only or status != QMediaPlayer.EndOfMedia: return
         if LOOP_VIDEO:
             self._wave_anchor = None
