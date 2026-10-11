@@ -235,6 +235,48 @@ def nome_separatore(chiave):
     return "Demucs"
 
 
+def cerca_voce_pulita(path):
+    """Restituisce il file di voce pulita (<nome>_voce.wav) gia' salvato accanto all'audio,
+    se esiste; None altrimenti. E' la traccia creata da 'trascrivi' (o da 'Salva voce e
+    musica'): riutilizzarla evita di separare di nuovo la voce da capo."""
+    v = os.path.splitext(path)[0] + "_voce.wav"
+    return v if os.path.isfile(v) else None
+
+
+def cerca_musica_separata(path):
+    """Restituisce il file di musica separata (<nome>_musica.wav) gia' salvato accanto
+    all'audio, se esiste; None altrimenti."""
+    m = os.path.splitext(path)[0] + "_musica.wav"
+    return m if os.path.isfile(m) else None
+
+
+def _nuovo_stem(dest, motore):
+    """True se 'dest' (<nome>_voce.wav / <nome>_musica.wav) va rigenerato: non esiste,
+    oppure l'e' stato creato da un separatore diverso da 'motore' usato ora (es. prima
+    Demucs, ora BS-RoFormer). Senza meta-dati il file si considera comunque riusabile."""
+    if not os.path.exists(dest):
+        return True
+    meta = {}
+    try:
+        with open(os.path.splitext(dest)[0] + ".json", encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    salvato = (meta.get("separatore") or "").strip().lower()
+    return bool(salvato) and salvato != motore
+
+
+def _scrivi_stem_meta(stem_path, motore, device):
+    """Affianca al wav una piccola copia .json ('<nome>_voce.json') con il separatore e il
+    dispositivo usati per crearlo: serve a 'trascrivi' per capire se il file in cache e'
+    ancora valido o va rifatto perche' ottenuto con un altro motore."""
+    try:
+        with open(os.path.splitext(stem_path)[0] + ".json", "w", encoding="utf-8") as fh:
+            json.dump({"separatore": motore, "device": device}, fh, ensure_ascii=False)
+    except OSError:
+        pass
+
+
 def _trova_stem_bsroformer(cartella, src, marca):
     """audio-separator nomina i file '<nome>_(Vocals)_<modello>.wav' e '<nome>_(Instrumental)_<modello>.wav'."""
     for f in os.listdir(cartella):
@@ -294,25 +336,35 @@ def separa_voce_musica(path, motore, device):
 
 
 class SeparatoreStem(QThread):
-    """Separa voce e musica del file originale e salva le due tracce nei percorsi indicati."""
+    """Separa voce e musica del file originale e salva le due tracce nei percorsi indicati.
+
+    Con riuso_voce=True 'path' e' gia' la traccia di voce pulita (<nome>_voce.wav) creata
+    da 'trascrivi': non va salvata di nuovo (e mai sovrascritta, perche' sarebbe il file
+    stesso usato come sorgente), basta separare la musica."""
     stato = pyqtSignal(str)
     fatto = pyqtSignal(str)          # messaggio di errore ("" se tutto ok)
 
-    def __init__(self, path, motore, device, dest_voce, dest_musica):
+    def __init__(self, path, motore, device, dest_voce, dest_musica, riuso_voce=False):
         super().__init__()
         self.path, self.motore, self.device = path, motore, device
         self.dest_voce, self.dest_musica = dest_voce, dest_musica
+        self.riuso_voce = bool(riuso_voce)
 
     def run(self):
         d = None
         try:
-            self.stato.emit("Separo voce e musica con {} (puo' richiedere alcuni minuti)...".format(
-                nome_separatore(self.motore)))
+            if self.riuso_voce:
+                self.stato.emit("Voce gia' isolata: separo solo la musica con {} "
+                                "(puo' richiedere alcuni minuti)...".format(nome_separatore(self.motore)))
+            else:
+                self.stato.emit("Separo voce e musica con {} (puo' richiedere alcuni minuti)...".format(
+                    nome_separatore(self.motore)))
             voce, musica, d, err = separa_voce_musica(self.path, self.motore, self.device)
             if not voce or not musica:
                 self.fatto.emit(err or "separazione non riuscita")
                 return
-            shutil.copyfile(voce, self.dest_voce)
+            if not self.riuso_voce:
+                shutil.copyfile(voce, self.dest_voce)
             shutil.copyfile(musica, self.dest_musica)
             self.fatto.emit("")
         except Exception as e:
@@ -320,6 +372,52 @@ class SeparatoreStem(QThread):
         finally:
             if d:
                 shutil.rmtree(d, ignore_errors=True)
+
+
+def esporta_mka(video, voce, musica, lossless=False):
+    """Mette la traccia di voce e quella di musica in un unico file .mka (Matroska audio
+    multitraccia) accanto al video/audio originale: <nome>.mka, con le tracce chiamate
+    'Voce' e 'Musica'. Con lossless=True usa FLAC, altrimenti Opus a 192k.
+    Restituisce il percorso del file creato; solleva CalledProcessError/FileNotFoundError
+    se ffmpeg fallisce o non esiste."""
+    base = os.path.splitext(video)[0]
+    dest = base + ".mka"
+    codec = ["-c:a", "flac"] if lossless else ["-c:a", "libopus", "-b:a", "192k"]
+    subprocess.run([
+        "ffmpeg", "-y", "-v", "error",
+        "-i", voce, "-i", musica,
+        "-map", "0:a:0", "-map", "1:a:0",
+        *codec,
+        "-metadata:s:a:0", "title=Voce",
+        "-metadata:s:a:1", "title=Musica",
+        dest,
+    ], check=True, stdin=subprocess.DEVNULL, capture_output=True)
+    return dest
+
+
+class EsportatoreMka(QThread):
+    """Esegue esporta_mka() in un thread separato per non bloccare l'interfaccia."""
+    stato = pyqtSignal(str)
+    fatto = pyqtSignal(str)          # messaggio di errore ("" se tutto ok)
+
+    def __init__(self, video, voce, musica, lossless=False):
+        super().__init__()
+        self.video, self.voce, self.musica = video, voce, musica
+        self.lossless = bool(lossless)
+
+    def run(self):
+        try:
+            self.stato.emit("Esporto le tracce in {}...".format(
+                os.path.basename(os.path.splitext(self.video)[0] + ".mka")))
+            esporta_mka(self.video, self.voce, self.musica, self.lossless)
+            self.fatto.emit("")
+        except FileNotFoundError:
+            self.fatto.emit("ffmpeg non trovato: installalo e aggiungilo al PATH.")
+        except subprocess.CalledProcessError as e:
+            self.fatto.emit((e.stderr or b"").decode(errors="replace").strip()[-300:]
+                            or "esportazione non riuscita")
+        except Exception as e:
+            self.fatto.emit(str(e))
 
 # traduzione locale (NLLB-200 distilled, CTranslate2 int8; licenza CC-BY-NC 4.0: solo uso
 # non commerciale). Il modello si scarica una volta sola, al primo uso.
@@ -1160,7 +1258,9 @@ def traduzione_numerata(trad):
 
 def salva_risultato(r, media):
     """Salva accanto a 'media' gli stessi file di "Salva accanto all'audio":
-    _trascrizione.txt, _hiragana.txt, _traduzione.txt (se c'e') e _karaoke.json."""
+    _trascrizione.txt, _hiragana.txt, _traduzione.txt (se c'e') e _karaoke.json.
+    Se la trascrizione ha isolato la voce, conserva anche quella (<nome>_voce.wav),
+    cosi' da non doverla separare di nuovo in seguito."""
     base = os.path.splitext(media)[0]
     testi = [("_trascrizione.txt", r["orig"]), ("_hiragana.txt", r["hira"])]
     trad = r.get("trad")
@@ -1174,6 +1274,13 @@ def salva_risultato(r, media):
             scritti.append(suff)
     scrivi_karaoke_json(r, media, base + "_karaoke.json")
     scritti.append("_karaoke.json")
+    if r.get("voce_file") and not r.get("voce_temporanea") \
+            and os.path.isfile(r["voce_file"]) and os.path.abspath(r["voce_file"]) != base + "_voce.wav":
+        try:
+            shutil.copyfile(r["voce_file"], base + "_voce.wav")
+            scritti.append("_voce.wav")
+        except OSError:
+            pass
     return scritti
 
 
@@ -1363,7 +1470,7 @@ def _llama_avvia(cfg, stato=None):
         ctx = int(str(cfg.get("ctx") or "").strip() or 16384)
     except ValueError:
         ctx = 16384
-    ngl = str(cfg.get("ngl") or "").strip() or "99"
+    ngl = str(cfg.get("ngl") or "").strip()
     try:
         extra = shlex.split(cfg.get("extra") or "", posix=(os.name != "nt"))
     except ValueError as e:
@@ -1378,8 +1485,10 @@ def _llama_avvia(cfg, stato=None):
     with socket.socket() as sk:
         sk.bind(("127.0.0.1", 0))
         porta = sk.getsockname()[1]
-    cmd = [exe, "-m", gguf, "-c", str(ctx), "-ngl", ngl,
-           "--host", "127.0.0.1", "--port", str(porta)] + extra
+    cmd = [exe, "-m", gguf, "-c", str(ctx)]
+    if ngl and ngl.lower() != "auto":
+        cmd += ["-ngl", ngl]
+    cmd += ["--host", "127.0.0.1", "--port", str(porta)] + extra
     logf = tempfile.NamedTemporaryFile(prefix="llama_server_", suffix=".log", delete=False)
     kw = {}
     if os.name != "nt":
@@ -2232,10 +2341,18 @@ class Worker(QThread):
             f"Impossibile caricare faster-whisper {p['modello']}: {msg_err}{guida}"
         )
 
-    def _isola_voce(self, path):
-        """Separa la voce dalla musica con il motore scelto (Demucs htdemucs oppure BS-RoFormer
-        tramite audio-separator) e restituisce (wav_voce, cartella_temporanea, messaggio_errore):
-        wav_voce e' None se fallisce.
+    def _isola_voce(self, path, audio_orig=None):
+        """Separa voce e musica con il motore scelto (Demucs htdemucs oppure BS-RoFormer
+        tramite audio-separator), in un'unica passata: il modello produce entrambe le
+        tracce, quindi non ha senso lanciarlo due volte. Restituisce
+        (wav_voce, wav_musica, cartella_temporanea, messaggio_errore); i due wav sono
+        None se fallisce.
+
+        Se 'audio_orig' (il file originale scelto dall'utente) viene passato insieme alle
+        tracce ottenute dall'intero brano, le due tracce vengono salvate direttamente
+        accanto all'originale come <nome>_voce.wav e <nome>_musica.wav: cosi' 'trascrivi'
+        popola subito la cache degli stem, senza dover poi rilanciare la separazione per
+        'Salva voce e musica' o per l'esportazione .mka.
         Richiede:  python -m pip install demucs
               o:   python -m pip install "audio-separator[gpu]"   (oppure [cpu])"""
         motore = self.p.get("separatore") or "demucs"
@@ -2248,51 +2365,56 @@ class Worker(QThread):
 
             ultimo = ""
             for dev in (["cpu"] if self.p["device"] == "cpu" else ["cuda", "cpu"]):
+                voce = musica = None
                 if motore == "bsroformer":
                     os.makedirs(SEPARATOR_MODELS_DIR, exist_ok=True)
                     env = dict(os.environ)
                     if dev == "cpu":
                         env["CUDA_VISIBLE_DEVICES"] = "-1"     # audio-separator sceglie da solo la GPU
+                    # niente --single_stem: il modello genera Vocals + Instrumental in un colpo
+                    # solo, salvare anche la musica adesso evita di separare di nuovo dopo
                     r = subprocess.run(
                         [sys.executable, "-c",
                          "from audio_separator.utils.cli import main; main()",
                          src, "--model_filename", BSROFORMER_MODEL,
                          "--model_file_dir", SEPARATOR_MODELS_DIR,
-                         "--output_dir", d, "--output_format", "WAV",
-                         "--single_stem", "Vocals"],
+                         "--output_dir", d, "--output_format", "WAV"],
                         stdin=subprocess.DEVNULL, capture_output=True, env=env)
-                    voce = self._trova_voce_bsroformer(d, src)
+                    voce = _trova_stem_bsroformer(d, src, "(vocals)")
+                    musica = _trova_stem_bsroformer(d, src, "(instrumental)")
                 else:
                     r = subprocess.run(
                         [sys.executable, "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
                          "-d", dev, "-o", d, src],
                         stdin=subprocess.DEVNULL, capture_output=True)
-                    voce = os.path.join(d, "htdemucs", "audio", "vocals.wav")
+                    cart = os.path.join(d, "htdemucs", "audio")
+                    voce = os.path.join(cart, "vocals.wav")
+                    musica = os.path.join(cart, "no_vocals.wav")
                 if r.returncode == 0 and voce and os.path.isfile(voce):
-                    return voce, d, ""
+                    if musica and not os.path.isfile(musica):
+                        musica = None
+                    if audio_orig:
+                        # salvataggio diretto dei 2 stem accanto all'originale (una volta sola)
+                        base = os.path.splitext(audio_orig)[0]
+                        try:
+                            shutil.copyfile(voce, base + "_voce.wav")
+                            _scrivi_stem_meta(base + "_voce.wav", motore, dev)
+                            if musica:
+                                shutil.copyfile(musica, base + "_musica.wav")
+                                _scrivi_stem_meta(base + "_musica.wav", motore, dev)
+                        except OSError:
+                            pass
+                    return voce, musica, d, ""
                 ultimo = (r.stderr or b"").decode(errors="replace").strip()[-300:]
                 if "No module named" in ultimo:
                     ultimo += ("  ->  python -m pip install " +
                                ('"audio-separator[gpu]"' if motore == "bsroformer" else "demucs"))
                     break      # inutile riprovare su CPU: manca proprio il pacchetto
-            return None, d, ultimo or "errore sconosciuto"
+            return None, None, d, ultimo or "errore sconosciuto"
         except FileNotFoundError:
-            return None, d, "ffmpeg non trovato"
+            return None, None, d, "ffmpeg non trovato"
         except subprocess.CalledProcessError as e:
-            return None, d, (e.stderr or b"").decode(errors="replace").strip()[-300:]
-
-    @staticmethod
-    def _trova_voce_bsroformer(cartella, src):
-        """audio-separator nomina il file '<nome>_(Vocals)_<modello>.wav': lo cerca nella cartella."""
-        wavs = [f for f in os.listdir(cartella)
-                if f.lower().endswith(".wav") and os.path.join(cartella, f) != src]
-        for f in wavs:
-            if "(vocals)" in f.lower():
-                return os.path.join(cartella, f)
-        for f in wavs:
-            if "instrumental" not in f.lower():
-                return os.path.join(cartella, f)
-        return None
+            return None, None, d, (e.stderr or b"").decode(errors="replace").strip()[-300:]
 
     def run(self):
         tmp = None
@@ -2313,18 +2435,92 @@ class Worker(QThread):
                 subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, capture_output=True)
                 path = tmp
 
-            # Musica di sottofondo: Demucs / BS-RoFormer isola la voce, poi si trascrive solo quella
+            # Musica di sottofondo: Demucs / BS-RoFormer isola la voce, poi si trascrive solo quella.
+            # La separazione si fa UNA VOLTA SOLA e produce entrambi gli stem: voce e musica
+            # vengono salvati subito accanto all'audio (<nome>_voce.wav / <nome>_musica.wav),
+            # cosi' 'Salva voce e musica' e l'export .mka li trovano gia' pronti senza rilanciare
+            # il modello. Se le tracce esistono gia' (e sono state create con lo stesso
+            # separatore) si riutilizzano, senza rifare la separazione da capo.
             voce_isolata = False
+            voce_persistente = None
+            musica_persistente = None
             avviso_pre = ""
             if p.get("demucs"):
-                nome_sep = nome_separatore(p.get("separatore"))
-                self.stato.emit("Isolo la voce con {} (puo' richiedere alcuni minuti)...".format(nome_sep))
-                voce, dir_demucs, err = self._isola_voce(path)
-                if voce:
-                    path = voce
+                motore = p.get("separatore") or "demucs"
+                nome_sep = nome_separatore(motore)
+                riuso = p.get("riusa_voce", True)
+                dest_voce = os.path.splitext(p["file"])[0] + "_voce.wav"
+                voce_cache = cerca_voce_pulita(p["file"]) if riuso else None
+                se_esiste = bool(voce_cache) and not _nuovo_stem(dest_voce, motore)
+                musica_cache = cerca_musica_separata(p["file"]) if riuso else None
+                brano_intero = p["inizio"] <= 0 and p["fine"] <= 0
+
+                def _sep(sorg):
+                    """Separa voce+musica in un colpo solo; salva i 2 stem accanto all'originale."""
+                    nonlocal dir_demucs
+                    self.stato.emit("Isolo voce e musica con {} (una volta sola, puo' richiedere "
+                                    "alcuni minuti)...".format(nome_sep))
+                    v, m, d, err = self._isola_voce(
+                        sorg, audio_orig=p["file"] if brano_intero else None)
+                    if v:
+                        dir_demucs = d
+                    return v, m, err
+
+                if se_esiste and brano_intero:
+                    self.stato.emit("Uso la voce gia' isolata: {}".format(os.path.basename(voce_cache)))
+                    path = voce_cache
                     voce_isolata = True
+                    voce_persistente = voce_cache       # niente copia: il file e' gia' quello giusto
+                    if not musica_cache:
+                        # manca solo la musica: la si ottiene dalla stessa separazione completa
+                        # (che riscrive anche la voce, identica) senza rifarla due volte
+                        _, m, _ = _sep(p["file"])
+                        musica_persistente = m
+                elif se_esiste:
+                    # voce pulita dell'intero brano ma la trascrizione e' di un segmento: si ritaglia
+                    # la voce salvata sul segmento richiesto, senza rifare la separazione da capo
+                    self.stato.emit("Ritaglio la voce gia' isolata sul segmento scelto...")
+                    tmp2 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+                    try:
+                        subprocess.run(
+                            ["ffmpeg", "-y", "-v", "error", "-ss", str(p["inizio"]), "-i", voce_cache]
+                            + (["-t", str(p["fine"] - p["inizio"])] if p["fine"] > p["inizio"] else [])
+                            + ["-ar", "44100", "-ac", "2", tmp2],
+                            check=True, stdin=subprocess.DEVNULL, capture_output=True)
+                        path = tmp2
+                        if tmp and os.path.exists(tmp):
+                            try:
+                                os.remove(tmp)
+                            except OSError:
+                                pass
+                        tmp = tmp2          # il ritaglio va ripulito alla fine
+                        voce_isolata = True
+                        if not musica_cache:
+                            # gli stem si salvano una volta sola: ricavo la musica dall'originale
+                            # (la voce e' gia' a destino: qui '_isola_voce' non la sovrascrive)
+                            _, musica_persistente, _ = self._isola_voce(p["file"], audio_orig=p["file"])
+                    except Exception:
+                        # ritaglio fallito: si torna indietro e si separa l'originale come una volta
+                        if os.path.exists(tmp2):
+                            try:
+                                os.remove(tmp2)
+                            except OSError:
+                                pass
+                        voce, m, err = _sep(path)
+                        if voce:
+                            path = voce
+                            voce_isolata = True
+                            musica_persistente = m
+                        else:
+                            avviso_pre = " ({} non utilizzabile, uso l'audio originale: {})".format(nome_sep, err)
                 else:
-                    avviso_pre = " ({} non utilizzabile, uso l'audio originale: {})".format(nome_sep, err)
+                    voce, m, err = _sep(path)
+                    if voce:
+                        path = voce
+                        voce_isolata = True
+                        musica_persistente = m
+                    else:
+                        avviso_pre = " ({} non utilizzabile, uso l'audio originale: {})".format(nome_sep, err)
 
             model, device, compute_type = self._load_model()
 
@@ -2589,6 +2785,13 @@ class Worker(QThread):
                 da_tradurre=da_tradurre,
                 tok=dict(o=tok_o, h=tok_h, seg=tok_seg),
                 trad=allinea_traduzione([t[0] for t in tempi], [t[1] for t in tempi], trad),
+                # tracce pulite prodotte/salvate da questa trascrizione: la voce (e la musica)
+                # sono gia' accanto all'audio come <nome>_voce.wav / <nome>_musica.wav, percio'
+                # 'Salva voce e musica' e l'export .mka non devono rifare la separazione
+                voce_file=(voce_persistente if voce_persistente else
+                           (path if (voce_isolata and dir_demucs) else None)),
+                voce_temporanea=bool(voce_isolata and dir_demucs),
+                musica_file=musica_persistente,
             ))
 
         except FileNotFoundError:
@@ -3329,6 +3532,7 @@ class Finestra(QWidget):
         self._batch_trad = None
         self._trad_solo = None
         self._stem = None
+        self._mka = None
         self._batch_params = None
         self._batch_interrotto1 = False
         self._batch_esiti = dict(ok=0, salt=0, vuoti=[], err=[], avvisi=[], note=[])
@@ -3568,8 +3772,12 @@ class Finestra(QWidget):
         rc = QHBoxLayout()
         self.ed_ls_ctx = QLineEdit("16384")
         self.ed_ls_ctx.setToolTip("Context Length (-c). Piu' e' grande, piu' VRAM usa la KV cache.")
-        self.ed_ls_ngl = QLineEdit("99")
-        self.ed_ls_ngl.setToolTip("Layer sulla GPU (-ngl). 99 = tutti; abbassa se la VRAM non basta.")
+        self.ed_ls_ngl = QLineEdit("")
+        self.ed_ls_ngl.setPlaceholderText("auto")
+        self.ed_ls_ngl.setToolTip(
+            "Layer sulla GPU (-ngl). Vuoto = llama.cpp decide da solo in base alla VRAM libera\n"
+            "(consigliato). Un numero forza quel valore: 99 = tutti, ma se la VRAM non basta\n"
+            "llama-server si chiude con 'failed to fit params', quindi abbassa (es. 20, 10).")
         self.ed_ls_extra = QLineEdit()
         self.ed_ls_extra.setPlaceholderText("argomenti extra, es. -ctk q8_0 -ctv q8_0 -fa on")
         rc.addWidget(QLabel("Contesto"))
@@ -3647,6 +3855,16 @@ class Finestra(QWidget):
         )
         self.b_salva_stem.clicked.connect(self.salva_voce_musica)
 
+        self.b_esporta_mka = QPushButton("🎛 Esporta tracce .mka")
+        self.b_esporta_mka.setToolTip(
+            "Unisce le due tracce gia' separate (<nome>_voce.wav e <nome>_musica.wav, create da\n"
+            "'trascrivi' con separazione o da 'Salva voce e musica') in un unico file Matroska\n"
+            "multitraccia <nome>.mka accanto all'originale: traccia 1 = Voce, traccia 2 = Musica.\n"
+            "Con il tasto destro del mouse puoi scegliere la codifica lossless (FLAC) invece di\n"
+            "Opus 192k. Non fa alcuna separazione: se gli stem non ci sono, avvisa."
+        )
+        self.b_esporta_mka.clicked.connect(self.esporta_tracce_mka)
+
         self.b_ferma = QPushButton("■ Interrompi")
         self.b_ferma.setEnabled(False)
         self.b_ferma.setToolTip(
@@ -3665,6 +3883,7 @@ class Finestra(QWidget):
 
         az.addWidget(self.b_salva_accanto)
         az.addWidget(self.b_salva_stem)
+        az.addWidget(self.b_esporta_mka)
         az.addWidget(self.b_carica_k)
         az.addStretch(1)
         az.addWidget(self.b_libera)
@@ -3963,6 +4182,11 @@ class Finestra(QWidget):
 
         self.ultima_cartella = ""
         self._carica_impostazioni()
+        # dopo il caricamento della configurazione i campi llama-server possono essere
+        # stati popolati ma restare grigi: riappliciamo lo stato di abilitazione
+        # (con la lingua salvata "giapponese" cb_trad risulta disabilitato e _trad_ui
+        # spegneva i campi anche se il backend scelto era "llama.cpp")
+        self._lingua_cambiata()
 
     # ------------------------------------------------------------ impostazioni
     def _impostazioni(self):
@@ -4029,6 +4253,8 @@ class Finestra(QWidget):
         isep = self.cb_sep.findData(d.get("separatore"))
         if isep >= 0:
             self.cb_sep.setCurrentIndex(isep)
+        # i campi llama-server vanno popolati PRIMA di _trad_ui: se il modello scelto
+        # e' "llama.cpp", i widget restano disabilitati finche' non sono tutti compilati
         tm = d.get("trad_modello")
         if isinstance(tm, int) and 0 <= tm < self.cb_trad.count():
             self.cb_trad.setCurrentIndex(tm)
@@ -5052,10 +5278,12 @@ class Finestra(QWidget):
         self._trad_ui()
 
     def _trad_ui(self, *_):
-        """I campi di LM Studio sono attivi solo se e' scelto quel backend."""
+        """I campi del backend di traduzione sono attivi solo se e' scelto quel backend.
+        Nota: con la lingua 'giapponese' il menu cb_trad e' disabilitato (la trascrizione
+        giapponese non passa dalla traduzione), ma i campi vanno lasciati modificabili:
+        servono comunque per preparare/conservare la configurazione."""
         tipo = MODELLI_TRAD[self.cb_trad.currentIndex()][1]
-        att = self.cb_trad.isEnabled()
-        lm, ls = tipo == "lmstudio" and att, tipo == "llamaserver" and att
+        lm, ls = tipo == "lmstudio", tipo == "llamaserver"
         for w in (self.lb_lm, self.ed_lm_url, self.ed_lm_modello):
             w.setEnabled(lm)
         for w in (self.ck_lm_ctx, self.ck_lm_tutto, self.ck_lm_veloce):
@@ -5144,6 +5372,21 @@ class Finestra(QWidget):
         self._ripristina()
         self.ultimo_ris = r
         self._imposta_testi(r["orig"], r["hira"], r["span_o"], r["span_h"], r["t0"], r["t1"], r.get("tok"), r.get("trad"))
+
+        # se la trascrizione ha usato una voce isolata (temporanea, che sta per essere cancellata),
+        # la teniamo in cache accanto all'audio: "Salva voce e musica" e le trascrizioni successive
+        # la riutilizzano senza separare di nuovo. La musica (<nome>_musica.wav) l'ha gia' salvata
+        # il worker stesso nella stessa separazione, quindi qui non serve toccarla.
+        if r.get("voce_file") and r.get("voce_temporanea") and os.path.isfile(r["voce_file"]):
+            audio = self.ed_file.text().strip()
+            motore = self.cb_sep.currentData() or "demucs"
+            dest = (os.path.splitext(audio)[0] + "_voce.wav") if audio else None
+            if dest and not os.path.exists(dest):
+                try:
+                    shutil.copyfile(r["voce_file"], dest)
+                    _scrivi_stem_meta(dest, motore, self.cb_device.currentText())
+                except OSError:
+                    pass
 
         self.lb_stato.setText(
             "Fatto{}. Premi ▶ per vedere le parole colorarsi mentre vengono pronunciate, anche sul video "
@@ -5556,14 +5799,37 @@ class Finestra(QWidget):
             QMessageBox.warning(self, "File mancante", "Scegli prima un file audio/video valido.")
             return
 
+        base = os.path.splitext(audio)[0]
+        dest_voce, dest_musica = base + "_voce.wav", base + "_musica.wav"
+
+        # Voce pulita e musica gia' create da 'trascrivi' (Demucs/BS-RoFormer salvano ora
+        # entrambi gli stem accanto all'originale, in un'unica passata): non ha senso
+        # rifare la separazione da capo. Se esiste anche la musica (<nome>_musica.wav)
+        # non c'e' proprio nulla da fare; se manca, si separa solo la musica partendo
+        # dall'audio pulito che abbiamo gia'.
+        voce_esistente = cerca_voce_pulita(audio)
+        if voce_esistente and os.path.abspath(voce_esistente) == os.path.abspath(dest_voce):
+            if os.path.exists(dest_musica):
+                print("Voce e musica gia' salvate da 'trascrivi', nessuna separazione da rifare:\n  {}\n  {}".format(
+                    dest_voce, dest_musica))
+                self.lb_stato.setText("Nessun audio da salvare: voce e musica esistono gia' ({}, {}).".format(
+                    os.path.basename(dest_voce), os.path.basename(dest_musica)))
+                return
+            sorgente, riuso_voce = dest_voce, True
+        else:
+            # nessun audio pulito creato con 'trascrivi': non c'e' niente da salvare e
+            # non va rifatta la separazione di tutto il brano da capo
+            print("Nessun audio pulito da salvare: trascrivi prima il file isolando la voce "
+                  "(Demucs/BS-RoFormer), oppure usa 'Salva accanto all'audio'.")
+            self.lb_stato.setText("Nessun audio da salvare: manca la voce pulita creata da 'trascrivi'.")
+            return
+
         if self._batch_attivo or (self.worker is not None and self.worker.isRunning()) \
                 or (self._stem is not None and self._stem.isRunning()):
             QMessageBox.information(self, "Operazione in corso", "Attendi la fine dell'operazione in corso.")
             return
 
-        base = os.path.splitext(audio)[0]
-        dest_voce, dest_musica = base + "_voce.wav", base + "_musica.wav"
-        esistenti = [os.path.basename(f) for f in (dest_voce, dest_musica) if os.path.exists(f)]
+        esistenti = [os.path.basename(dest_musica)] if os.path.exists(dest_musica) else []
 
         if esistenti:
             r = QMessageBox.question(
@@ -5577,8 +5843,9 @@ class Finestra(QWidget):
         self.b_avvia.setEnabled(False)
         self.barra.setRange(0, 0)
 
-        t = SeparatoreStem(audio, self.cb_sep.currentData() or "demucs",
-                           self.cb_device.currentText(), dest_voce, dest_musica)
+        t = SeparatoreStem(sorgente, self.cb_sep.currentData() or "demucs",
+                           self.cb_device.currentText(), dest_voce, dest_musica,
+                           riuso_voce=riuso_voce)
         t.stato.connect(self.lb_stato.setText)
         t.fatto.connect(lambda err, d=os.path.dirname(audio), v=dest_voce, m=dest_musica:
                         self._salva_voce_musica_fatto(err, d, v, m))
@@ -5595,8 +5862,80 @@ class Finestra(QWidget):
             QMessageBox.critical(self, "Separazione voce/musica", err)
             return
 
-        self.lb_stato.setText("Salvato in {}: {}, {}".format(
-            cartella, os.path.basename(dest_voce), os.path.basename(dest_musica)))
+        # con la voce gia' isolata da 'trascrivi' qui si e' salvata solo la musica
+        if os.path.exists(dest_voce) and os.path.exists(dest_musica):
+            self.lb_stato.setText("Salvato in {}: {}, {}".format(
+                cartella, os.path.basename(dest_voce), os.path.basename(dest_musica)))
+        else:
+            self.lb_stato.setText("Salvato in {}: {}".format(
+                cartella, os.path.basename(dest_musica if os.path.exists(dest_musica) else dest_voce)))
+
+    def esporta_tracce_mka(self):
+        """Unisce gli stem gia' presenti in cache (<nome>_voce.wav + <nome>_musica.wav) in un
+        unico .mka multitraccia. Non separa nulla: se mancano, dice che non c'e' audio da salvare."""
+        audio = self.ed_file.text().strip()
+        if not audio or not os.path.isfile(audio):
+            QMessageBox.warning(self, "File mancante", "Scegli prima un file audio/video valido.")
+            return
+
+        base = os.path.splitext(audio)[0]
+        voce = cerca_voce_pulita(audio) or (base + "_voce.wav")
+        musica = base + "_musica.wav"
+        mancanti = [os.path.basename(x) for x in (voce, musica) if not os.path.isfile(x)]
+        if mancanti:
+            print("Nessun audio da salvare in .mka: mancano {}\n"
+                  "(separa prima le tracce: trascrivi con separazione attiva, oppure usa "
+                  "'Salva voce e musica').".format(", ".join(mancanti)))
+            self.lb_stato.setText("Nessun audio da salvare in .mka: {} non trovati."
+                                  .format(", ".join(mancanti)))
+            QMessageBox.information(
+                self, "Nessuno stem da esportare",
+                "Non ci sono tracce in cache da esportare:\n{}\n\n"
+                "Trascrivi il file con la separazione attiva, oppure premi "
+                "'Salva voce e musica'.".format("\n".join(mancanti)))
+            return
+
+        lossless = False
+        r = QMessageBox.question(
+            self, "Esporta tracce .mka",
+            "Tracce trovate:\n  {}\n  {}\n\nCodifica del file <nome>.mka:\n"
+            "  Yes    -> lossless (FLAC, file piu' grande)\n"
+            "  No     -> Opus 192k (compatto)\n"
+            "  Cancel -> annulla".format(os.path.basename(voce), os.path.basename(musica)))
+        if r == QMessageBox.Yes:
+            lossless = True
+        elif r != QMessageBox.No:
+            return
+
+        if self._batch_attivo or (self.worker is not None and self.worker.isRunning()) \
+                or (self._stem is not None and self._stem.isRunning()) \
+                or (self._mka is not None and self._mka.isRunning()):
+            QMessageBox.information(self, "Operazione in corso", "Attendi la fine dell'operazione in corso.")
+            return
+
+        dest = base + ".mka"
+        if os.path.exists(dest):
+            r = QMessageBox.question(self, "Sovrascrivere?",
+                                     "Esiste gia':\n{}\nVuoi sovrascriverlo?".format(
+                                         os.path.basename(dest)))
+            if r != QMessageBox.Yes:
+                return
+
+        self.b_esporta_mka.setEnabled(False)
+        t = EsportatoreMka(audio, voce, musica, lossless)
+        t.stato.connect(self.lb_stato.setText)
+        t.fatto.connect(lambda err, d=dest, c=os.path.dirname(audio):
+                        self._esporta_mka_fatto(err, d, c))
+        self._mka = t
+        t.start()
+
+    def _esporta_mka_fatto(self, err, dest, cartella):
+        self.b_esporta_mka.setEnabled(True)
+        if err:
+            self.lb_stato.setText("Esportazione .mka non riuscita.")
+            QMessageBox.critical(self, "Esporta tracce .mka", err)
+            return
+        self.lb_stato.setText("Tracce unite in {}: {}".format(cartella, os.path.basename(dest)))
 
     def libera(self):
         libera_modello()
@@ -5615,6 +5954,8 @@ class Finestra(QWidget):
             self._trad_solo.wait(1500)
         if self._stem is not None and self._stem.isRunning():
             self._stem.wait(1500)
+        if self._mka is not None and self._mka.isRunning():
+            self._mka.wait(1500)
         self._salva_impostazioni()
         ferma_llamaserver()
         self._fullscreen(False)
