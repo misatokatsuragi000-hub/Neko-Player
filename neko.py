@@ -3483,25 +3483,27 @@ class KaraokeSubs:
         x = min(1.0, max(0.0, x))
         return x * x * (3.0 - 2.0 * x)
 
-    def _env(self, passo):
-        """Intensita' 0..1 al passo 'passo': sale in fretta, tiene, poi scende."""
-        u = (passo + 0.5) / self.ZOOM_PASSI
+    def _env(self, passo, u=None):
+        """Intensita' 0..1 al passo 'passo' (o al progresso continuo u se dato): sale in fretta, tiene, poi scende."""
+        if u is None:
+            u = (passo + 0.5) / self.ZOOM_PASSI
         return self._liscia(u / 0.25) if u < 0.5 else self._liscia((1.0 - u) / 0.25)
 
-    def _scala_zoom(self, passo):
+    def _scala_zoom(self, passo, u=None):
         """Scala della lettera al passo 'passo': sale in fretta, tiene, poi torna normale."""
-        return 1.0 + self.ZOOM_AMPIEZZA * self._env(passo)
+        return 1.0 + self.ZOOM_AMPIEZZA * self._env(passo, u)
 
-    def _colore_traduzione(self, passo):
+    def _colore_traduzione(self, passo, u=None):
         """Azzurro intenso del tratto di traduzione in corso: stessa curva del rosso dei kanji."""
-        u = (passo + 0.5) / self.ZOOM_PASSI
+        if u is None:
+            u = (passo + 0.5) / self.ZOOM_PASSI
         base = SUB_TRAD if u < 0.5 else SUB_SPOKEN
-        return mix_colore(base, SUB_TRAD_CURRENT, self._env(passo))
+        return mix_colore(base, SUB_TRAD_CURRENT, self._env(passo, u))
 
-    def _vicini(self, idx, passo):
+    def _vicini(self, idx, passo, u=None):
         """[(indice token, intensita' 0..1)] dei token prima e dopo quello in riproduzione (solo nella stessa riga)."""
         a, b = self.seg_range[self.seg[idx]]
-        e = self._env(passo)
+        e = self._env(passo, u)
         out = []
         for dist, forza in self.VICINI:
             for i in (idx - dist, idx + dist):
@@ -3514,15 +3516,18 @@ class KaraokeSubs:
         """Colore di un token vicino: parte dal suo colore normale (gia' detto / non ancora detto) verso il rosso."""
         return mix_colore(SUB_SPOKEN if i < idx else SUB_UNSPOKEN, SUB_CURRENT, f)
 
-    def _colore_corrente(self, passo):
+    def _colore_corrente(self, passo, u=None):
         """Colore del token in riproduzione: dal bianco sale al rosso, poi si raffredda
         verso l'arancione dei token gia' pronunciati (nessun salto di colore agli estremi)."""
-        u = (passo + 0.5) / self.ZOOM_PASSI
+        if u is None:
+            u = (passo + 0.5) / self.ZOOM_PASSI
         base = SUB_UNSPOKEN if u < 0.5 else SUB_SPOKEN
-        return mix_colore(base, SUB_CURRENT, self._env(passo))
+        return mix_colore(base, SUB_CURRENT, self._env(passo, u))
 
-    def chiave(self, t, zoom=False):
-        """Stato dei sottotitoli al tempo t (serve a ridisegnare solo quando cambia)."""
+    def chiave(self, t, zoom=False, zampa=False):
+        """Stato dei sottotitoli al tempo t (serve a ridisegnare solo quando cambia).
+        Con zampa=True il progresso del token corrente e' continuo (k_c[2]=u): la zampa/stella
+        deve saltare in modo fluido, non a gradini (altrimenti sembra si teletrasporti)."""
         k_jp = k_tr = k_z = k_c = None
         idx = bisect_right(self.t0, t) - 1
         if idx >= 0:
@@ -3532,9 +3537,13 @@ class KaraokeSubs:
             if in_corso and self.o[idx].strip():
                 d = self.t1[idx] - self.t0[idx]
                 u = (t - self.t0[idx]) / d if d > 0 else 0.5
-                k_c = (idx, min(self.ZOOM_PASSI - 1, max(0, int(u * self.ZOOM_PASSI))))
+                passo = min(self.ZOOM_PASSI - 1, max(0, int(u * self.ZOOM_PASSI)))
+                if zampa:
+                    k_c = (idx, passo, round(min(1.0, max(0.0, u)) * 1000) / 1000.0)
+                else:
+                    k_c = (idx, passo)
                 if zoom:
-                    k_z = k_c
+                    k_z = (idx, passo)
         if self.tr:
             it = bisect_right(self.t0_t, t) - 1
             if it >= 0 and t <= self.t1_t[it] + 1.5:
@@ -3564,10 +3573,11 @@ class KaraokeSubs:
 
     def html(self, k, trans=False, show_o=True, show_h=True, show_t=True):
         k_jp, k_tr, k_z, k_c = k
-        corrente = self._colore_corrente(k_c[1]) if k_c else None
+        u_c = k_c[2] if k_c and len(k_c) > 2 else None
+        corrente = self._colore_corrente(k_c[1], u_c) if k_c else None
         vicini = {}
         if trans and k_c:
-            vicini = {i: self._colore_vicino(i, k_c[0], f) for i, f in self._vicini(*k_c)}
+            vicini = {i: self._colore_vicino(i, k_c[0], f) for i, f in self._vicini(k_c[0], k_c[1], u_c)}
         nascondi = set()
         if k_z:
             nascondi.add(k_z[0])
@@ -3606,6 +3616,8 @@ class KaraokeSubs:
         """Lettere da disegnare ingrandite: [(blocco, posizione UTF-16 nel blocco, testo, scala, colore)].
         I blocchi sono le righe del html(): kanji, poi (se diversa) hiragana, poi la traduzione."""
         k_jp, k_tr, k_z = k[0], k[1], k[2]
+        k_c = k[3]
+        u_c = k_c[2] if k_c and len(k_c) > 2 else None
         out = []
         n_righe = 0
         if k_jp is not None:
@@ -3614,13 +3626,13 @@ class KaraokeSubs:
             n_righe = len(righe)
             if k_z:
                 idx, passo = k_z
-                sc = self._scala_zoom(passo)
-                col = self._colore_corrente(passo)
+                sc = self._scala_zoom(passo, u_c)
+                col = self._colore_corrente(passo, u_c)
                 for blocco, r in enumerate(righe):
                     tok = self.o if r == "o" else self.h
                     out.append((blocco, l16("".join(tok[a:idx])), tok[idx], sc, col))
                 if trans:
-                    for i, f in self._vicini(idx, passo):
+                    for i, f in self._vicini(idx, passo, u_c):
                         c = self._colore_vicino(i, idx, f)
                         s = 1.0 + self.ZOOM_AMPIEZZA * f
                         for blocco, r in enumerate(righe):
@@ -3650,9 +3662,10 @@ class KaraokeSubs:
         if righe:
             if not k_c:
                 return None
-            idx, passo = k_c
+            idx, passo = k_c[0], k_c[1]
             tok = self.o if righe[0] == "o" else self.h
-            u = (passo + 0.5) / self.ZOOM_PASSI
+            # progresso continuo del token (k_c[2]=u) se disponibile: salto fluido, senza gradini
+            u = k_c[2] if len(k_c) > 2 else (passo + 0.5) / self.ZOOM_PASSI
             p = idx - 1
             while p >= a and not tok[p].strip():
                 p -= 1
@@ -3694,9 +3707,14 @@ class SubtitleOverlay(QWidget):
         self._zampa = None
         self._cache = None
         self._scale = 1.0
+        self.use_star = False  # True = stella arrotondata, False = zampa di gatto
         parent.installEventFilter(self)
         self.setGeometry(parent.rect())
         self.hide()
+
+    def set_use_star(self, on):
+        self.use_star = bool(on)
+        self.update()
 
     def eventFilter(self, obj, ev):
         if obj is self.parent() and ev.type() == QEvent.Resize:
@@ -3775,7 +3793,10 @@ class SubtitleOverlay(QWidget):
         if self._zoom:
             self._disegna_zoom(p, doc, x, y, px, r)
         if self._zampa:
-            self._disegna_zampa(p, doc, x, y, px, r)
+            if getattr(self, "use_star", False):
+                self._disegna_stella(p, doc, x, y, px, r)
+            else:
+                self._disegna_zampa(p, doc, x, y, px, r)
         p.end()
 
     @staticmethod
@@ -3806,30 +3827,106 @@ class SubtitleOverlay(QWidget):
         riposo = top - S * 0.5             # centro della zampa quando e' posata sopra la lettera
         ca = self._centro_lettera(doc, x, y, blocco, A[0], A[1]) if A else None
         e = s * s * (3.0 - 2.0 * s)        # partenza e arrivo dolci in orizzontale
+
         if ca is not None:
             px0, py0 = ca[0], ca[1] - S * 0.5
             cx = px0 + (cx - px0) * e
             riposo = py0 + (riposo - py0) * e
-            alza = S * 0.9 * 4.0 * s * (1.0 - s)          # arco del salto
-            ang = 14.0 * math.sin(math.pi * s) * (1.0 if cb[0] >= px0 else -1.0)
+            alza = S * 0.95 * 4.0 * s * (1.0 - s)          # arco parabolico del salto
+            # Oscillazione di +-55° rispetto all'asse verticale lungo il salto
+            direzione = 1.0 if cb[0] >= px0 else -1.0
+            ang = 55.0 * math.sin(2.0 * math.pi * s) * direzione
         else:                              # prima lettera: la zampa scende dall'alto
             alza = S * 1.6 * (1.0 - e)
             ang = 0.0
+
         cy = riposo - alza
-        sx, sy = 1.0 + 0.18 * q, 1.0 - 0.22 * q            # schiacciamento all'atterraggio
+
+        # Dinamica di salto: estensione elastica in volo (stretch) e schiacciamento all'impatto (squash)
+        stretch = 0.12 * math.sin(math.pi * s) if ca is not None and s < 1.0 else 0.0
+        sx = (1.0 + 0.18 * q) * (1.0 - stretch * 0.5)
+        sy = (1.0 - 0.22 * q) * (1.0 + stretch)
+
         path = QPainterPath()
         path.addEllipse(QPointF(0.0, 0.16 * S), 0.34 * S, 0.27 * S)            # cuscinetto
         for dx, dy, rx, ry in ((-0.40, -0.14, 0.12, 0.155), (-0.14, -0.36, 0.12, 0.155),
                                (0.14, -0.36, 0.12, 0.155), (0.40, -0.14, 0.12, 0.155)):
             path.addEllipse(QPointF(dx * S, dy * S), rx * S, ry * S)           # polpastrelli
+
         p.save()
         p.setRenderHint(QPainter.Antialiasing)
-        p.translate(cx, cy + 0.43 * S)     # perno in basso: lo schiacciamento appoggia la zampa sulla lettera
+        p.translate(cx, cy + 0.43 * S)     # perno in basso per oscillazione e appoggio
         p.rotate(ang)
         p.scale(sx, sy)
         p.translate(0.0, -0.43 * S)
         p.strokePath(path, QPen(QColor("#000000"), 2 * r + 1, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         p.fillPath(path, QColor("#ff9ec4"))
+        p.restore()
+
+    def _disegna_stella(self, p, doc, x, y, px, r):
+        """Stella arrotondata dorata con contorno nero che salta dalla lettera precedente a quella corrente."""
+        blocco, A, B, s, q = self._zampa
+        cb = self._centro_lettera(doc, x, y, blocco, B[0], B[1])
+        if cb is None:
+            return
+        S = px * 0.85                      # dimensione della stella
+        cx, top, _ = cb
+        riposo = top - S * 0.5             # centro quando e' posata sopra la lettera
+        ca = self._centro_lettera(doc, x, y, blocco, A[0], A[1]) if A else None
+        e = s * s * (3.0 - 2.0 * s)        # partenza e arrivo dolci in orizzontale
+
+        if ca is not None:
+            px0, py0 = ca[0], ca[1] - S * 0.5
+            cx = px0 + (cx - px0) * e
+            riposo = py0 + (riposo - py0) * e
+            alza = S * 0.95 * 4.0 * s * (1.0 - s)          # arco parabolico del salto
+            # Oscillazione di +-55° rispetto all'asse verticale lungo il salto
+            direzione = 1.0 if cb[0] >= px0 else -1.0
+            ang = 55.0 * math.sin(2.0 * math.pi * s) * direzione
+        else:                              # prima lettera: scende dall'alto
+            alza = S * 1.6 * (1.0 - e)
+            ang = 0.0
+
+        cy = riposo - alza
+
+        # Dinamica di salto: estensione elastica in volo (stretch) e schiacciamento all'impatto (squash)
+        stretch = 0.12 * math.sin(math.pi * s) if ca is not None and s < 1.0 else 0.0
+        sx = (1.0 + 0.18 * q) * (1.0 - stretch * 0.5)
+        sy = (1.0 - 0.22 * q) * (1.0 + stretch)
+
+        # Tracciato della stella a 5 punte arrotondata
+        pts = []
+        r_out = S * 0.46
+        r_in = S * 0.22
+        for k in range(10):
+            rad = -math.pi / 2.0 + k * (math.pi / 5.0)
+            dist = r_out if (k % 2 == 0) else r_in
+            pts.append(QPointF(dist * math.cos(rad), dist * math.sin(rad)))
+
+        path = QPainterPath()
+        p0 = QPointF((pts[9].x() + pts[0].x()) / 2.0, (pts[9].y() + pts[0].y()) / 2.0)
+        path.moveTo(p0)
+        for k in range(10):
+            nxt = (k + 1) % 10
+            mid = QPointF((pts[k].x() + pts[nxt].x()) / 2.0, (pts[k].y() + pts[nxt].y()) / 2.0)
+            path.quadTo(pts[k], mid)
+        path.closeSubpath()
+
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing)
+        p.translate(cx, cy + 0.38 * S)     # perno in basso per oscillazione e appoggio
+        p.rotate(ang)
+        p.scale(sx, sy)
+        p.translate(0.0, -0.38 * S)
+
+        # Contorno nero e riempimento oro brillante
+        p.strokePath(path, QPen(QColor("#000000"), 2 * r + 1, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.fillPath(path, QColor("#ffd43f"))
+
+        # Riflesso lucido in alto a sinistra
+        shine = QPainterPath()
+        shine.addEllipse(QPointF(-0.11 * S, -0.13 * S), 0.08 * S, 0.055 * S)
+        p.fillPath(shine, QColor(255, 255, 255, 175))
         p.restore()
 
     def _disegna_zoom(self, p, doc, x, y, px, r):
@@ -4081,6 +4178,7 @@ class NekoPlayer(QMainWindow):
         self.sub_show_trans = True  # riga della traduzione (spunta nel menu)
         self.sub_zoom = True        # zoom leggero sulla lettera in riproduzione (spunta nel menu)
         self.sub_zampa = True       # zampa di gatto che salta di lettera in lettera (spunta nel menu)
+        self.sub_star = False       # True = stella arrotondata, False = zampa
         self.sub_transition = True  # transizione sui kanji prima e dopo quello pronunciato (spunta nel menu)
         self.sub_scale = 1.0        # dimensione dei sottotitoli (+ / - da tastiera), salvata in config
         self.always_on_top = ALWAYS_ON_TOP     # spunta nel menu: finestra sopra tutte le altre
@@ -4242,6 +4340,7 @@ class NekoPlayer(QMainWindow):
         self._wave_timer.timeout.connect(self._tick_audio_mode)
         self.sub_overlay = SubtitleOverlay(self.video_display)
         self.sub_overlay.set_scale(self.sub_scale)
+        self.sub_overlay.set_use_star(self.sub_star)
         self.clock_overlay = ClockOverlay(self.video_display)
         self.clock_overlay.minute_rolled_over = self.on_clock_minute
         self.clock_overlay.set_bg_color(self.theme_color)
@@ -5555,6 +5654,7 @@ class NekoPlayer(QMainWindow):
             ("Traduzione", self.toggle_sub_trans, self.subs is not None, bool(self.sub_show_trans)),
             ("Zoom sulla lettera", self.toggle_sub_zoom, self.subs is not None, bool(self.sub_zoom)),
             ("Zampa di gatto", self.toggle_sub_zampa, self.subs is not None, bool(self.sub_zampa)),
+            ("Stella arrotondata", self.toggle_sub_star, self.subs is not None, bool(self.sub_star)),
             ("Transizione kanji vicini", self.toggle_sub_transition, self.subs is not None, bool(self.sub_transition)),
             ("Sempre in primo piano", self.toggle_always_on_top,
              can_fit and FREE_WINDOW_MOVE and sys.platform.startswith("linux"), bool(self.always_on_top)),
@@ -5593,7 +5693,7 @@ class NekoPlayer(QMainWindow):
                 self._sub_key = None
                 self.sub_overlay.set_html("")
             return
-        k = self.subs.chiave(self.audio_player.position() / 1000.0, self.sub_zoom)
+        k = self.subs.chiave(self.audio_player.position() / 1000.0, self.sub_zoom, self.sub_zampa)
         if k == self._sub_key: return
         self._sub_key = k
         if k == (None, None, None, None):
@@ -5666,6 +5766,12 @@ class NekoPlayer(QMainWindow):
 
     def toggle_sub_zampa(self):
         self.sub_zampa = not self.sub_zampa
+        self._sub_key = None
+        self.save_settings()
+
+    def toggle_sub_star(self):
+        self.sub_star = not self.sub_star
+        self.sub_overlay.set_use_star(self.sub_star)
         self._sub_key = None
         self.save_settings()
 
@@ -6075,6 +6181,7 @@ class NekoPlayer(QMainWindow):
             "subtitles_translation": bool(self.sub_show_trans),
             "subtitles_zoom": bool(self.sub_zoom),
             "subtitles_zampa": bool(self.sub_zampa),
+            "subtitles_star": bool(self.sub_star),
             "subtitles_transition": bool(self.sub_transition),
             "subtitles_scale": float(self.sub_scale),
             "show_bg_texture": self.chk_texture.isChecked(),
@@ -6175,6 +6282,8 @@ class NekoPlayer(QMainWindow):
             self.sub_show_trans = bool(config_data.get("subtitles_translation", True))
             self.sub_zoom = bool(config_data.get("subtitles_zoom", True))
             self.sub_zampa = bool(config_data.get("subtitles_zampa", True))
+            self.sub_star = bool(config_data.get("subtitles_star", False))
+            self.sub_overlay.set_use_star(self.sub_star)
             self.sub_transition = bool(config_data.get("subtitles_transition", True))
             try:
                 self.sub_scale = min(SUB_SCALE_MAX, max(SUB_SCALE_MIN, float(config_data.get("subtitles_scale", 1.0))))
