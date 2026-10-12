@@ -979,6 +979,9 @@ class EyeSlider(QSlider):
         self.setFixedHeight(int(round(self.TOP + self._depth + self.BOTTOM)))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._dragging = False
+        self.setMouseTracking(True)       # il mouse si segue anche senza tasti premuti (tempo sotto il cursore)
+        self._hover_x = None              # x del mouse sulla barra (None = mouse fuori)
+        self.time_fn = None               # callable(valore) -> testo del tempo da mostrare (impostata dal player)
     @classmethod
     def depth_for_width(cls, arc_width):
         """Altezza della collina per un arco largo arc_width px (stessa regola della bocca)."""
@@ -1028,6 +1031,8 @@ class EyeSlider(QSlider):
             event.accept()
         else: event.ignore()
     def mouseMoveEvent(self, event):
+        self._hover_x = event.x()
+        self.update()
         if self._dragging:
             self._set_from_mouse(event.x())
             event.accept()
@@ -1035,13 +1040,47 @@ class EyeSlider(QSlider):
         if event.button() == Qt.LeftButton and self._dragging:
             self._dragging = False
             self.setSliderDown(False)         # emette sliderReleased
+            if not self.underMouse(): self._hover_x = None
+            self.update()
             event.accept()
     def enterEvent(self, event):
+        self._hover_x = self.mapFromGlobal(QCursor.pos()).x()
         self.update()
         super().enterEvent(event)
     def leaveEvent(self, event):
+        if not self._dragging: self._hover_x = None
         self.update()
         super().leaveEvent(event)
+    def hideEvent(self, event):
+        self._hover_x = None
+        super().hideEvent(event)
+    def _paint_hover_time(self, p):
+        """Etichetta col tempo del punto sotto il mouse (e un puntino sull'arco), dentro la collina."""
+        if self._hover_x is None or self.time_fn is None: return
+        testo = self.time_fn(self._value_from_x(self._hover_x))
+        if not testo: return
+        x0, x1, a, y_b, depth = self._geom()
+        xm = max(x0, min(x1, float(self._hover_x)))
+        if not self._dragging:       # durante il trascinamento c'e' gia' la maniglia
+            u = (xm - (x0 + a)) / a
+            ya = y_b - depth * math.sqrt(max(0.0, 1.0 - u * u))
+            p.setPen(QPen(QColor("#ffffff"), 2))
+            p.setBrush(QColor(255, 255, 255, 110))
+            p.drawEllipse(QPointF(xm, ya), 5.0, 5.0)
+        f = QFont(self.font())
+        f.setBold(True)
+        f.setPixelSize(13)
+        p.setFont(f)
+        fm = QFontMetrics(f)
+        pw, ph = fm.boundingRect(testo).width() + 16, fm.height() + 4
+        px = max(2.0, min(self.width() - pw - 2.0, xm - pw / 2.0))
+        py = max(1.0, min(self.height() - ph - 1.0, y_b - depth * 0.4 - ph / 2.0))
+        rect = QRectF(px, py, pw, ph)
+        p.setPen(QPen(QColor(self.ON_COLOR), 1.5))
+        p.setBrush(QColor(15, 12, 18, 235))
+        p.drawRoundedRect(rect, ph / 2.0, ph / 2.0)
+        p.setPen(QColor("#ffffff"))
+        p.drawText(rect, Qt.AlignCenter, testo)
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
@@ -1063,6 +1102,7 @@ class EyeSlider(QSlider):
         p.setPen(QPen(QColor(self.ON_COLOR), 2))
         p.setBrush(QColor("#0aa633" if hover else "#0aa633"))
         p.drawEllipse(QPointF(hx, hy), 11.0, 11.0)
+        self._paint_hover_time(p)
         p.end()
 
 class MouthStemOverlay(QWidget):
@@ -3131,6 +3171,9 @@ SUB_UNSPOKEN = "#ffffff"  # parte non ancora pronunciata
 SUB_CURRENT = "#ff2a2a"   # picco di rosso della lettera/token pronunciato in questo istante
 SUB_TRAD_CURRENT = "#00b0ff"   # azzurro intenso: parte della traduzione che corrisponde al token rosso
 SUB_TRAD = "#bfe3ff"     # traduzione non ancora illuminata
+SUB_SCALE_MIN = 0.5      # dimensione minima dei sottotitoli (1.0 = standard)
+SUB_SCALE_MAX = 3.0      # dimensione massima
+SUB_SCALE_STEP = 0.1     # passo per ogni pressione di + / -
 
 
 _RE_TS_SUB = re.compile(
@@ -3349,19 +3392,55 @@ class KaraokeSubs:
         f = (self._prog_jp(t) - ca) / (cb - ca) if cb - ca > 1e-9 else (t - a) / (b - a)
         return min(1.0, max(0.0, f))
 
-    TRAD_CODA = ((1, 0.55), (2, 0.2))   # lettere appena superate: (distanza, quanto resta azzurro)
+    # Forza dell'azzurro (e dello zoom) di una lettera in funzione di d = posizione raggiunta - indice lettera
+    # (in lettere, continua): sale in fretta quando la lettera viene raggiunta, tiene fino alla successiva,
+    # poi scende piano lungo la coda (la lettera successiva e' a d-1). Interpolazione liscia tra i punti.
+    TRAD_CURVA = ((0.0, 0.0), (0.3, 1.0), (1.0, 1.0), (2.0, 0.55), (3.0, 0.2), (4.0, 0.0))
+    TRAD_PASSI = 4      # sotto-passi per lettera (ridisegni): piu' alto = transizione piu' fluida, ma piu' lavoro
 
-    def _lettera_trad(self, i, t):
-        """Indice della lettera della riga tradotta i raggiunta al tempo t (avanza lettera per lettera,
-        seguendo il giapponese cantato); len(testo) = riga finita. Gli spazi si saltano."""
+    def _posizione_trad(self, i, t):
+        """(lettera h, sotto-passo) della riga tradotta i al tempo t: h avanza lettera per lettera, seguendo il
+        giapponese cantato (len(testo) = riga finita; gli spazi si saltano); il sotto-passo (0..TRAD_PASSI-1)
+        dice a che punto della lettera h si e' arrivati."""
         testo = self.tr[i]
         n = len(testo)
         if n == 0 or t >= self.t1_t[i]:
-            return n
-        h = min(n - 1, int(self._frazione_trad(i, t) * n))
+            return n, 0
+        x = self._frazione_trad(i, t) * n
+        h = min(n - 1, int(x))
+        passo = min(self.TRAD_PASSI - 1, int((x - h) * self.TRAD_PASSI)) if h == int(x) else 0
         while h < n and testo[h].isspace():
             h += 1
-        return h if h < n else n
+            passo = 0
+        return (h, passo) if h < n else (n, 0)
+
+    def _forza_trad(self, d):
+        """Forza 0..1 di una lettera a distanza d (in lettere) dalla posizione raggiunta."""
+        c = self.TRAD_CURVA
+        if d <= c[0][0] or d >= c[-1][0]:
+            return 0.0
+        for (d0, f0), (d1, f1) in zip(c, c[1:]):
+            if d0 <= d <= d1:
+                return f0 + (f1 - f0) * self._liscia((d - d0) / (d1 - d0))
+        return 0.0
+
+    def _lettere_evidenziate(self, i, h, passo=0):
+        """Lettere azzurre della riga tradotta i quando la posizione raggiunta e' h + passo/TRAD_PASSI:
+        {indice: (forza 0..1, colore)}. Gli spazi non contano."""
+        testo = self.tr[i]
+        n = len(testo)
+        out = {}
+        if h < n:                 # riga finita: tutto uguale, niente lettera illuminata
+            pos = h + (passo + 0.5) / self.TRAD_PASSI
+            for j in range(max(0, h - int(self.TRAD_CURVA[-1][0])), h + 1):
+                if testo[j].isspace():
+                    continue
+                d = pos - j
+                f = self._forza_trad(d)
+                if f > 1e-3:
+                    base = SUB_TRAD if d < 0.5 else SUB_SPOKEN   # come i kanji: da non ancora detto verso il blu, poi verso il detto
+                    out[j] = (f, mix_colore(base, SUB_TRAD_CURRENT, f))
+        return out
 
     def _intervallo_trad(self, i, idx):
         """Intervallo [c0, c1) di caratteri della riga tradotta i che corrisponde al token giapponese
@@ -3393,6 +3472,11 @@ class KaraokeSubs:
 
     ZOOM_PASSI = 16      # a quanti passi si divide la durata di un token (ridisegni di zoom e colore)
     ZOOM_AMPIEZZA = 0.25  # ingrandimento massimo: +25%
+    ZOOM_TRAD_AMPIEZZA = 0.25  # ingrandimento massimo della lettera azzurra della traduzione (la coda segue TRAD_CURVA)
+    # Transizione sui kanji vicini a quello pronunciato: (distanza in token, forza rispetto al token corrente).
+    # I vicini seguono la stessa curva del token corrente (sale, tiene, scende) ma attenuata: a inizio e fine
+    # token l'intensita' e' zero, quindi non ci sono salti con l'effetto dei token adiacenti.
+    VICINI = ((1, 0.40), (2, 0.15))
 
     @staticmethod
     def _liscia(x):
@@ -3413,6 +3497,22 @@ class KaraokeSubs:
         u = (passo + 0.5) / self.ZOOM_PASSI
         base = SUB_TRAD if u < 0.5 else SUB_SPOKEN
         return mix_colore(base, SUB_TRAD_CURRENT, self._env(passo))
+
+    def _vicini(self, idx, passo):
+        """[(indice token, intensita' 0..1)] dei token prima e dopo quello in riproduzione (solo nella stessa riga)."""
+        a, b = self.seg_range[self.seg[idx]]
+        e = self._env(passo)
+        out = []
+        for dist, forza in self.VICINI:
+            for i in (idx - dist, idx + dist):
+                if a <= i < b and self.o[i].strip():
+                    out.append((i, e * forza))
+        return out
+
+    @staticmethod
+    def _colore_vicino(i, idx, f):
+        """Colore di un token vicino: parte dal suo colore normale (gia' detto / non ancora detto) verso il rosso."""
+        return mix_colore(SUB_SPOKEN if i < idx else SUB_UNSPOKEN, SUB_CURRENT, f)
 
     def _colore_corrente(self, passo):
         """Colore del token in riproduzione: dal bianco sale al rosso, poi si raffredda
@@ -3438,44 +3538,56 @@ class KaraokeSubs:
         if self.tr:
             it = bisect_right(self.t0_t, t) - 1
             if it >= 0 and t <= self.t1_t[it] + 1.5:
-                k_tr = (it, self._lettera_trad(it, t))    # lettera azzurra = punto raggiunto dal canto
+                h_tr, p_tr = self._posizione_trad(it, t)
+                k_tr = (it, h_tr, p_tr, bool(zoom))    # lettera azzurra = punto raggiunto dal canto
         return (k_jp, k_tr, k_z, k_c)
 
-    def _riga(self, tok, a, b, idx, nascondi=None, corrente=None):
+    def _riga(self, tok, a, b, idx, nascondi=(), corrente=None, vicini=None):
         out = []
         for i in range(a, b):
             col = SUB_SPOKEN if i <= idx else SUB_UNSPOKEN
             if i == idx and corrente:
                 col = corrente           # token in riproduzione: sfumatura verso il rosso
-            if i == nascondi and tok[i].strip():
+            elif vicini and i in vicini:
+                col = vicini[i]          # token prima/dopo: transizione attenuata
+            if i in nascondi and tok[i].strip():
                 col = "transparent"      # la lettera in zoom la disegna l'overlay
             out.append('<span style="color:%s;">%s</span>' % (col, escape(tok[i])))
         return '<div style="white-space: pre-wrap;">%s</div>' % "".join(out)
 
-    def html(self, k):
+    def _righe_jp(self, a, b, show_o=True, show_h=True):
+        """Righe giapponesi visibili per il segmento [a, b): lista di 'o' (kanji) / 'h' (hiragana), in ordine.
+        Se hiragana e testo sono identici c'e' una sola riga, mostrata se serve almeno uno dei due."""
+        if self.h[a:b] != self.o[a:b]:
+            return (["o"] if show_o else []) + (["h"] if show_h else [])
+        return ["o"] if (show_o or show_h) else []
+
+    def html(self, k, trans=False, show_o=True, show_h=True, show_t=True):
         k_jp, k_tr, k_z, k_c = k
-        nascondi = k_z[0] if k_z else None
         corrente = self._colore_corrente(k_c[1]) if k_c else None
+        vicini = {}
+        if trans and k_c:
+            vicini = {i: self._colore_vicino(i, k_c[0], f) for i, f in self._vicini(*k_c)}
+        nascondi = set()
+        if k_z:
+            nascondi.add(k_z[0])
+            nascondi.update(vicini)          # con lo zoom attivo anche i vicini li disegna l'overlay
         righe = []
         if k_jp is not None:
             idx = k_jp[0]
             a, b = self.seg_range[self.seg[idx]]
-            righe.append(self._riga(self.o, a, b, idx, nascondi, corrente))
-            if self.h[a:b] != self.o[a:b]:   # niente riga hiragana se identica al testo
-                righe.append(self._riga(self.h, a, b, idx, nascondi, corrente))
-        if k_tr is not None:
+            for r in self._righe_jp(a, b, show_o, show_h):   # niente riga hiragana se identica al testo
+                righe.append(self._riga(self.o if r == "o" else self.h, a, b, idx, nascondi, corrente, vicini))
+        if k_tr is not None and show_t:
             testo = self.tr[k_tr[0]]
             out = ""
             h = k_tr[1]
             n = len(testo)
             # lettere singole: quella raggiunta e' azzurro intenso, le 2 precedenti sfumano verso il
             # colore delle gia' pronunciate; il resto e' gia' detto / non ancora detto
-            colori = {}
-            if h < n:                 # riga finita: tutto uguale, niente lettera illuminata
-                colori[h] = SUB_TRAD_CURRENT
-                for dist, forza in self.TRAD_CODA:
-                    colori[h - dist] = mix_colore(SUB_SPOKEN, SUB_TRAD_CURRENT, forza)
-            colori = {j: c for j, c in colori.items() if 0 <= j < n and not testo[j].isspace()}
+            colori = {j: v[1] for j, v in self._lettere_evidenziate(k_tr[0], h, k_tr[2]).items()}
+            if k_tr[3]:               # con lo zoom attivo le lettere azzurre le disegna l'overlay
+                colori = {j: "transparent" for j in colori}
             j = 0
             while j < n:
                 if j in colori:
@@ -3490,20 +3602,84 @@ class KaraokeSubs:
             righe.append('<div style="white-space: pre-wrap;">%s</div>' % out)
         return "".join(righe)
 
-    def zoom_tokens(self, k):
-        """Lettere da disegnare ingrandite: [(blocco, posizione UTF-16 nel blocco, testo, scala)].
-        I blocchi sono le righe del html(): kanji, poi (se diversa) hiragana."""
-        k_z = k[2]
-        if not k_z or k[0] is None:
-            return ()
-        idx, passo = k_z
-        a, b = self.seg_range[self.seg[idx]]
-        sc = self._scala_zoom(passo)
-        col = self._colore_corrente(passo)
-        out = [(0, l16("".join(self.o[a:idx])), self.o[idx], sc, col)]
-        if self.h[a:b] != self.o[a:b]:
-            out.append((1, l16("".join(self.h[a:idx])), self.h[idx], sc, col))
+    def zoom_tokens(self, k, trans=False, show_o=True, show_h=True, show_t=True):
+        """Lettere da disegnare ingrandite: [(blocco, posizione UTF-16 nel blocco, testo, scala, colore)].
+        I blocchi sono le righe del html(): kanji, poi (se diversa) hiragana, poi la traduzione."""
+        k_jp, k_tr, k_z = k[0], k[1], k[2]
+        out = []
+        n_righe = 0
+        if k_jp is not None:
+            a, b = self.seg_range[self.seg[k_jp[0]]]
+            righe = self._righe_jp(a, b, show_o, show_h)   # il numero di blocco e' la posizione della riga visibile
+            n_righe = len(righe)
+            if k_z:
+                idx, passo = k_z
+                sc = self._scala_zoom(passo)
+                col = self._colore_corrente(passo)
+                for blocco, r in enumerate(righe):
+                    tok = self.o if r == "o" else self.h
+                    out.append((blocco, l16("".join(tok[a:idx])), tok[idx], sc, col))
+                if trans:
+                    for i, f in self._vicini(idx, passo):
+                        c = self._colore_vicino(i, idx, f)
+                        s = 1.0 + self.ZOOM_AMPIEZZA * f
+                        for blocco, r in enumerate(righe):
+                            tok = self.o if r == "o" else self.h
+                            out.append((blocco, l16("".join(tok[a:i])), tok[i], s, c))
+        if show_t and k_tr is not None and k_tr[3]:
+            # traduzione: la lettera azzurra e la sua coda crescono in proporzione alla forza (come i kanji vicini)
+            testo = self.tr[k_tr[0]]
+            for j, (forza, c) in self._lettere_evidenziate(k_tr[0], k_tr[1], k_tr[2]).items():
+                out.append((n_righe, l16(testo[:j]), testo[j], 1.0 + self.ZOOM_TRAD_AMPIEZZA * forza, c))
         return tuple(out)
+
+
+    ZAMPA_SALTO = 0.4      # frazione della durata di un token kanji impiegata per il salto (poi resta posata)
+    ZAMPA_SALTO_TRAD = 0.8  # idem per le lettere della traduzione
+
+    def zampa(self, k, show_o=True, show_h=True, show_t=True):
+        """Zampa di gatto che salta di lettera in lettera: (blocco, A, B, s, q) oppure None.
+        A = lettera di partenza (posizione UTF-16, testo) o None; B = lettera corrente; s = avanzamento
+        del salto 0..1; q = schiacciamento all'atterraggio 0..1. Sta sopra la riga giapponese (kanji o
+        hiragana) o, se non ce n'e', sopra la traduzione."""
+        k_jp, k_tr, k_c = k[0], k[1], k[3]
+        righe = []
+        if k_jp is not None:
+            a, b = self.seg_range[self.seg[k_jp[0]]]
+            righe = self._righe_jp(a, b, show_o, show_h)
+        if righe:
+            if not k_c:
+                return None
+            idx, passo = k_c
+            tok = self.o if righe[0] == "o" else self.h
+            u = (passo + 0.5) / self.ZOOM_PASSI
+            p = idx - 1
+            while p >= a and not tok[p].strip():
+                p -= 1
+            A = (l16("".join(tok[a:p])), tok[p]) if p >= a else None
+            B = (l16("".join(tok[a:idx])), tok[idx])
+            s, fine = min(1.0, u / self.ZAMPA_SALTO), self.ZAMPA_SALTO
+            span = 0.2
+        elif show_t and k_tr is not None:
+            it, h, passo = k_tr[0], k_tr[1], k_tr[2]
+            testo = self.tr[it]
+            if h >= len(testo):
+                return None
+            u = (passo + 0.5) / self.TRAD_PASSI
+            p = h - 1
+            while p >= 0 and testo[p].isspace():
+                p -= 1
+            A = (l16(testo[:p]), testo[p]) if p >= 0 else None
+            B = (l16(testo[:h]), testo[h])
+            s, fine = min(1.0, u / self.ZAMPA_SALTO_TRAD), self.ZAMPA_SALTO_TRAD
+            span = 1.0 - fine
+        else:
+            return None
+        q = 0.0
+        if u > fine and span > 1e-6:
+            x = (u - fine) / span
+            q = math.sin(math.pi * x) if x < 1.0 else 0.0
+        return (0, A, B, round(s, 3), round(q, 3))
 
 
 class SubtitleOverlay(QWidget):
@@ -3515,7 +3691,9 @@ class SubtitleOverlay(QWidget):
         self.setFocusPolicy(Qt.NoFocus)
         self._html = ""
         self._zoom = ()
+        self._zampa = None
         self._cache = None
+        self._scale = 1.0
         parent.installEventFilter(self)
         self.setGeometry(parent.rect())
         self.hide()
@@ -3525,13 +3703,23 @@ class SubtitleOverlay(QWidget):
             self.setGeometry(self.parent().rect())
         return False
 
-    def set_html(self, html, zoom=()):
-        if html == self._html and zoom == self._zoom:
+    def set_scale(self, scale):
+        """Moltiplicatore della dimensione del testo (kanji, hiragana e traduzione insieme)."""
+        scale = min(SUB_SCALE_MAX, max(SUB_SCALE_MIN, float(scale)))
+        if abs(scale - self._scale) < 1e-6:
+            return
+        self._scale = scale
+        self._cache = None
+        self.update()
+
+    def set_html(self, html, zoom=(), zampa=None):
+        if html == self._html and zoom == self._zoom and zampa == self._zampa:
             return
         if html != self._html:
             self._cache = None
         self._html = html
         self._zoom = tuple(zoom)
+        self._zampa = zampa
         self.setVisible(bool(html))
         if html:
             self.raise_()
@@ -3557,6 +3745,8 @@ class SubtitleOverlay(QWidget):
         win = self.window()
         rect_mode = win.isFullScreen() or win.isMaximized()
         px = max(13, min(int(h * 0.05), 46))
+        if abs(self._scale - 1.0) > 1e-6:      # a 100% resta il calcolo originale, senza arrotondamenti né limiti
+            px = max(8, min(int(round(px * self._scale)), max(px, int(h * 0.2))))
         y_bottom = h * (0.95 if rect_mode else 0.86)
         # nella finestra ellittica il testo sta dentro la corda dell'ellisse all'altezza dell'ultima riga
         larg = int(w * 0.92) if rect_mode else int(2 * ellipse_half_width(w, h, y_bottom) * 0.9)
@@ -3584,7 +3774,63 @@ class SubtitleOverlay(QWidget):
         p.translate(-x, -y)
         if self._zoom:
             self._disegna_zoom(p, doc, x, y, px, r)
+        if self._zampa:
+            self._disegna_zampa(p, doc, x, y, px, r)
         p.end()
+
+    @staticmethod
+    def _centro_lettera(doc, x, y, blocco, off, testo):
+        """(centro x, cima della riga, linea di base) della lettera nel documento, o None."""
+        b = doc.findBlockByNumber(blocco)
+        lay = b.layout() if b.isValid() else None
+        if lay is None or lay.lineCount() == 0 or not testo.strip():
+            return None
+        pos = min(off, max(0, b.length() - 1))
+        riga = lay.lineForTextPosition(pos)
+        if not riga.isValid():
+            return None
+        fine = min(pos + l16(testo), riga.textStart() + riga.textLength())
+        x0 = riga.cursorToX(pos)[0]
+        x1 = riga.cursorToX(fine)[0]
+        top = y + lay.position().y() + riga.y()
+        return (x + lay.position().x() + (x0 + x1) / 2.0, top, top + riga.ascent())
+
+    def _disegna_zampa(self, p, doc, x, y, px, r):
+        """Zampa di gatto rosa con contorno nero che salta dalla lettera precedente a quella corrente."""
+        blocco, A, B, s, q = self._zampa
+        cb = self._centro_lettera(doc, x, y, blocco, B[0], B[1])
+        if cb is None:
+            return
+        S = px * 0.85                      # dimensione della zampa
+        cx, top, _ = cb
+        riposo = top - S * 0.5             # centro della zampa quando e' posata sopra la lettera
+        ca = self._centro_lettera(doc, x, y, blocco, A[0], A[1]) if A else None
+        e = s * s * (3.0 - 2.0 * s)        # partenza e arrivo dolci in orizzontale
+        if ca is not None:
+            px0, py0 = ca[0], ca[1] - S * 0.5
+            cx = px0 + (cx - px0) * e
+            riposo = py0 + (riposo - py0) * e
+            alza = S * 0.9 * 4.0 * s * (1.0 - s)          # arco del salto
+            ang = 14.0 * math.sin(math.pi * s) * (1.0 if cb[0] >= px0 else -1.0)
+        else:                              # prima lettera: la zampa scende dall'alto
+            alza = S * 1.6 * (1.0 - e)
+            ang = 0.0
+        cy = riposo - alza
+        sx, sy = 1.0 + 0.18 * q, 1.0 - 0.22 * q            # schiacciamento all'atterraggio
+        path = QPainterPath()
+        path.addEllipse(QPointF(0.0, 0.16 * S), 0.34 * S, 0.27 * S)            # cuscinetto
+        for dx, dy, rx, ry in ((-0.40, -0.14, 0.12, 0.155), (-0.14, -0.36, 0.12, 0.155),
+                               (0.14, -0.36, 0.12, 0.155), (0.40, -0.14, 0.12, 0.155)):
+            path.addEllipse(QPointF(dx * S, dy * S), rx * S, ry * S)           # polpastrelli
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing)
+        p.translate(cx, cy + 0.43 * S)     # perno in basso: lo schiacciamento appoggia la zampa sulla lettera
+        p.rotate(ang)
+        p.scale(sx, sy)
+        p.translate(0.0, -0.43 * S)
+        p.strokePath(path, QPen(QColor("#000000"), 2 * r + 1, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.fillPath(path, QColor("#ff9ec4"))
+        p.restore()
 
     def _disegna_zoom(self, p, doc, x, y, px, r):
         """Disegna ingrandita (con contorno nero) la lettera in riproduzione: nel testo e' trasparente."""
@@ -3830,7 +4076,13 @@ class NekoPlayer(QMainWindow):
         self.show_osd = False
         self.subs = None            # KaraokeSubs del video corrente (se esiste il _karaoke.json)
         self.subs_enabled = True    # spunta nel menu contestuale
+        self.sub_show_kanji = True  # riga dei kanji (spunta nel menu)
+        self.sub_show_hira = True   # riga degli hiragana (spunta nel menu)
+        self.sub_show_trans = True  # riga della traduzione (spunta nel menu)
         self.sub_zoom = True        # zoom leggero sulla lettera in riproduzione (spunta nel menu)
+        self.sub_zampa = True       # zampa di gatto che salta di lettera in lettera (spunta nel menu)
+        self.sub_transition = True  # transizione sui kanji prima e dopo quello pronunciato (spunta nel menu)
+        self.sub_scale = 1.0        # dimensione dei sottotitoli (+ / - da tastiera), salvata in config
         self.always_on_top = ALWAYS_ON_TOP     # spunta nel menu: finestra sopra tutte le altre
         self.vsync_enabled = self._leggi_config_bool("vsync_display", True)   # anti-tearing (spunta nel menu, al riavvio)
         self._audio_only = False    # file solo audio: schermo nero + onda dei dB + karaoke
@@ -3989,6 +4241,7 @@ class NekoPlayer(QMainWindow):
         self._wave_timer.setInterval(33)
         self._wave_timer.timeout.connect(self._tick_audio_mode)
         self.sub_overlay = SubtitleOverlay(self.video_display)
+        self.sub_overlay.set_scale(self.sub_scale)
         self.clock_overlay = ClockOverlay(self.video_display)
         self.clock_overlay.minute_rolled_over = self.on_clock_minute
         self.clock_overlay.set_bg_color(self.theme_color)
@@ -4008,6 +4261,7 @@ class NekoPlayer(QMainWindow):
             sl.setFocusPolicy(Qt.NoFocus)
             sl.sliderPressed.connect(self.on_slider_pressed)
             sl.sliderReleased.connect(self.on_slider_released)
+            sl.time_fn = self._testo_tempo_slider
         def _link(src, dst):
             def f(v):
                 if dst.value() != v:
@@ -5296,7 +5550,12 @@ class NekoPlayer(QMainWindow):
             ("Minimal", self.toggle_minimal_mode, can_fit, bool(self._minimal_on)),
             ("Sottotitoli" if self.subs is not None else "Sottotitoli (nessun karaoke)",
              self.toggle_subtitles, self.subs is not None, bool(self.subs_enabled and self.subs is not None)),
+            ("Kanji", self.toggle_sub_kanji, self.subs is not None, bool(self.sub_show_kanji)),
+            ("Hiragana", self.toggle_sub_hira, self.subs is not None, bool(self.sub_show_hira)),
+            ("Traduzione", self.toggle_sub_trans, self.subs is not None, bool(self.sub_show_trans)),
             ("Zoom sulla lettera", self.toggle_sub_zoom, self.subs is not None, bool(self.sub_zoom)),
+            ("Zampa di gatto", self.toggle_sub_zampa, self.subs is not None, bool(self.sub_zampa)),
+            ("Transizione kanji vicini", self.toggle_sub_transition, self.subs is not None, bool(self.sub_transition)),
             ("Sempre in primo piano", self.toggle_always_on_top,
              can_fit and FREE_WINDOW_MOVE and sys.platform.startswith("linux"), bool(self.always_on_top)),
             ("V-Sync anti-tearing" + (" (al riavvio)" if self.vsync_enabled != self._vsync_active else ""),
@@ -5340,7 +5599,12 @@ class NekoPlayer(QMainWindow):
         if k == (None, None, None, None):
             self.sub_overlay.set_html("")
         else:
-            self.sub_overlay.set_html(self.subs.html(k), self.subs.zoom_tokens(k) if self.sub_zoom else ())
+            self.sub_overlay.set_html(
+                self.subs.html(k, self.sub_transition, self.sub_show_kanji, self.sub_show_hira, self.sub_show_trans),
+                self.subs.zoom_tokens(k, self.sub_transition, self.sub_show_kanji, self.sub_show_hira, self.sub_show_trans)
+                if self.sub_zoom else (),
+                self.subs.zampa(k, self.sub_show_kanji, self.sub_show_hira, self.sub_show_trans)
+                if self.sub_zampa else None)
 
     @staticmethod
     def _leggi_config_bool(chiave, default):
@@ -5380,8 +5644,45 @@ class NekoPlayer(QMainWindow):
         self.status.showMessage("V-Sync anti-tearing " + ("attivo" if self.vsync_enabled else "disattivato")
                                 + ": si applica al prossimo avvio di Neko Player")
 
+    def toggle_sub_kanji(self):
+        self.sub_show_kanji = not self.sub_show_kanji
+        self._sub_key = None
+        self.save_settings()
+
+    def toggle_sub_hira(self):
+        self.sub_show_hira = not self.sub_show_hira
+        self._sub_key = None
+        self.save_settings()
+
+    def toggle_sub_trans(self):
+        self.sub_show_trans = not self.sub_show_trans
+        self._sub_key = None
+        self.save_settings()
+
     def toggle_sub_zoom(self):
         self.sub_zoom = not self.sub_zoom
+        self._sub_key = None
+        self.save_settings()
+
+    def toggle_sub_zampa(self):
+        self.sub_zampa = not self.sub_zampa
+        self._sub_key = None
+        self.save_settings()
+
+    def _sottotitoli_attivi(self):
+        return self.subs is not None and self.subs_enabled
+
+    def cambia_dimensione_sottotitoli(self, delta):
+        """Aumenta/riduce kanji, hiragana e traduzione insieme; il valore resta salvato nella config."""
+        nuovo = round(min(SUB_SCALE_MAX, max(SUB_SCALE_MIN, self.sub_scale + delta)), 2)
+        if nuovo != self.sub_scale:
+            self.sub_scale = nuovo
+            self.sub_overlay.set_scale(nuovo)
+            self.save_settings()
+        self.status.showMessage(f"Dimensione sottotitoli: {int(round(self.sub_scale * 100))}%", 1500)
+
+    def toggle_sub_transition(self):
+        self.sub_transition = not self.sub_transition
         self._sub_key = None
         self.save_settings()
 
@@ -5769,7 +6070,13 @@ class NekoPlayer(QMainWindow):
             "vsync_display": self.vsync_enabled,
             "always_on_top": self.always_on_top,
             "subtitles_enabled": bool(self.subs_enabled),
+            "subtitles_kanji": bool(self.sub_show_kanji),
+            "subtitles_hiragana": bool(self.sub_show_hira),
+            "subtitles_translation": bool(self.sub_show_trans),
             "subtitles_zoom": bool(self.sub_zoom),
+            "subtitles_zampa": bool(self.sub_zampa),
+            "subtitles_transition": bool(self.sub_transition),
+            "subtitles_scale": float(self.sub_scale),
             "show_bg_texture": self.chk_texture.isChecked(),
             "video_fill_mode": getattr(self, "_video_fill_mode", "height"),
             "minimal_mode": bool(getattr(self, "_minimal_on", False)),
@@ -5863,7 +6170,16 @@ class NekoPlayer(QMainWindow):
             self._apply_minimal_size_limits(self._minimal_on)
             self.show_osd = config_data.get("show_osd", False)
             self.subs_enabled = bool(config_data.get("subtitles_enabled", True))
+            self.sub_show_kanji = bool(config_data.get("subtitles_kanji", True))
+            self.sub_show_hira = bool(config_data.get("subtitles_hiragana", True))
+            self.sub_show_trans = bool(config_data.get("subtitles_translation", True))
             self.sub_zoom = bool(config_data.get("subtitles_zoom", True))
+            self.sub_zampa = bool(config_data.get("subtitles_zampa", True))
+            self.sub_transition = bool(config_data.get("subtitles_transition", True))
+            try:
+                self.sub_scale = min(SUB_SCALE_MAX, max(SUB_SCALE_MIN, float(config_data.get("subtitles_scale", 1.0))))
+            except (TypeError, ValueError):
+                self.sub_scale = 1.0
             self.vsync_enabled = bool(config_data.get("vsync_display", True))
             self.last_video_dir = config_data.get("last_video_dir", "")
             self.last_model_dir = config_data.get("last_model_dir", "")
@@ -6030,11 +6346,13 @@ class NekoPlayer(QMainWindow):
         elif key == Qt.Key_E:
             self.cycle_audio_track()
             event.accept()
-        elif key in (Qt.Key_Plus, Qt.Key_Equal):
-            self.slider_volume.setValue(min(100, self.slider_volume.value() + 5))
-            event.accept()
-        elif key == Qt.Key_Minus:
-            self.slider_volume.setValue(max(0, self.slider_volume.value() - 5))
+        elif key in (Qt.Key_Plus, Qt.Key_Equal, Qt.Key_Minus):
+            su = key != Qt.Key_Minus
+            if self._sottotitoli_attivi() and not (event.modifiers() & Qt.ControlModifier):
+                self.cambia_dimensione_sottotitoli(SUB_SCALE_STEP if su else -SUB_SCALE_STEP)
+            else:       # senza sottotitoli (o con Ctrl) + / - regolano il volume
+                d = 5 if su else -5
+                self.slider_volume.setValue(min(100, max(0, self.slider_volume.value() + d)))
             event.accept()
         elif key == Qt.Key_Left:
             self.seek_relative(-5.0)
@@ -6056,6 +6374,14 @@ class NekoPlayer(QMainWindow):
         self.audio_player.setPosition(target_ms)
         if self._audio_only: return       # nessun decoder video da riposizionare
         self.worker.request_seek_seconds(delta_sec)
+
+    def _testo_tempo_slider(self, val):
+        """Tempo corrispondente a un valore dello slider (frame o ms: si usa la proporzione sulla durata) + durata totale."""
+        tot = self.total_duration_sec
+        lo, hi = self.slider.minimum(), self.slider.maximum()
+        if tot <= 0 or hi <= lo: return None
+        t = min(1.0, max(0.0, (val - lo) / float(hi - lo))) * tot
+        return f"{format_time(t)} / {format_time(tot)}"
 
     def on_slider_pressed(self): self.is_slider_dragged = True
     def on_slider_released(self):
