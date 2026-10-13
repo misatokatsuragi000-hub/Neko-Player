@@ -95,6 +95,38 @@ def _imposta_bypass_overlay(w, on):
     w.setWindowFlags(flags)
     if visibile: w.show()
 
+def _x11_imposta_focus(wid):
+    """Da' il focus di tastiera X11 alla finestra wid con XSetInputFocus(CurrentTime).
+    Le finestre senza window manager (override-redirect) non vengono mai attivate dal WM: activateWindow()
+    di Qt imposta il focus col timestamp dell'ultimo evento ricevuto, che il server scarta se un'altra app
+    (es. Nemo) ha preso il focus dopo. Con CurrentTime (0) la richiesta vale sempre. Un errore X (finestra
+    non visibile) viene ignorato: l'handler di default di Xlib terminerebbe il processo."""
+    if not sys.platform.startswith("linux"): return False
+    try:
+        xl = ctypes.CDLL("libX11.so.6")
+        xl.XOpenDisplay.restype = ctypes.c_void_p
+        xl.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        xl.XSetInputFocus.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        xl.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        xl.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        handler_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+        xl.XSetErrorHandler.restype = handler_t
+        xl.XSetErrorHandler.argtypes = [handler_t]
+        ignora = handler_t(lambda dpy, ev: 0)
+        dpy = xl.XOpenDisplay(None)
+        if not dpy: return False
+        try:
+            vecchio = xl.XSetErrorHandler(ignora)
+            xl.XSetInputFocus(dpy, int(wid), 2, 0)       # RevertToParent, CurrentTime
+            xl.XSync(dpy, 0)
+            xl.XSetErrorHandler(vecchio)
+        finally:
+            xl.XCloseDisplay(dpy)
+        return True
+    except Exception:
+        return False
+
+
 if USE_NATIVE_FILE_DIALOG:
     os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal"
 
@@ -114,13 +146,13 @@ import onnxruntime as ort
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QCheckBox, QStatusBar, QSlider, QStyle, QMessageBox,
-    QFileIconProvider, QTreeView, QToolButton, QSplitter, QColorDialog, QSizePolicy
+    QFileIconProvider, QTreeView, QToolButton, QSplitter, QColorDialog, QSizePolicy, QDialog
 )
 from PyQt5.QtGui import (
     QImage, QPixmap, QKeyEvent, QMouseEvent, QWheelEvent,
     QPainter, QColor, QPen, QBrush, QTransform, QRegion, QPainterPath,
     QPainterPathStroker, QIcon, QFont, QCursor, QFontMetrics, QLinearGradient, QPolygon,
-    QTextDocument, QTextOption
+    QTextDocument, QTextOption, QPolygonF
 )
 from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint, QPointF, QRect, QRectF, QSize, QEvent,
@@ -480,6 +512,8 @@ class CatEar(QWidget):
         self.anim_step = 0
         self.anim_total_steps = 18
         self._unit_pts = None
+        self._hull = None       # inviluppo convesso della parte opaca (coordinate normalizzate)
+        self._update_mask()
     def _opaque_unit_points(self):
         # Pixel opachi della texture in coordinate normalizzate (0..1), calcolati una sola volta
         if self._unit_pts is None:
@@ -518,6 +552,45 @@ class CatEar(QWidget):
         x = (u - 0.5) * ear_w
         y = (v - 1.0) * ear_h
         return float(-(x * sp + y * ca).min())
+    def _hull_unit(self):
+        # contorno (inviluppo convesso) dei pixel opachi della texture, calcolato una sola volta
+        if self._hull is None:
+            self._hull = False
+            pts = self._opaque_unit_points()
+            if pts is not None:
+                try:
+                    arr = np.stack((pts[0] * 1000.0, pts[1] * 1000.0), 1).astype(np.int32).reshape(-1, 1, 2)
+                    hull = cv2.convexHull(arr).reshape(-1, 2) / 1000.0
+                    self._hull = [(float(x), float(y)) for x, y in hull]
+                except Exception: self._hull = False
+        return self._hull or [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+    def _update_mask(self):
+        # La finestra e' un rettangolo trasparente molto grande (560x500): senza maschera bloccherebbe i clic
+        # sulle altre app anche dove non c'e' disegno. Solo la sagoma dell'orecchio (con la stessa trasformazione
+        # del paintEvent) resta sensibile al mouse.
+        region = QRegion()
+        if self.ear_h > 5:
+            pa, aa = math.radians(self.base_angle), math.radians(self.angle)
+            t = QTransform()
+            t.translate(self.anchor_x, self.anchor_y)
+            t = QTransform(math.cos(pa), math.sin(pa), -math.sin(aa), math.cos(aa), 0.0, 0.0) * t
+            tilt = (0.24 * self.squash + 0.18 * self.flare)
+            if tilt > 0.001:
+                pivot_x = (self.ear_w / 2.0) if self.is_left else (-self.ear_w / 2.0)
+                t.translate(pivot_x, 0)
+                t.shear(-tilt if self.is_left else tilt, 0.0)
+                t.translate(-pivot_x, 0)
+            poly = QPolygonF([t.map(QPointF(-self.ear_w / 2.0 + u * self.ear_w, -self.ear_h + v * self.ear_h))
+                              for u, v in self._hull_unit()])
+            path = QPainterPath()
+            path.addPolygon(poly)
+            path.closeSubpath()
+            st = QPainterPathStroker()
+            st.setWidth(8.0)                       # piccolo margine attorno alla sagoma
+            for pl in st.createStroke(path).united(path).toFillPolygons():
+                region = region.united(QRegion(pl.toPolygon(), Qt.WindingFill))
+        if region.isEmpty(): region = QRegion(0, 0, 1, 1)
+        self.setMask(region)
     def trigger_twitch(self):
         self.anim_step = 0
         self.anim_timer.start(16)
@@ -530,12 +603,14 @@ class CatEar(QWidget):
         else:
             if progress < 0.28: self.flare = progress / 0.28
             else: self.flare = 1.0 - ((progress - 0.28) / 0.72)
+        self._update_mask()
         self.update()
     def set_ear_config(self, angle: float, width: float, height: float, base_angle: float = None):
         self.angle = angle
         self.base_angle = angle if base_angle is None else base_angle
         self.ear_w = width
         self.ear_h = height
+        self._update_mask()
         self.update()
     def paintEvent(self, event):
         if self.ear_h <= 5: return
@@ -3194,6 +3269,121 @@ def l16(s):
     return len(s.encode("utf-16-le")) // 2
 
 
+# Inclinazione della zampa/stella: ciclo distribuito sui kanji, un'estremita per lettera.
+# Ciclo normale (4 salti): 0 -> +30 -> 0 -> -30 -> 0, dove il ciclo riparte.
+# Dopo 2 cicli normali arriva la capriola: un salto che scavalca un kanji (durata 3 kanji, atterra
+# 2 posizioni piu' avanti) con arco alto il doppio del normale e rotazione completa di 360 gradi:
+# 0 sul primo kanji, 180 a meta' del secondo, 0 (giro chiuso) sul terzo. Poi di nuovo 2 cicli
+# normali, capriola, e cosi' all'infinito (periodo: 10 kanji).
+ZAMPA_INCL_MAX = 30.0
+ZAMPA_CAPRIOLA_GIRI = 1                  # giri completi (360 gradi) di ogni capriola
+# Fine tuning dell'altezza della capriola: moltiplicatore applicato all'arco del salto largo.
+# 2.0 = altezza doppia rispetto al salto normale; aumentare per una capriola piu' alta,
+# diminuire (es. 1.5) se scende/pare troppo in alto o basso.
+ZAMPA_CAPRIOLA_ALTEZZA = 2.5
+# Pulsazione continua della zampa/stella (anche mentre salta): si ingrandisce un istante a ritmo
+# regolare, come un battito. Scala massima = 1 + AMPIEZZA.
+ZAMPA_PULSA_AMPIEZZA = 0.30    # 0.10 = +10% al picco; 0 = nessuna pulsazione
+ZAMPA_PULSA_PERIODO = 0.85     # secondi tra un battito e il successivo
+_ZAMPA_INCL_CICLI_NORMALI = 2            # quanti cicli normali prima di ogni capriola
+_ZAMPA_INCL_SALTI_CICLO = 4              # salti (kanji-1) di un ciclo normale 0,+30,0,-30
+_ZAMPA_INCL_KANJI_NORMALI = _ZAMPA_INCL_SALTI_CICLO * _ZAMPA_INCL_CICLI_NORMALI + 1
+_ZAMPA_INCL_KANJI_CAPRIOLA = 3           # kanji coperti dalla capriola: partenza, sorvolato, arrivo
+# Posizione nel periodo (kanji contati a partire dall'inizio del ciclo, 0-based) in cui la capriola
+# ha inizio: coincide con l'ultimo nodo dei cicli normali, da cui la figura riparte a 0.
+_ZAMPA_INCL_CAPRIOLA_INIZIO = _ZAMPA_INCL_KANJI_NORMALI - 1      # = 8
+# Il periodo dura quanto il ciclo normale piu' i due kanji successivi (il terzo e' la posizione 0
+# del periodo seguente): la capriola deve chiudersi proprio sul confine, cosi' il ciclo riparte
+# identico (periodo: 10 kanji).
+_ZAMPA_INCL_KANJI_PERIODO = _ZAMPA_INCL_KANJI_NORMALI + (_ZAMPA_INCL_KANJI_CAPRIOLA - 2)
+# Kanji saltati dalla capriola (durata 3 kanji, atterraggio 2 posizioni piu' avanti).
+ZAMPA_CAPRIOLA_SALTO = _ZAMPA_INCL_KANJI_CAPRIOLA - 1
+
+
+def _zampa_incl_capriola_fase(p):
+    """Fase 0..1 della capriola per un kanji di posizione p nel periodo (None fuori dalla finestra):
+    0 al decollo (kanji di partenza), ~0.5 sul kanji sorvolato, 1 all'atterraggio (due kanji avanti,
+    che coincide col confine del periodo, dove il ciclo riparte)."""
+    j = p - _ZAMPA_INCL_CAPRIOLA_INIZIO
+    if 0 <= j < _ZAMPA_INCL_KANJI_CAPRIOLA - 1:
+        return j / float(_ZAMPA_INCL_KANJI_CAPRIOLA - 1)
+    return None
+
+
+def _zampa_incl_angolo_base(k):
+    """Angolo base (rotazioni complete escluse) della zampa/stella sul kanji di posizione k nel
+    periodo: nei primi 9 kanji vale il ciclo normale 0,+30,0,-30 ripetuto due volte (chiusura a 0);
+    la capriola invece resta a 0 (il suo contributo e' solo la rotazione di 360 gradi)."""
+    p = k % _ZAMPA_INCL_KANJI_PERIODO
+    if p >= _ZAMPA_INCL_CAPRIOLA_INIZIO:  # fase di capriola: posata a 0 (decollo e atterraggio)
+        return 0.0
+    i = p % _ZAMPA_INCL_SALTI_CICLO       # ciclo normale: un nodo del pattern 0,+30,0,-30 per kanji
+    return (0.0, ZAMPA_INCL_MAX, 0.0, -ZAMPA_INCL_MAX)[i]
+
+
+def _zampa_incl_salto_capriola(k_prec, k_cur):
+    """True se il salto tra i kanji k_prec e k_cur e' una capriola: va avanti, atterra due posizioni
+    piu' in la' (scavalcando un kanji, durata 3 kanji) e il punto di partenza coincide col decollo
+    della capriola nel ciclo (posizione 8 del periodo di 10 kanji)."""
+    return (k_cur > k_prec
+            and (k_cur - k_prec) == ZAMPA_CAPRIOLA_SALTO
+            and (k_prec % _ZAMPA_INCL_KANJI_PERIODO) == _ZAMPA_INCL_CAPRIOLA_INIZIO)
+
+
+def _zampa_incl_nodo(k):
+    """Angolo della zampa/stella sul kanji di posizione k nel periodo (contati a partire
+    dall'inizio del ciclo, 0-based): nei primi 9 kanji vale il ciclo normale 0,+30,0,-30 ripetuto
+    due volte; negli ultimi due (capriola) la figura passa a 360 gradi, chiudendo il giro."""
+    p = k % _ZAMPA_INCL_KANJI_PERIODO
+    f = _zampa_incl_capriola_fase(p)
+    if f is not None:                     # fase di capriola: mezzo giro per ogni kanji sorvolato
+        return 360.0 * f
+    return _zampa_incl_angolo_base(k)     # ciclo normale +-30
+
+
+def _zampa_incl_nodo_riflesso(k):
+    """Nodo dell'angolo visto dagli indici riflessi (salti all'indietro): se lo specchio cade dentro
+    una capriola viene riportato ai nodi dei cicli normali, cosi' anche nelle letture all'indietro la
+    zampa continua a oscillare +-30 (la capriola completa avviene solo avanti)."""
+    j = (-k) % _ZAMPA_INCL_KANJI_PERIODO
+    if _zampa_incl_capriola_fase(j) is not None:
+        j = _ZAMPA_INCL_CAPRIOLA_INIZIO - (j - _ZAMPA_INCL_CAPRIOLA_INIZIO)
+    return -_zampa_incl_angolo_base(j)
+
+
+def zampa_incl_angolo(k_cur, k_prec, s, con_capriola=True):
+    """Angolo (gradi, rotazione attorno all'asse che fuoriesce dallo schermo) della zampa/stella durante
+    il salto dal kanji 'k_prec' al kanji 'k_cur' (indici crescenti da sinistra, con spazi) a progresso s:
+    partendo dall'angolo del kanji precedente si va linearmente verso quello del kanji corrente, quindi
+    l'oscillazione +-30 e' distribuita su piu' lettere (un nodo per kanji). Dopo 2 cicli normali arriva la
+    capriola: il salto scavalca un kanji (delta di 2, durata 3 kanji) e compie un giro completo di 360
+    gradi -- 0 sul primo, 180 a meta' del secondo, 0 (giro chiuso) sul terzo -- dopodiche' il ciclo
+    normale riparte identico (periodo: 10 kanji).
+    Se il salto va verso sinistra gli indici sono riflessi, cosi' l'inclinazione resta avanti/indietro
+    rispetto al verso del testo."""
+    avanti = k_cur >= k_prec
+    if avanti and not con_capriola:       # salto normale: mai nodi della capriola (niente 180 gradi rimasti)
+        ang_prec = _zampa_incl_angolo_base(k_prec)
+        ang_cur = _zampa_incl_angolo_base(k_cur)
+    elif avanti:
+        ang_prec = _zampa_incl_nodo(k_prec)
+        ang_cur = _zampa_incl_nodo(k_cur)
+    else:                                 # salto all'indietro: specchia gli indici
+        ang_prec = _zampa_incl_nodo_riflesso(-k_prec)
+        ang_cur = _zampa_incl_nodo_riflesso(-k_cur)
+    if avanti and con_capriola and _zampa_incl_salto_capriola(k_prec, k_cur):
+        # capriola: durante il salto largo (2 kanji) il progresso copre l'intera finestra di 3 kanji,
+        # percio' il target e' sempre il traguardo del giro (360 gradi); la mezzeria (180) sul kanji
+        # sorvolato emerge naturalmente dal progresso s, senza salti ne' inversioni
+        ang_prec = _zampa_incl_nodo(k_prec)          # 0 al decollo
+        ang_cur = ang_prec + 360.0                   # 360 all'atterraggio (visivamente identico a 0)
+    # scelta del percorso piu' corto sull'arco: alla chiusura della capriola (360 -> 0) l'angolo deve
+    # restare fermo, non compiere un giro inverso a causa del modulo
+    if ang_cur - ang_prec > 180.0:   ang_prec += 360.0
+    elif ang_prec - ang_cur > 180.0: ang_cur += 360.0
+    return ang_prec + (ang_cur - ang_prec) * min(1.0, max(0.0, s))
+
+
 def _segmenti_giapponesi(seg):
     """Da tok['seg'] (indice di segmento per ogni token) a una lista di intervalli [a, b) di token."""
     out = []
@@ -3648,12 +3838,17 @@ class KaraokeSubs:
 
     ZAMPA_SALTO = 0.4      # frazione della durata di un token kanji impiegata per il salto (poi resta posata)
     ZAMPA_SALTO_TRAD = 0.8  # idem per le lettere della traduzione
+    ZAMPA_SCHIACCIA = 0.35  # durata dello schiacciamento all'atterraggio (frazione del token, dopo il salto): piu' alto = piu' morbido
 
     def zampa(self, k, show_o=True, show_h=True, show_t=True):
-        """Zampa di gatto che salta di lettera in lettera: (blocco, A, B, s, q) oppure None.
+        """Zampa di gatto che salta di lettera in lettera: (blocco, A, B, s, q, pos_ciclo) oppure None.
         A = lettera di partenza (posizione UTF-16, testo) o None; B = lettera corrente; s = avanzamento
-        del salto 0..1; q = schiacciamento all'atterraggio 0..1. Sta sopra la riga giapponese (kanji o
+        del salto 0..1; q = schiacciamento all'atterraggio 0..1; pos_ciclo = posizione della lettera
+        corrente nel ciclo d'inclinazione +-30 (un nodo per kanji). Sta sopra la riga giapponese (kanji o
         hiragana) o, se non ce n'e', sopra la traduzione."""
+        capriola = False
+        rate = 0.0
+        qinfo = None                       # (u, 1/durata token, fine, span): serve a estrapolare q
         k_jp, k_tr, k_c = k[0], k[1], k[3]
         righe = []
         if k_jp is not None:
@@ -3669,10 +3864,31 @@ class KaraokeSubs:
             p = idx - 1
             while p >= a and not tok[p].strip():
                 p -= 1
-            A = (l16("".join(tok[a:p])), tok[p]) if p >= a else None
-            B = (l16("".join(tok[a:idx])), tok[idx])
-            s, fine = min(1.0, u / self.ZAMPA_SALTO), self.ZAMPA_SALTO
-            span = 0.2
+            i0 = next((i for i in range(len(tok)) if tok[i].strip()), 0)
+            k_cur = sum(1 for i in range(i0, idx + 1) if tok[i].strip()) - 1
+            k_prec = sum(1 for i in range(i0, p + 1) if tok[i].strip()) - 1 if p >= a else k_cur
+            # Capriola: volo continuo dal kanji di decollo (posizione 8 del periodo) a quello di
+            # atterraggio (posizione 10 = 0 del periodo seguente), scavalcando quello in mezzo. I kanji
+            # sono sempre consecutivi (delta 1), quindi il volo si riconosce dalla posizione nel periodo.
+            # s e' il progresso del VOLO INTERO (0..1, in tempo reale), usato sia per l'arco sia per
+            # l'angolo (360 * s): rotazione uniforme e sempre in avanti, senza il rewind 180 -> 0.
+            ids = [i for i in range(i0, len(tok)) if tok[i].strip()]
+            d_tok = max(1e-3, self.t1[idx] - self.t0[idx])
+            volo = self._capriola_volo(ids, k_cur, u, a, b)
+            if volo is not None:
+                i8, i10, s, T = volo
+                A = (l16("".join(tok[a:i8])), tok[i8])
+                B = (l16("".join(tok[a:i10])), tok[i10])
+                capriola = True
+                fine, span = 1.0, 0.0            # in volo nessuno schiacciamento
+                rate = 1.0 / T                   # velocita' del volo (s al secondo), per interpolare a 60 Hz
+            else:
+                A = (l16("".join(tok[a:p])), tok[p]) if p >= a else None
+                B = (l16("".join(tok[a:idx])), tok[idx])
+                s, fine = min(1.0, u / self.ZAMPA_SALTO), self.ZAMPA_SALTO
+                span = self.ZAMPA_SCHIACCIA
+                rate = 1.0 / (self.ZAMPA_SALTO * d_tok) if s < 1.0 else 0.0
+                qinfo = (u, round(1.0 / d_tok, 4), fine, span)
         elif show_t and k_tr is not None:
             it, h, passo = k_tr[0], k_tr[1], k_tr[2]
             testo = self.tr[it]
@@ -3686,13 +3902,45 @@ class KaraokeSubs:
             B = (l16(testo[:h]), testo[h])
             s, fine = min(1.0, u / self.ZAMPA_SALTO_TRAD), self.ZAMPA_SALTO_TRAD
             span = 1.0 - fine
+            i0 = next((i for i in range(len(testo)) if not testo[i].isspace()), 0)
+            k_cur = sum(1 for i in range(i0, h + 1) if not testo[i].isspace()) - 1
+            k_prec = sum(1 for i in range(i0, p + 1) if not testo[i].isspace()) - 1 if p >= 0 else k_cur
         else:
             return None
         q = 0.0
         if u > fine and span > 1e-6:
             x = (u - fine) / span
             q = math.sin(math.pi * x) if x < 1.0 else 0.0
-        return (0, A, B, round(s, 3), round(q, 3))
+        return (0, A, B, round(s, 3), round(q, 3), (k_cur, k_prec), bool(capriola), round(rate, 4), qinfo)
+
+    def _capriola_volo(self, ids, k_cur, u, a, b):
+        """Se il token corrente (kanji numero k_cur, avanzamento u) cade nel volo della capriola
+        restituisce (token_decollo, token_atterraggio, progresso 0..1 del volo, durata s), altrimenti None.
+        Il volo parte a fine atterraggio sul kanji 8 del periodo (u >= ZAMPA_SALTO), scavalca il 9 e
+        atterra sul 10 (= 0 del periodo dopo) a u = ZAMPA_SALTO: il progresso e' proporzionale al
+        tempo reale, indipendentemente dalla durata dei singoli kanji."""
+        P, ZS, ini = _ZAMPA_INCL_KANJI_PERIODO, self.ZAMPA_SALTO, _ZAMPA_INCL_CAPRIOLA_INIZIO
+        pos = k_cur % P
+        if pos == ini and u >= ZS:               k8 = k_cur
+        elif pos == ini + 1:                     k8 = k_cur - 1
+        elif pos == 0 and k_cur >= P and u < ZS: k8 = k_cur - 2
+        else: return None
+        if k8 < 0 or k8 + 2 >= len(ids): return None
+        i8, i9, i10 = ids[k8], ids[k8 + 1], ids[k8 + 2]
+        if i8 < a or i10 >= b: return None
+        d8, d9, d10 = (max(1e-3, self.t1[i] - self.t0[i]) for i in (i8, i9, i10))
+        T = (1.0 - ZS) * d8 + d9 + ZS * d10
+        if pos == ini:       el = (u - ZS) * d8
+        elif pos == ini + 1: el = (1.0 - ZS) * d8 + u * d9
+        else:                el = (1.0 - ZS) * d8 + d9 + u * d10
+        return i8, i10, min(1.0, max(0.0, el / T)), T
+
+    @staticmethod
+    def _kanji_indice(tok, a, i):
+        """Posizione nel ciclo d'inclinazione del token i (caratteri non spazi a partire dal primo
+        con testo); -1 se non ce ne sono (usato per riconoscere i salti da capriola)."""
+        i0 = next((j for j in range(len(tok)) if tok[j].strip()), 0)
+        return sum(1 for j in range(i0, i + 1) if tok[j].strip()) - 1
 
 
 class SubtitleOverlay(QWidget):
@@ -3705,6 +3953,26 @@ class SubtitleOverlay(QWidget):
         self._html = ""
         self._zoom = ()
         self._zampa = None
+        # animazione fluida dell'inclinazione: l'angolo 'target' della zampa cambia solo quando
+        # cambia lettera, ma qui viene inseguito fotogramma per fotogramma (smorzamento esponenziale)
+        # cosi' le rotazioni risultano sempre graduali, anche con kanji molto veloci o salti ampi
+        self._ang_attuale = 0.0
+        self._ang_target = None
+        self._ang_ultimo_t = None
+        self._ang_capriola = False         # True durante il volo della capriola (angolo = 360 * s)
+        # interpolazione a 60 Hz del progresso del salto: i sottotitoli arrivano ogni 40 ms (25 Hz) e la
+        # posizione audio e' a gradini, quindi tra un campione e l'altro s viene estrapolato col tempo reale
+        self._zs_rep = 0.0                 # ultimo s ricevuto
+        self._zs_t = None                  # istante (monotonic) in cui e' stato ricevuto
+        self._s_vis = 0.0                  # s mostrato (mai all'indietro dentro lo stesso salto)
+        self._s_vis_id = None
+        # ultima zampa/stella disegnata: se il testo resta ma lo stato della zampa diventa None
+        # (es. token senza lettera di partenza) si continua a mostrare l'ultima posizione, cosi'
+        # la figura non sparisce del tutto mentre i sottotitoli sono visibili
+        self._zampa_ultima = None
+        self._ang_timer = QTimer(self)
+        self._ang_timer.setInterval(16)          # ~60 Hz, indipendente dal timer dei sottotitoli
+        self._ang_timer.timeout.connect(self._avvicina_angolo)
         self._cache = None
         self._scale = 1.0
         self.use_star = False  # True = stella arrotondata, False = zampa di gatto
@@ -3738,9 +4006,124 @@ class SubtitleOverlay(QWidget):
         self._html = html
         self._zoom = tuple(zoom)
         self._zampa = zampa
+        # nuovo stato della zampa/stella: aggiorna il target d'inclinazione (inseguito in modo
+        # graduale da _avvicina_angolo, cosi' la rotazione non risulta mai istantanea)
+        if zampa is not None and len(zampa) > 5 and zampa[5] is not None:
+            pos_ciclo = zampa[5]
+            s = zampa[3] if len(zampa) > 3 else 1.0
+            self._ang_capriola = bool(len(zampa) > 6 and zampa[6])
+            self._zs_rep, self._zs_t = s, time.monotonic()
+            if self._ang_capriola:
+                # in volo l'angolo e' 360 * s (calcolato al disegno col progresso interpolato): nessun
+                # inseguitore, niente piu' reset a 0 a ogni campione. Il giro si chiude a 360 = 0.
+                self._ang_target = 0.0
+                self._ang_attuale = 0.0
+            else:
+                self._ang_target = zampa_incl_angolo(pos_ciclo[0], pos_ciclo[1], s)
+                # l'angolo normale e' calcolato al disegno dal progresso interpolato: nessun inseguitore
+                self._ang_attuale = self._ang_target
+            if (abs(self._ang_target - self._ang_attuale) > 0.5 or self._salto_in_corso()) \
+                    and not self._ang_timer.isActive():
+                self._ang_timer.start()          # attivo solo durante l'animazione
+        elif zampa is None:
+            self._ang_target = None
+            self._ang_ultimo_t = None
+            if not self._pulsa_attiva():
+                self._ang_timer.stop()
+        if self._pulsa_attiva() and not self._ang_timer.isActive():
+            self._ang_timer.start()              # serve anche per la pulsazione da ferma
+        # memorizza l'ultima zampa valida: se il testo resta ma la zampa diventa None (o arriva un
+        # salto 'a vuoto', senza lettera di partenza) si ridisegna l'ultima posizione nota, cosi' la
+        # stella/zampa non sparisce mai del tutto finche' i sottotitoli sono visibili
+        if zampa is not None:
+            self._zampa_ultima = zampa
+        elif html == "":                   # sottotitoli spenti: si riparte davvero da zero
+            self._zampa_ultima = None
         self.setVisible(bool(html))
         if html:
             self.raise_()
+        self.update()
+
+    def _pulsa_attiva(self):
+        """True se c'e' una zampa/stella da far pulsare (anche posata sull'ultima posizione nota)."""
+        return ZAMPA_PULSA_AMPIEZZA > 0 and (self._zampa or self._zampa_ultima) is not None
+
+    def _pulsa(self):
+        """Fattore di scala (>= 1) della pulsazione, sempre attiva: un battito ogni ZAMPA_PULSA_PERIODO, con
+        fase legata all'orologio (ritmo costante, indipendente da salti e pause). Sale in fretta e scende
+        piano; parte e torna a 0 a ogni periodo, quindi senza scatti."""
+        x = (time.monotonic() % ZAMPA_PULSA_PERIODO) / ZAMPA_PULSA_PERIODO
+        if x < 0.2:
+            k = x / 0.2
+            v = k * k * (3.0 - 2.0 * k)              # attacco rapido
+        else:
+            v = (1.0 - (x - 0.2) / 0.8) ** 2         # rilascio lento
+        return 1.0 + ZAMPA_PULSA_AMPIEZZA * v
+
+    def _salto_in_corso(self):
+        """True finche' salto o schiacciamento hanno ancora da avanzare (tiene vivo il timer a 60 Hz)."""
+        z = self._zampa
+        if z is None or self._zs_t is None:
+            return False
+        dt = time.monotonic() - self._zs_t
+        if dt >= 0.2:
+            return False
+        if len(z) > 7 and z[7] > 0 and z[3] < 1.0 and self._s_vis < 1.0:
+            return True
+        qi = z[8] if len(z) > 8 else None
+        return qi is not None and qi[0] + qi[1] * dt < qi[2] + qi[3]
+
+    def _q_corrente(self, z):
+        """Schiacciamento all'atterraggio estrapolato col tempo reale (dura solo 50-120 ms, cioe' 1-3
+        campioni a 25 Hz: senza estrapolazione si vedrebbe un battito a scatti)."""
+        qi = z[8] if len(z) > 8 else None
+        if qi is None or self._zs_t is None:
+            return z[4]
+        u, inv_d, fine, span = qi
+        uu = min(1.0, u + inv_d * min(0.2, max(0.0, time.monotonic() - self._zs_t)))
+        if span > 1e-6 and uu > fine:
+            x = (uu - fine) / span
+            return math.sin(math.pi * x) if x < 1.0 else 0.0
+        return 0.0
+
+    def _s_corrente(self, z):
+        """Progresso del salto da disegnare: l'ultimo s ricevuto piu' la velocita' del salto (z[7]) per il
+        tempo reale trascorso (max 0.2 s). Non torna mai indietro dentro lo stesso salto."""
+        s = z[3]
+        rate = z[7] if len(z) > 7 else 0.0
+        ident = (z[1], z[2], bool(len(z) > 6 and z[6]))
+        if rate <= 0 or s >= 1.0 or self._zs_t is None:
+            self._s_vis, self._s_vis_id = s, ident
+            return s
+        dt = min(0.2, max(0.0, time.monotonic() - self._zs_t))
+        pred = min(1.0, self._zs_rep + rate * dt)
+        if self._s_vis_id == ident and pred < self._s_vis < pred + 0.25:
+            pred = self._s_vis
+        self._s_vis, self._s_vis_id = pred, ident
+        return pred
+
+    def _avvicina_angolo(self):
+        """Ogni ~16 ms: smorza l'angolo attuale verso quello target (esponenziale, ~0.12 s) per le
+        oscillazioni normali +-30, e ridisegna finche' c'e' qualcosa che si muove (angolo o salto in
+        corso). Durante la capriola l'angolo e' 360 * s e il ridisegno avviene col salto interpolato."""
+        salto = self._salto_in_corso() or self._pulsa_attiva()    # la pulsazione richiede ridisegni continui
+        if self._ang_target is None:
+            self._ang_ultimo_t = None
+            # zampa ferma sull'ultima posizione nota (stato None): niente angolo da inseguire, ma si deve
+            # comunque ridisegnare ogni fotogramma, altrimenti la pulsazione non si vede
+            if salto: self.update()
+            else: self._ang_timer.stop()
+            return
+        t = time.monotonic()
+        dt = 0.016 if self._ang_ultimo_t is None else min(0.1, max(0.0, t - self._ang_ultimo_t))
+        self._ang_ultimo_t = t
+        diff = self._ang_target - self._ang_attuale
+        if abs(diff) < 0.5:
+            self._ang_attuale = self._ang_target
+            if not salto: self._ang_timer.stop()     # fermo: niente ridisegni inutili
+            self.update()
+            return
+        self._ang_attuale += diff * (1.0 - math.exp(-dt / 0.12))
         self.update()
 
     def _doc(self, html, larg, px):
@@ -3793,20 +4176,34 @@ class SubtitleOverlay(QWidget):
         if self._zoom:
             self._disegna_zoom(p, doc, x, y, px, r)
         if self._zampa:
+            # zampa 'a vuoto' (senza lettera di partenza, es. primo token del blocco o salto all'indietro):
+            # usa l'ultima posizione nota come punto di partenza, cosi' la figura non scompare mai
+            if self._zampa[1] is None and self._zampa_ultima is not None and self._zampa_ultima[1] is not None:
+                self._zampa = (self._zampa[0], self._zampa_ultima[1]) + tuple(self._zampa[2:])
+        elif self._zampa_ultima is None:
+            p.end()
+            return                         # nessuna zampa da disegnare (ne' corrente ne' ultima)
+        # disegna la zampa/stella: con lo stato corrente o, se diventato None, con l'ultima
+        # posizione nota (la figura non sparisce del tutto finche' restano i sottotitoli)
+        try:
             if getattr(self, "use_star", False):
                 self._disegna_stella(p, doc, x, y, px, r)
             else:
                 self._disegna_zampa(p, doc, x, y, px, r)
+        except Exception:
+            pass                           # posizione non piu' valida nel nuovo testo: niente figura
         p.end()
 
     @staticmethod
     def _centro_lettera(doc, x, y, blocco, off, testo):
-        """(centro x, cima della riga, linea di base) della lettera nel documento, o None."""
+        """(centro x, cima della riga, linea di base) della lettera nel documento, o None.
+        Con 'off' frazionario (meta' lettera, usato come appoggio virtuale durante la capriola) il
+        centro e' interpolato tra le due mezze lettere."""
         b = doc.findBlockByNumber(blocco)
         lay = b.layout() if b.isValid() else None
         if lay is None or lay.lineCount() == 0 or not testo.strip():
             return None
-        pos = min(off, max(0, b.length() - 1))
+        pos = min(int(off), max(0, b.length() - 1))
         riga = lay.lineForTextPosition(pos)
         if not riga.isValid():
             return None
@@ -3814,11 +4211,25 @@ class SubtitleOverlay(QWidget):
         x0 = riga.cursorToX(pos)[0]
         x1 = riga.cursorToX(fine)[0]
         top = y + lay.position().y() + riga.y()
-        return (x + lay.position().x() + (x0 + x1) / 2.0, top, top + riga.ascent())
+        cx = x + lay.position().x() + (x0 + x1) / 2.0
+        frac = off - int(off)
+        if frac > 0:                      # meta' lettera: centro verso la lettera successiva
+            nx = min(pos + l16(testo), max(0, b.length() - 1))
+            r2 = lay.lineForTextPosition(nx)
+            if r2.isValid():
+                x2 = r2.cursorToX(min(nx + l16(" "), r2.textStart() + r2.textLength()))[0]
+                cx += (x2 - cx) * frac
+        return (cx, top, top + riga.ascent())
 
     def _disegna_zampa(self, p, doc, x, y, px, r):
         """Zampa di gatto rosa con contorno nero che salta dalla lettera precedente a quella corrente."""
-        blocco, A, B, s, q = self._zampa
+        z = self._zampa or self._zampa_ultima   # se lo stato e' None si usa l'ultima posizione nota
+        if z is None:
+            return
+        blocco, A, B, s, q = z[:5]
+        s = self._s_corrente(z)            # progresso interpolato a 60 Hz
+        q = self._q_corrente(z)            # schiacciamento interpolato a 60 Hz
+        pos_ciclo = z[5] if len(z) > 5 else None
         cb = self._centro_lettera(doc, x, y, blocco, B[0], B[1])
         if cb is None:
             return
@@ -3832,20 +4243,44 @@ class SubtitleOverlay(QWidget):
             px0, py0 = ca[0], ca[1] - S * 0.5
             cx = px0 + (cx - px0) * e
             riposo = py0 + (riposo - py0) * e
-            alza = S * 0.95 * 4.0 * s * (1.0 - s)          # arco parabolico del salto
-            # Oscillazione di +-55° rispetto all'asse verticale lungo il salto
-            direzione = 1.0 if cb[0] >= px0 else -1.0
-            ang = 55.0 * math.sin(2.0 * math.pi * s) * direzione
+            # Inclinazione di +-30° attorno all'asse che fuoriesce dallo schermo (rotazione nel piano 2D),
+            # distribuita su piu' kanji: un nodo del ciclo 0 -> +30 -> 0 -> -30 -> 0 per ogni lettera;
+            # l'angolo reale e' quello 'attuale' inseguito gradualmente dall'overlay, mai istantaneo
+            if pos_ciclo is not None:
+                # capriola: giro uniforme 360 * s (sempre in avanti); altrimenti oscillazione +-30 inseguita
+                if len(z) > 6 and z[6]:
+                    ang = 360.0 * s
+                else:                        # +-30: stesso easing della posizione, senza ritardo
+                    ang = zampa_incl_angolo(pos_ciclo[0], pos_ciclo[1], e, False)
+            else:
+                direzione = 1.0 if cb[0] >= px0 else -1.0
+                ang = 30.0 * math.sin(math.pi * s) * direzione
+            # Arco parabolico del salto, identico anche per la capriola: il centro della figura
+            # segue la parabola (altezza ZAMPA_CAPRIOLA_ALTEZZA volte quella normale durante la
+            # capriola) e ruota attorno al proprio centro. In questo modo il salto e' visibile per
+            # intero (la zampa sale davvero fino all'apice e ridiscende), senza inversioni
+            # sull'asse y: la rotazione a 360 gradi attorno al centro non cambia l'altezza del volo.
+            salto_alto = bool(len(z) > 6 and z[6])
+            base_altezza = 0.95 * S
+            molla = 4.0 * s * (1.0 - s)    # profilo dell'arco: 0 ai capi, 1 all'apice
+            alza = base_altezza * (ZAMPA_CAPRIOLA_ALTEZZA if salto_alto else 1.0) * molla
+            cy = riposo - alza
         else:                              # prima lettera: la zampa scende dall'alto
+            molla = 0.0
+            salto_alto = False
+            base_altezza = 0.95 * S
             alza = S * 1.6 * (1.0 - e)
             ang = 0.0
-
-        cy = riposo - alza
+            cy = riposo - alza
 
         # Dinamica di salto: estensione elastica in volo (stretch) e schiacciamento all'impatto (squash)
         stretch = 0.12 * math.sin(math.pi * s) if ca is not None and s < 1.0 else 0.0
         sx = (1.0 + 0.18 * q) * (1.0 - stretch * 0.5)
         sy = (1.0 - 0.22 * q) * (1.0 + stretch)
+        # la figura pulsa sempre, a ritmo costante, anche durante salto e schiacciamento
+        pulsa = self._pulsa()
+        sx *= pulsa
+        sy *= pulsa
 
         path = QPainterPath()
         path.addEllipse(QPointF(0.0, 0.16 * S), 0.34 * S, 0.27 * S)            # cuscinetto
@@ -3855,17 +4290,22 @@ class SubtitleOverlay(QWidget):
 
         p.save()
         p.setRenderHint(QPainter.Antialiasing)
-        p.translate(cx, cy + 0.43 * S)     # perno in basso per oscillazione e appoggio
+        p.translate(cx, cy)                        # centro della figura: ruota attorno a se stessa
         p.rotate(ang)
         p.scale(sx, sy)
-        p.translate(0.0, -0.43 * S)
         p.strokePath(path, QPen(QColor("#000000"), 2 * r + 1, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         p.fillPath(path, QColor("#ff9ec4"))
         p.restore()
 
     def _disegna_stella(self, p, doc, x, y, px, r):
         """Stella arrotondata dorata con contorno nero che salta dalla lettera precedente a quella corrente."""
-        blocco, A, B, s, q = self._zampa
+        z = self._zampa or self._zampa_ultima   # se lo stato e' None si usa l'ultima posizione nota
+        if z is None:
+            return
+        blocco, A, B, s, q = z[:5]
+        s = self._s_corrente(z)            # progresso interpolato a 60 Hz
+        q = self._q_corrente(z)            # schiacciamento interpolato a 60 Hz
+        pos_ciclo = z[5] if len(z) > 5 else None
         cb = self._centro_lettera(doc, x, y, blocco, B[0], B[1])
         if cb is None:
             return
@@ -3879,20 +4319,44 @@ class SubtitleOverlay(QWidget):
             px0, py0 = ca[0], ca[1] - S * 0.5
             cx = px0 + (cx - px0) * e
             riposo = py0 + (riposo - py0) * e
-            alza = S * 0.95 * 4.0 * s * (1.0 - s)          # arco parabolico del salto
-            # Oscillazione di +-55° rispetto all'asse verticale lungo il salto
-            direzione = 1.0 if cb[0] >= px0 else -1.0
-            ang = 55.0 * math.sin(2.0 * math.pi * s) * direzione
+            # Inclinazione di +-30° attorno all'asse che fuoriesce dallo schermo (rotazione nel piano 2D),
+            # distribuita su piu' kanji: un nodo del ciclo 0 -> +30 -> 0 -> -30 -> 0 per ogni lettera;
+            # l'angolo reale e' quello 'attuale' inseguito gradualmente dall'overlay, mai istantaneo
+            if pos_ciclo is not None:
+                # capriola: giro uniforme 360 * s (sempre in avanti); altrimenti oscillazione +-30 inseguita
+                if len(z) > 6 and z[6]:
+                    ang = 360.0 * s
+                else:                        # +-30: stesso easing della posizione, senza ritardo
+                    ang = zampa_incl_angolo(pos_ciclo[0], pos_ciclo[1], e, False)
+            else:
+                direzione = 1.0 if cb[0] >= px0 else -1.0
+                ang = 30.0 * math.sin(math.pi * s) * direzione
+            # Arco parabolico del salto, identico anche per la capriola: il centro della figura
+            # segue la parabola (altezza ZAMPA_CAPRIOLA_ALTEZZA volte quella normale durante la
+            # capriola) e ruota attorno al proprio centro. Il salto e' cosi' visibile per intero
+            # (la stella sale fino all'apice e ridiscende), senza inversioni sull'asse y: la
+            # rotazione a 360 gradi attorno al centro non cambia l'altezza del volo.
+            salto_alto = bool(len(z) > 6 and z[6])
+            base_altezza = 0.95 * S
+            molla = 4.0 * s * (1.0 - s)    # profilo dell'arco: 0 ai capi, 1 all'apice
+            alza = base_altezza * (ZAMPA_CAPRIOLA_ALTEZZA if salto_alto else 1.0) * molla
+            cy = riposo - alza
         else:                              # prima lettera: scende dall'alto
+            molla = 0.0
+            salto_alto = False
+            base_altezza = 0.95 * S
             alza = S * 1.6 * (1.0 - e)
             ang = 0.0
-
-        cy = riposo - alza
+            cy = riposo - alza
 
         # Dinamica di salto: estensione elastica in volo (stretch) e schiacciamento all'impatto (squash)
         stretch = 0.12 * math.sin(math.pi * s) if ca is not None and s < 1.0 else 0.0
         sx = (1.0 + 0.18 * q) * (1.0 - stretch * 0.5)
         sy = (1.0 - 0.22 * q) * (1.0 + stretch)
+        # la figura pulsa sempre, a ritmo costante, anche durante salto e schiacciamento
+        pulsa = self._pulsa()
+        sx *= pulsa
+        sy *= pulsa
 
         # Tracciato della stella a 5 punte arrotondata
         pts = []
@@ -3914,10 +4378,9 @@ class SubtitleOverlay(QWidget):
 
         p.save()
         p.setRenderHint(QPainter.Antialiasing)
-        p.translate(cx, cy + 0.38 * S)     # perno in basso per oscillazione e appoggio
+        p.translate(cx, cy)                        # centro della figura: ruota attorno a se stessa
         p.rotate(ang)
         p.scale(sx, sy)
-        p.translate(0.0, -0.38 * S)
 
         # Contorno nero e riempimento oro brillante
         p.strokePath(path, QPen(QColor("#000000"), 2 * r + 1, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
@@ -5204,6 +5667,11 @@ class NekoPlayer(QMainWindow):
             self._fs = True
             self.setGeometry(screen.geometry())
             self._grab_focus()
+            if not getattr(self, "_fs_guard", False):
+                self._fs_guard = True
+                QApplication.instance().focusWindowChanged.connect(self._fs_focus_cambiato)
+            # il focus va riaffermato anche dopo che overlay e sottotitoli sono comparsi
+            for ms in (60, 250, 800): QTimer.singleShot(ms, self._fs_riprendi_focus)
         else:
             self._fs = False
             if self._normal_geo is not None: self.setGeometry(self._normal_geo)
@@ -5250,6 +5718,25 @@ class NekoPlayer(QMainWindow):
         self.activateWindow()
         self._ears_force_raise = True
         self.lower_ears_behind_window()
+        self._forza_focus_x11()
+
+    def _forza_focus_x11(self):
+        """Senza window manager la tastiera resta all'app che aveva il focus (es. Nemo): lo si imposta a mano."""
+        if not BYPASS_WM or not self.isVisible() or QApplication.platformName() != "xcb": return
+        _x11_imposta_focus(int(self.winId()))
+
+    def _fs_focus_cambiato(self, win):
+        # a schermo intero e' l'unica finestra visibile: se il focus passa a un'altra app (Nemo aperta da una
+        # scorciatoia resta nascosta dietro) si riprende subito, cosi' i tasti non finiscono li'
+        if win is None and self._fs and BYPASS_WM and not self._min:
+            QTimer.singleShot(40, self._fs_riprendi_focus)
+
+    def _fs_riprendi_focus(self):
+        if not (self._fs and BYPASS_WM and not self._min and self.isVisible()): return
+        if QApplication.activePopupWidget() is not None or QApplication.activeModalWidget() is not None: return
+        if QApplication.activeWindow() is not None: return          # il focus e' gia' a una nostra finestra
+        if any(isinstance(w, QDialog) and w.isVisible() for w in QApplication.topLevelWidgets()): return
+        self._grab_focus()
 
     def _is_overlay_window(self, obj):
         return obj in (self.ear_left, self.ear_right)
