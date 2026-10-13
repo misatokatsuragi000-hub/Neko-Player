@@ -152,7 +152,7 @@ from PyQt5.QtGui import (
     QImage, QPixmap, QKeyEvent, QMouseEvent, QWheelEvent,
     QPainter, QColor, QPen, QBrush, QTransform, QRegion, QPainterPath,
     QPainterPathStroker, QIcon, QFont, QCursor, QFontMetrics, QLinearGradient, QPolygon,
-    QTextDocument, QTextOption, QPolygonF
+    QTextDocument, QTextOption, QPolygonF, QRadialGradient
 )
 from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint, QPointF, QRect, QRectF, QSize, QEvent,
@@ -3283,7 +3283,7 @@ ZAMPA_CAPRIOLA_GIRI = 1                  # giri completi (360 gradi) di ogni cap
 ZAMPA_CAPRIOLA_ALTEZZA = 2.5
 # Pulsazione continua della zampa/stella (anche mentre salta): si ingrandisce un istante a ritmo
 # regolare, come un battito. Scala massima = 1 + AMPIEZZA.
-ZAMPA_PULSA_AMPIEZZA = 0.30    # 0.10 = +10% al picco; 0 = nessuna pulsazione
+ZAMPA_PULSA_AMPIEZZA = 0.10    # 0.10 = +10% al picco; 0 = nessuna pulsazione
 ZAMPA_PULSA_PERIODO = 0.85     # secondi tra un battito e il successivo
 _ZAMPA_INCL_CICLI_NORMALI = 2            # quanti cicli normali prima di ogni capriola
 _ZAMPA_INCL_SALTI_CICLO = 4              # salti (kanji-1) di un ciclo normale 0,+30,0,-30
@@ -3838,6 +3838,7 @@ class KaraokeSubs:
 
     ZAMPA_SALTO = 0.4      # frazione della durata di un token kanji impiegata per il salto (poi resta posata)
     ZAMPA_SALTO_TRAD = 0.8  # idem per le lettere della traduzione
+    ZAMPA_SALTO_LETTERA = 0.8  # token con piu' lettere: frazione del tempo di OGNI lettera impiegata per il salto (la zampa salta su ogni lettera, distribuita sulla durata del token)
     ZAMPA_SCHIACCIA = 0.35  # durata dello schiacciamento all'atterraggio (frazione del token, dopo il salto): piu' alto = piu' morbido
 
     def zampa(self, k, show_o=True, show_h=True, show_t=True):
@@ -3877,18 +3878,43 @@ class KaraokeSubs:
             volo = self._capriola_volo(ids, k_cur, u, a, b)
             if volo is not None:
                 i8, i10, s, T = volo
-                A = (l16("".join(tok[a:i8])), tok[i8])
-                B = (l16("".join(tok[a:i10])), tok[i10])
+                A = self._lettera_riposo(tok, a, i8)      # lettera su cui la zampa e' posata al decollo
+                B = self._lettera_riposo(tok, a, i10)     # lettera su cui atterra
                 capriola = True
                 fine, span = 1.0, 0.0            # in volo nessuno schiacciamento
                 rate = 1.0 / T                   # velocita' del volo (s al secondo), per interpolare a 60 Hz
             else:
-                A = (l16("".join(tok[a:p])), tok[p]) if p >= a else None
-                B = (l16("".join(tok[a:idx])), tok[idx])
-                s, fine = min(1.0, u / self.ZAMPA_SALTO), self.ZAMPA_SALTO
-                span = self.ZAMPA_SCHIACCIA
-                rate = 1.0 / (self.ZAMPA_SALTO * d_tok) if s < 1.0 else 0.0
-                qinfo = (u, round(1.0 / d_tok, 4), fine, span)
+                A = self._ultima_lettera(tok, a, p) if p >= a else None
+                base = l16("".join(tok[a:idx]))
+                lett = self._lettere_token(tok[idx])
+                if len(lett) <= 1:                # token di una sola lettera: comportamento originale
+                    B = (base, tok[idx])
+                    s, fine = min(1.0, u / self.ZAMPA_SALTO), self.ZAMPA_SALTO
+                    span = self.ZAMPA_SCHIACCIA
+                    rate = 1.0 / (self.ZAMPA_SALTO * d_tok) if s < 1.0 else 0.0
+                    qinfo = (u, round(1.0 / d_tok, 4), fine, span)
+                else:
+                    # token con piu' lettere: il suo tempo e' diviso in parti uguali, una per lettera, e la
+                    # zampa salta su ogni lettera (invece di restare al centro della stringa fino alla fine)
+                    n = len(lett)
+                    xl = min(n - 1e-9, max(0.0, u * n))
+                    j = int(xl)
+                    uj = xl - j                    # avanzamento dentro la lettera j
+                    B = (base + lett[j][0], lett[j][1])
+                    if j > 0:
+                        A = (base + lett[j - 1][0], lett[j - 1][1])
+                        k_prec = k_cur             # salto dentro lo stesso token: l'inclinazione non cambia
+                    fine = self.ZAMPA_SALTO_LETTERA
+                    span = 1.0 - fine
+                    dopo_cap = (k_cur >= _ZAMPA_INCL_KANJI_PERIODO and k_cur % _ZAMPA_INCL_KANJI_PERIODO == 0
+                                and ids[k_cur - 2] >= a)
+                    if dopo_cap and u >= self.ZAMPA_SALTO and j == min(n - 1, int(self.ZAMPA_SALTO * n)):
+                        s, span, rate = 1.0, 0.0, 0.0   # lettera di atterraggio della capriola: resta posata
+                    else:
+                        s = min(1.0, uj / fine)
+                        rate = n / (fine * d_tok) if s < 1.0 else 0.0
+                    u = uj
+                    qinfo = (uj, round(n / d_tok, 4), fine, span) if span > 1e-6 else None
         elif show_t and k_tr is not None:
             it, h, passo = k_tr[0], k_tr[1], k_tr[2]
             testo = self.tr[it]
@@ -3936,6 +3962,34 @@ class KaraokeSubs:
         return i8, i10, min(1.0, max(0.0, el / T)), T
 
     @staticmethod
+    def _lettere_token(s):
+        """[(posizione UTF-16 nel token, carattere)] dei caratteri non spazio di un token."""
+        out, off = [], 0
+        for ch in s:
+            if not ch.isspace():
+                out.append((off, ch))
+            off += l16(ch)
+        return out
+
+    def _ultima_lettera(self, tok, a, i):
+        """(posizione UTF-16 nel blocco, testo) dell'ultima lettera del token i (token di una lettera: il token)."""
+        base = l16("".join(tok[a:i]))
+        lett = self._lettere_token(tok[i])
+        if len(lett) <= 1:
+            return (base, tok[i])
+        return (base + lett[-1][0], lett[-1][1])
+
+    def _lettera_riposo(self, tok, a, i):
+        """Lettera del token i su cui sta la zampa quando e' trascorsa la frazione ZAMPA_SALTO del token
+        (decollo e atterraggio della capriola); token di una lettera: il token intero, come prima."""
+        base = l16("".join(tok[a:i]))
+        lett = self._lettere_token(tok[i])
+        if len(lett) <= 1:
+            return (base, tok[i])
+        j = min(len(lett) - 1, int(self.ZAMPA_SALTO * len(lett)))
+        return (base + lett[j][0], lett[j][1])
+
+    @staticmethod
     def _kanji_indice(tok, a, i):
         """Posizione nel ciclo d'inclinazione del token i (caratteri non spazi a partire dal primo
         con testo); -1 se non ce ne sono (usato per riconoscere i salti da capriola)."""
@@ -3976,12 +4030,17 @@ class SubtitleOverlay(QWidget):
         self._cache = None
         self._scale = 1.0
         self.use_star = False  # True = stella arrotondata, False = zampa di gatto
+        self.use_heart = False  # True = cuoricino finto 3D (ha la precedenza su stella e zampa)
         parent.installEventFilter(self)
         self.setGeometry(parent.rect())
         self.hide()
 
     def set_use_star(self, on):
         self.use_star = bool(on)
+        self.update()
+
+    def set_use_heart(self, on):
+        self.use_heart = bool(on)
         self.update()
 
     def eventFilter(self, obj, ev):
@@ -4186,7 +4245,9 @@ class SubtitleOverlay(QWidget):
         # disegna la zampa/stella: con lo stato corrente o, se diventato None, con l'ultima
         # posizione nota (la figura non sparisce del tutto finche' restano i sottotitoli)
         try:
-            if getattr(self, "use_star", False):
+            if getattr(self, "use_heart", False):
+                self._disegna_cuore(p, doc, x, y, px, r)
+            elif getattr(self, "use_star", False):
                 self._disegna_stella(p, doc, x, y, px, r)
             else:
                 self._disegna_zampa(p, doc, x, y, px, r)
@@ -4295,6 +4356,131 @@ class SubtitleOverlay(QWidget):
         p.scale(sx, sy)
         p.strokePath(path, QPen(QColor("#000000"), 2 * r + 1, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         p.fillPath(path, QColor("#ff9ec4"))
+        p.restore()
+
+    def _disegna_cuore(self, p, doc, x, y, px, r):
+        """Cuoricino rosso con effetto 3D finto (cupola sfumata, spessore, riflessi) che salta di lettera in lettera."""
+        z = self._zampa or self._zampa_ultima   # se lo stato e' None si usa l'ultima posizione nota
+        if z is None:
+            return
+        blocco, A, B, s, q = z[:5]
+        s = self._s_corrente(z)            # progresso interpolato a 60 Hz
+        q = self._q_corrente(z)            # schiacciamento interpolato a 60 Hz
+        pos_ciclo = z[5] if len(z) > 5 else None
+        cb = self._centro_lettera(doc, x, y, blocco, B[0], B[1])
+        if cb is None:
+            return
+        S = px * 0.85                      # dimensione del cuoricino
+        cx, top, _ = cb
+        riposo = top - S * 0.5             # centro quando e' posata sopra la lettera
+        ca = self._centro_lettera(doc, x, y, blocco, A[0], A[1]) if A else None
+        e = s * s * (3.0 - 2.0 * s)        # partenza e arrivo dolci in orizzontale
+
+        if ca is not None:
+            px0, py0 = ca[0], ca[1] - S * 0.5
+            cx = px0 + (cx - px0) * e
+            riposo = py0 + (riposo - py0) * e
+            # Inclinazione di +-30° attorno all'asse che fuoriesce dallo schermo (rotazione nel piano 2D),
+            # distribuita su piu' kanji: un nodo del ciclo 0 -> +30 -> 0 -> -30 -> 0 per ogni lettera;
+            # l'angolo reale e' quello 'attuale' inseguito gradualmente dall'overlay, mai istantaneo
+            if pos_ciclo is not None:
+                # capriola: giro uniforme 360 * s (sempre in avanti); altrimenti oscillazione +-30 inseguita
+                if len(z) > 6 and z[6]:
+                    ang = 360.0 * s
+                else:                        # +-30: stesso easing della posizione, senza ritardo
+                    ang = zampa_incl_angolo(pos_ciclo[0], pos_ciclo[1], e, False)
+            else:
+                direzione = 1.0 if cb[0] >= px0 else -1.0
+                ang = 30.0 * math.sin(math.pi * s) * direzione
+            # Arco parabolico del salto, identico anche per la capriola: il centro della figura
+            # segue la parabola (altezza ZAMPA_CAPRIOLA_ALTEZZA volte quella normale durante la
+            # capriola) e ruota attorno al proprio centro. Il salto e' cosi' visibile per intero
+            # (la stella sale fino all'apice e ridiscende), senza inversioni sull'asse y: la
+            # rotazione a 360 gradi attorno al centro non cambia l'altezza del volo.
+            salto_alto = bool(len(z) > 6 and z[6])
+            base_altezza = 0.95 * S
+            molla = 4.0 * s * (1.0 - s)    # profilo dell'arco: 0 ai capi, 1 all'apice
+            alza = base_altezza * (ZAMPA_CAPRIOLA_ALTEZZA if salto_alto else 1.0) * molla
+            cy = riposo - alza
+        else:                              # prima lettera: scende dall'alto
+            molla = 0.0
+            salto_alto = False
+            base_altezza = 0.95 * S
+            alza = S * 1.6 * (1.0 - e)
+            ang = 0.0
+            cy = riposo - alza
+
+        # Dinamica di salto: estensione elastica in volo (stretch) e schiacciamento all'impatto (squash)
+        stretch = 0.12 * math.sin(math.pi * s) if ca is not None and s < 1.0 else 0.0
+        sx = (1.0 + 0.18 * q) * (1.0 - stretch * 0.5)
+        sy = (1.0 - 0.22 * q) * (1.0 + stretch)
+        # la figura pulsa sempre, a ritmo costante, anche durante salto e schiacciamento
+        pulsa = self._pulsa()
+        sx *= pulsa
+        sy *= pulsa
+
+        # Cuore: due lobi in alto, punta in basso. Coordinate in unita' di S, origine al centro.
+        def P(a, b_): return QPointF(a * S, b_ * S)
+        path = QPainterPath()
+        path.moveTo(P(0.0, 0.42))
+        path.cubicTo(P(-0.12, 0.30), P(-0.46, 0.08), P(-0.46, -0.16))
+        path.cubicTo(P(-0.46, -0.30), P(-0.36, -0.40), P(-0.23, -0.40))
+        path.cubicTo(P(-0.10, -0.40), P(-0.02, -0.30), P(0.0, -0.18))
+        path.cubicTo(P(0.02, -0.30), P(0.10, -0.40), P(0.23, -0.40))
+        path.cubicTo(P(0.36, -0.40), P(0.46, -0.30), P(0.46, -0.16))
+        path.cubicTo(P(0.46, 0.08), P(0.12, 0.30), P(0.0, 0.42))
+        path.closeSubpath()
+
+        # Illusione 3D: la luce resta fissa in alto a sinistra sullo schermo anche mentre il cuore ruota,
+        # quindi ogni offset di luce/spessore (definito in coordinate schermo) viene riportato nel sistema
+        # locale della figura: ruotato di -ang e diviso per la scala (sx, sy).
+        ar = math.radians(ang)
+        ca_, sa_ = math.cos(ar), math.sin(ar)
+        def loc(vx, vy):
+            return QPointF((ca_ * vx + sa_ * vy) * S / sx, (-sa_ * vx + ca_ * vy) * S / sy)
+
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing)
+        p.translate(cx, cy)                        # centro della figura: ruota attorno a se stessa
+        p.rotate(ang)
+        p.scale(sx, sy)
+        pen_nero = QPen(QColor("#000000"), 1 * r , Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+
+        # 1) spessore: copia scura spostata in basso a destra (sotto la faccia frontale)
+        d = loc(0.035, 0.06)
+        p.save()
+        p.translate(d)
+        p.strokePath(path, pen_nero)
+        p.fillPath(path, QColor("#8a0f2c"))
+        p.restore()
+
+        # 2) faccia frontale: contorno nero + cupola sfumata (luce in alto a sinistra)
+        p.strokePath(path, pen_nero)
+        g = QRadialGradient(loc(0.03, 0.05), 0.72 * S, loc(-0.15, -0.20))
+        g.setColorAt(0.0, QColor("#ffb0c2"))
+        g.setColorAt(0.30, QColor("#ff5577"))
+        g.setColorAt(0.72, QColor("#d41d45"))
+        g.setColorAt(1.0, QColor("#9a0e2d"))
+        p.fillPath(path, QBrush(g))
+
+        # 3) bordo interno scuro (smussatura): tratto largo ritagliato dentro la sagoma
+        p.save()
+        p.setClipPath(path)
+        p.strokePath(path, QPen(QColor(110, 0, 28, 110), 0.12 * S, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.restore()
+
+        # 4) riflessi lucidi sul lobo sinistro (fissi rispetto alla luce) e puntino su quello destro
+        p.setPen(Qt.NoPen)
+        p.save()
+        p.translate(loc(-0.25, -0.25))
+        p.rotate(-ang - 28.0)
+        p.setBrush(QColor(255, 255, 255, 190))
+        p.drawEllipse(QPointF(0.0, 0.0), 0.115 * S, 0.060 * S)
+        p.restore()
+        p.setBrush(QColor(255, 255, 255, 150))
+        p.drawEllipse(loc(-0.07, -0.30), 0.028 * S, 0.028 * S)
+        p.setBrush(QColor(255, 255, 255, 70))
+        p.drawEllipse(loc(0.26, -0.27), 0.035 * S, 0.022 * S)
         p.restore()
 
     def _disegna_stella(self, p, doc, x, y, px, r):
@@ -4642,6 +4828,7 @@ class NekoPlayer(QMainWindow):
         self.sub_zoom = True        # zoom leggero sulla lettera in riproduzione (spunta nel menu)
         self.sub_zampa = True       # zampa di gatto che salta di lettera in lettera (spunta nel menu)
         self.sub_star = False       # True = stella arrotondata, False = zampa
+        self.sub_heart = False      # True = cuoricino finto 3D (esclusivo con la stella)
         self.sub_transition = True  # transizione sui kanji prima e dopo quello pronunciato (spunta nel menu)
         self.sub_scale = 1.0        # dimensione dei sottotitoli (+ / - da tastiera), salvata in config
         self.always_on_top = ALWAYS_ON_TOP     # spunta nel menu: finestra sopra tutte le altre
@@ -4804,6 +4991,7 @@ class NekoPlayer(QMainWindow):
         self.sub_overlay = SubtitleOverlay(self.video_display)
         self.sub_overlay.set_scale(self.sub_scale)
         self.sub_overlay.set_use_star(self.sub_star)
+        self.sub_overlay.set_use_heart(self.sub_heart)
         self.clock_overlay = ClockOverlay(self.video_display)
         self.clock_overlay.minute_rolled_over = self.on_clock_minute
         self.clock_overlay.set_bg_color(self.theme_color)
@@ -6142,6 +6330,7 @@ class NekoPlayer(QMainWindow):
             ("Zoom sulla lettera", self.toggle_sub_zoom, self.subs is not None, bool(self.sub_zoom)),
             ("Zampa di gatto", self.toggle_sub_zampa, self.subs is not None, bool(self.sub_zampa)),
             ("Stella arrotondata", self.toggle_sub_star, self.subs is not None, bool(self.sub_star)),
+            ("Cuoricino 3D", self.toggle_sub_heart, True, bool(self.sub_heart)),     # sempre attivabile
             ("Transizione kanji vicini", self.toggle_sub_transition, self.subs is not None, bool(self.sub_transition)),
             ("Sempre in primo piano", self.toggle_always_on_top,
              can_fit and FREE_WINDOW_MOVE and sys.platform.startswith("linux"), bool(self.always_on_top)),
@@ -6258,7 +6447,19 @@ class NekoPlayer(QMainWindow):
 
     def toggle_sub_star(self):
         self.sub_star = not self.sub_star
+        if self.sub_star:                      # stella e cuoricino si escludono a vicenda
+            self.sub_heart = False
+            self.sub_overlay.set_use_heart(False)
         self.sub_overlay.set_use_star(self.sub_star)
+        self._sub_key = None
+        self.save_settings()
+
+    def toggle_sub_heart(self):
+        self.sub_heart = not self.sub_heart
+        if self.sub_heart:
+            self.sub_star = False
+            self.sub_overlay.set_use_star(False)
+        self.sub_overlay.set_use_heart(self.sub_heart)
         self._sub_key = None
         self.save_settings()
 
@@ -6669,6 +6870,7 @@ class NekoPlayer(QMainWindow):
             "subtitles_zoom": bool(self.sub_zoom),
             "subtitles_zampa": bool(self.sub_zampa),
             "subtitles_star": bool(self.sub_star),
+            "subtitles_heart": bool(self.sub_heart),
             "subtitles_transition": bool(self.sub_transition),
             "subtitles_scale": float(self.sub_scale),
             "show_bg_texture": self.chk_texture.isChecked(),
@@ -6770,7 +6972,10 @@ class NekoPlayer(QMainWindow):
             self.sub_zoom = bool(config_data.get("subtitles_zoom", True))
             self.sub_zampa = bool(config_data.get("subtitles_zampa", True))
             self.sub_star = bool(config_data.get("subtitles_star", False))
+            self.sub_heart = bool(config_data.get("subtitles_heart", False))
+            if self.sub_heart: self.sub_star = False
             self.sub_overlay.set_use_star(self.sub_star)
+            self.sub_overlay.set_use_heart(self.sub_heart)
             self.sub_transition = bool(config_data.get("subtitles_transition", True))
             try:
                 self.sub_scale = min(SUB_SCALE_MAX, max(SUB_SCALE_MIN, float(config_data.get("subtitles_scale", 1.0))))
