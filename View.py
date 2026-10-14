@@ -105,6 +105,54 @@ def parse_input_target():
             return cleaned
     return None
 
+def get_script_shebang(script_path):
+    """Legge la riga shebang (#!) di uno script Python in modo robusto.
+
+    Restituisce il path dell'interprete dichiarato nello script (es.
+    '#!/usr/bin/env python3' -> '/usr/bin/python3'), oppure None se lo script
+    non ha uno shebang eseguibile / valido.
+    """
+    try:
+        with open(script_path, 'r', encoding='utf-8', errors='ignore') as f:
+            first_line = f.readline().strip()
+    except Exception:
+        return None
+    if not first_line.startswith('#!'):
+        return None
+    interp = first_line[2:].strip()
+    if not interp:
+        return None
+    parts = interp.split()
+    if parts and os.path.basename(parts[0]) == 'env' and len(parts) > 1:
+        parts = parts[1:]  # gestisce '#!/usr/bin/env python3'
+    exe = parts[0]
+    resolved = shutil.which(exe) if not os.path.isabs(exe) else exe
+    if resolved and os.path.isfile(resolved) and os.access(resolved, os.X_OK):
+        return resolved
+    return None
+
+
+def find_system_python():
+    """Fallback: cerca un interprete Python DI SISTEMA (non venv).
+
+    Usato solo quando lo script non dichiara un proprio shebang. sys.executable
+    punterebbe al venv di View.py (es. ~/venvs/generale/bin/python) che potrebbe
+    non avere i moduli richiesti (es. gi/PyGObject).
+    """
+    candidates = []
+    for name in ('python3', 'python'):
+        p = shutil.which(name)
+        if p:
+            candidates.append(p)
+    candidates += ['/usr/bin/python3', '/usr/bin/python', '/usr/local/bin/python3']
+
+    for py in candidates:
+        rp = os.path.realpath(py)
+        if os.path.isfile(rp) and 'venv' not in rp.lower() and '.virtualenv' not in rp.lower():
+            return py
+    return sys.executable
+
+
 def build_launch_command(app_cmd, file_path):
     abs_path = os.path.abspath(file_path)
 
@@ -113,21 +161,36 @@ def build_launch_command(app_cmd, file_path):
         cmd_str = re.sub(r'@@.*?@@', f'@@ {shlex.quote(abs_path)} @@', cmd_str)
         cmd_str = re.sub(r'%[a-zA-Z]', '', cmd_str)
         parts = [p for p in shlex.split(cmd_str) if p.strip()]
-        return parts
-
-    if re.search(r'["\']?%[uUfF]["\']?', app_cmd):
+    elif re.search(r'["\']?%[uUfF]["\']?', app_cmd):
         cmd_str = re.sub(r'["\']?%[uUfF]["\']?', shlex.quote(abs_path), app_cmd)
         cmd_str = re.sub(r'%[a-zA-Z]', '', cmd_str)
         parts = [p for p in shlex.split(cmd_str) if p.strip()]
-        return parts
-
-    cmd_str = re.sub(r'["\']?%[a-zA-Z]["\']?', '', app_cmd)
-    parts = [p for p in shlex.split(cmd_str) if p.strip()]
-
-    if len(parts) >= 2 and parts[0].endswith('flatpak') and parts[1] == 'run':
-        parts.extend(['@@', abs_path, '@@'])
     else:
-        parts.append(abs_path)
+        # Percorso puro (es. /path/wallpaper.py selezionato dal file dialog): non deve
+        # essere spezzato da shlex, altrimenti i percorsi con spazi vengono troncati
+        # ("sh: cannot execute .../wallpaper.py") e lo script non parte.
+        if os.path.isfile(app_cmd):
+            parts = [os.path.abspath(app_cmd), abs_path]
+        else:
+            cmd_str = re.sub(r'["\']?%[a-zA-Z]["\']?', '', app_cmd)
+            try:
+                parts = [p for p in shlex.split(cmd_str) if p.strip()]
+            except ValueError:
+                parts = cmd_str.split()
+
+            if len(parts) >= 2 and parts[0].endswith('flatpak') and parts[1] == 'run':
+                parts.extend(['@@', abs_path, '@@'])
+            else:
+                parts.append(abs_path)
+
+    # MODIFICA: Se si lancia uno script Python (.py):
+    # 1) rispetta lo shebang (#!/usr/bin/env python3 o #!/percorso/python) scritto
+    #    in cima allo script, così ogni script può dichiarare il SUO interprete;
+    # 2) se non c'è alcuno shebang, usa il python di sistema (non sys.executable,
+    #    che potrebbe essere un venv senza PyGObject/gi).
+    if parts and parts[0].endswith('.py'):
+        interp = get_script_shebang(parts[0]) or find_system_python()
+        parts.insert(0, interp)
 
     return parts
 
@@ -2720,6 +2783,16 @@ class FastGalleryViewer(QMainWindow):
     def populate_open_with_submenu(self, menu, target_file_path):
         menu.clear()
 
+        # MODIFICA: Integrazione diretta con wallpaper.py
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        local_wallpaper = os.path.join(script_dir, "wallpaper.py")
+        if os.path.exists(local_wallpaper) and target_file_path:
+            ext = os.path.splitext(target_file_path)[1].lower()
+            if ext in KNOWN_VIDEO_EXTENSIONS or ext == '.gif':
+                action_wp = menu.addAction("🎬 Imposta come Sfondo Animato")
+                action_wp.triggered.connect(lambda ch=False, p=target_file_path: self.launch_app(local_wallpaper, p))
+                menu.addSeparator()
+
         saved_apps = self.settings.value("custom_apps_dict", {})
         if not isinstance(saved_apps, dict):
             old_apps = self.settings.value("custom_apps", [])
@@ -2738,12 +2811,24 @@ class FastGalleryViewer(QMainWindow):
 
         menu.addSeparator()
 
+        # Selezione al volo di qualsiasi script Python (.py)
+        action_py = menu.addAction("🐍 Esegui Script Python al volo...")
+        action_py.triggered.connect(lambda ch=False, p=target_file_path: self.launch_python_script_direct(p))
+
         action_add = menu.addAction("➕ Configura / Aggiungi nuova app...")
         action_add.triggered.connect(lambda ch=False, p=target_file_path: self.configure_new_app(p))
 
         if saved_apps:
             action_clear = menu.addAction("🗑 Cancella lista app salvate")
             action_clear.triggered.connect(self.clear_configured_apps)
+
+    def launch_python_script_direct(self, target_file_path=None):
+        fpath, _ = QFileDialog.getOpenFileName(
+            self, "Seleziona Script Python",
+            os.path.expanduser("~"), "Script Python (*.py);;Tutti i file (*)"
+        )
+        if fpath:
+            self.launch_app(fpath, target_file_path)
 
     def open_in_file_manager(self, file_path, app_cmd=""):
         abs_path = os.path.abspath(file_path)
@@ -2790,8 +2875,34 @@ class FastGalleryViewer(QMainWindow):
         cmd = build_launch_command(app_cmd, abs_file_path)
 
         try:
-            subprocess.Popen(cmd)
-            self.lbl_stats.setText(f"Avviato con: {os.path.basename(cmd[0])}")
+            # start_new_session=True rende lo sfondo indipendente dal ciclo di vita di View.py
+            work_dir = os.path.dirname(abs_file_path)
+            proc = subprocess.Popen(cmd, cwd=work_dir, start_new_session=True,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+            # Se il processo muore entro ~1.5s (es. errore di sintassi nel parser di
+            # wallpaper.py, modulo mancante, xprop/mpv non installati), mostra l'errore
+            # invece di far credere che lo sfondo animato sia partito.
+            def _check_early_exit(p=proc, c=cmd):
+                try:
+                    code = p.poll()
+                    if code is not None and code != 0:
+                        err = ""
+                        try:
+                            err = p.stderr.read().decode(errors="replace").strip()[-600:]
+                        except Exception:
+                            pass
+                        QMessageBox.warning(
+                            self, "Errore Avvio",
+                            f"Il processo è terminato subito (codice {code}):\n"
+                            f"{' '.join(c)}\n\n{err}"
+                        )
+                except Exception:
+                    pass
+            QTimer.singleShot(1500, _check_early_exit)
+
+            prog = os.path.basename(cmd[1]) if len(cmd) > 1 and os.path.basename(cmd[0]).startswith('python') else os.path.basename(cmd[0])
+            self.lbl_stats.setText(f"Avviato con: {prog}")
         except Exception as e:
             QMessageBox.warning(self, "Errore Avvio", f"Errore nell'avvio dell'applicazione:\n{e}")
 
