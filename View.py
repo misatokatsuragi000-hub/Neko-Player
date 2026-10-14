@@ -2901,7 +2901,11 @@ class FastGalleryViewer(QMainWindow):
                     pass
             QTimer.singleShot(1500, _check_early_exit)
 
-            prog = os.path.basename(cmd[1]) if len(cmd) > 1 and os.path.basename(cmd[0]).startswith('python') else os.path.basename(cmd[0])
+            # L'elemento [0] è un interprete Python se è python* oppure se è uno script .py
+            # lanciato con shebang personalizzato (es. '#!/x/venv/bin/python3.11').
+            is_interpreter = (os.path.basename(cmd[0]).startswith('python')
+                              or cmd[0].endswith('.py'))
+            prog = os.path.basename(cmd[1]) if len(cmd) > 1 and is_interpreter else os.path.basename(cmd[0])
             self.lbl_stats.setText(f"Avviato con: {prog}")
         except Exception as e:
             QMessageBox.warning(self, "Errore Avvio", f"Errore nell'avvio dell'applicazione:\n{e}")
