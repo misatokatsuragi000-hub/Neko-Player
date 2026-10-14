@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# venv: /mnt/1CE16DBE48849731/CosyVoice/.venv
 """
 Trascrivi Audio - GUI PyQt5 per estrarre il testo da un audio/video con faster-whisper,
 convertirlo in Hiragana e riascoltarlo con evidenziazione "karaoke".
@@ -37,6 +38,7 @@ import socket
 import time
 import shutil
 import threading
+from urllib.parse import quote
 from bisect import bisect_left, bisect_right
 from math import ceil
 
@@ -104,9 +106,9 @@ _aggiungi_path_librerie_cuda()
 import numpy as np
 
 from PyQt5.QtCore import (Qt, QThread, QTimer, QUrl, QPointF, QRectF, QSizeF, QProcess, QEventLoop,
-                          pyqtSignal)
+                          QObject, pyqtSignal, pyqtSlot)
 from PyQt5.QtGui import (
-    QBrush, QColor, QFont, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPalette, QPen,
+    QDesktopServices, QBrush, QColor, QFont, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPalette, QPen,
     QPolygonF, QTextCursor, QTextDocument, QTextOption, QImage, QPixmap,
 )
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
@@ -456,6 +458,7 @@ MODELLI_TRAD = [
     ("TranslateGemma 12B - via Ollama (migliore, serve piu' VRAM)", "ollama", "translategemma:12b"),
     ("LM Studio - server locale (qualsiasi modello caricato)", "lmstudio", ""),
     ("llama.cpp - llama-server avviato dallo script (GGUF caricato solo per la traduzione)", "llamaserver", ""),
+    ("Google Traduttore - nel browser (serve lo script Tampermonkey che copia la traduzione)", "browser", ""),
 ]
 LM_URL_PREDEFINITO = "http://localhost:1235/v1"
 # traduzione "a contesto completo": dimensione massima di un gruppo di righe (le finestre
@@ -578,6 +581,8 @@ QPushButton#play { background: %(accent)s; color: white; font-size: 16px; border
 QPushButton#play:hover { background: #917fff; }
 QPushButton#tondo { font-size: 14px; border-radius: 20px;
                     min-width: 40px; max-width: 40px; min-height: 40px; max-height: 40px; padding: 0; }
+QPushButton#tondo:checked { background: %(accent)s; color: white; }
+QPushButton#tondo:checked:hover { background: #917fff; }
 QPushButton#piccolo { padding: 4px 10px; font-size: 12px; }
 QTextEdit { background: #12131a; border: 1px solid %(border)s; border-radius: 10px; padding: 8px;
             font-size: 18px; selection-background-color: %(accent)s; }
@@ -959,6 +964,56 @@ def _u16_slice(s, a, b):
     return s.encode("utf-16-le")[2 * a:2 * b].decode("utf-16-le")
 
 
+# Token iniziali "fuori tempo": Whisper a volte assegna ai primi token di una riga tempi molto in anticipo
+# rispetto al resto (es. 0.7-1.8 s, mentre la riga canta davvero da 14.2 s). Il testo compariva a inizio
+# intervallo, spariva dopo il ritardo di coda e ricompariva quando partivano i tempi reali.
+GAP_INIZIO_SEGMENTO = 3.0           # secondi di buco, dopo i primi token, oltre i quali questi sono considerati fuori tempo
+DURATA_TOKEN_FUORI_TEMPO = (0.10, 0.50)   # durata minima e massima con cui si riportano accanto al primo token reale
+
+
+def riallinea_inizio_token(t0, t1, a, b, gap=GAP_INIZIO_SEGMENTO):
+    """Per i token [a, b) di una riga: se i primi (al massimo un terzo della riga, minimo 3) hanno tempi separati
+    dal resto da un buco > gap, li riporta contigui subito prima del primo token con tempo reale, cosi' l'inizio
+    della riga (e dei suoi sottotitoli) coincide con il primo kanji/hiragana mostrato e il testo non sparisce.
+    Modifica t0/t1 sul posto; restituisce True se ha cambiato qualcosa. Ripetibile senza effetti collaterali."""
+    n = b - a
+    if n < 2:
+        return False
+    k = None
+    for i in range(a, b - 1):
+        if t0[i + 1] - max(t1[i], t0[i]) > gap:
+            k = i + 1
+            break
+    if k is None or (k - a) > max(3, n // 3):
+        return False
+    fine = t0[k]                                       # primo token con tempo reale
+    lo_d, hi_d = DURATA_TOKEN_FUORI_TEMPO
+    dur = [min(hi_d, max(lo_d, t1[i] - t0[i])) for i in range(a, k)]
+    inizio = max(t0[a], fine - sum(dur))               # mai prima del tempo originale
+    scala = (fine - inizio) / sum(dur)
+    cur = inizio
+    for j, i in enumerate(range(a, k)):
+        d = dur[j] * scala
+        t0[i], t1[i] = cur, min(fine, cur + d)
+        cur += d
+    return True
+
+
+def correggi_inizio_toks(toks):
+    """Come riallinea_inizio_token, per la lista di tuple (testo, hiragana, t0, t1) di una riga.
+    Restituisce (lista, cambiata)."""
+    t0, t1 = [x[2] for x in toks], [x[3] for x in toks]
+    if not riallinea_inizio_token(t0, t1, 0, len(toks)):
+        return toks, False
+    return [(o, h, a, b) for (o, h, _, _), a, b in zip(toks, t0, t1)], True
+
+
+def _pre_con_tempi(pre, a, b):
+    """Sostituisce nel prefisso '[mm:ss.s -> mm:ss.s] ' di una riga i tempi con a, b."""
+    nuovo = "[{} -> {}]".format(fmt_tempo(a), fmt_tempo(max(a, b)))
+    return _RE_INTERVALLO.sub(lambda m: nuovo, pre, count=1)
+
+
 def allinea_traduzione(t0, t1, trad, seg=None):
     """Riallinea i tempi delle righe tradotte a quelli dei token giapponesi.
 
@@ -1245,17 +1300,27 @@ def karaoke_espandi(d):
     tok_o, tok_h, tok_seg = [], [], []
     po = ph = 0
 
+    corretti = []                      # (inizio vecchio, inizio nuovo) delle righe corrette
     for n, (pre, toks) in enumerate(d["s"]):
+        ta, tb = [e[-2] for e in toks], [e[-1] for e in toks]
+        if riallinea_inizio_token(ta, tb, 0, len(toks)):
+            ta, tb = [round(x, 2) for x in ta], [round(x, 2) for x in tb]
+            corretti.append((toks[0][-2], ta[0]))
+            pre = _pre_con_tempi(pre, ta[0], tb[-1])
+        else:
+            ta = None
         orig.append(pre)
         hira.append(pre)
         po += l16(pre)
         ph += l16(pre)
-        for e in toks:
+        for j, e in enumerate(toks):
             if len(e) == 3:
                 o, a, b = e
                 h = o
             else:
                 o, h, a, b = e
+            if ta is not None:
+                a, b = ta[j], tb[j]
             orig.append(o)
             hira.append(h)
             span_o.append((po, po + l16(o)))
@@ -1281,6 +1346,12 @@ def karaoke_espandi(d):
             out["trad"]["num"] = True
         if d.get("trp"):
             out["trad"]["per_segmento"] = True
+    if out.get("trad") and corretti and out["trad"].get("fissa"):
+        # tempi fissi presi da un file di traduzione: la riga parte insieme al suo primo kanji corretto
+        for vecchio, nuovo in corretti:
+            for i, x in enumerate(out["trad"]["t0"]):
+                if abs(x - vecchio) <= 0.3 and nuovo > x:
+                    out["trad"]["t0"][i] = nuovo
     if out.get("trad"):
         out["trad"] = allinea_traduzione(t0, t1, out["trad"], tok_seg)
     out.update(
@@ -1393,9 +1464,163 @@ def traduzione_numerata(trad):
         for k, (rg, a, b) in enumerate(zip(trad["righe"], trad["t0"], trad["t1"]), 1))
 
 
-def salva_risultato(r, media):
+# ---------------------------------------------------------------------------
+# Sottotitoli per mpv (.srt e .ass con karaoke), scritti insieme agli altri file
+# ---------------------------------------------------------------------------
+CODA_SOTTOTITOLO = 0.3     # secondi in piu' a fine frase, senza invadere la frase successiva
+
+
+def _t_srt(t):
+    ms = int(round(max(0.0, float(t)) * 1000))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return "{:02d}:{:02d}:{:02d},{:03d}".format(h, m, s, ms)
+
+
+def _t_ass(t):
+    cs = int(round(max(0.0, float(t)) * 100))
+    h, cs = divmod(cs, 360000)
+    m, cs = divmod(cs, 6000)
+    s, cs = divmod(cs, 100)
+    return "{:d}:{:02d}:{:02d}.{:02d}".format(h, m, s, cs)
+
+
+def _testo_srt(t):
+    righe = [" ".join(x.split()) for x in str(t).splitlines()]
+    return "\n".join(x for x in righe if x)
+
+
+def _testo_ass(t):
+    return " ".join(str(t).split()).replace("{", "(").replace("}", ")")
+
+
+def _scrivi_srt(voci):
+    """voci: [(inizio, fine, testo)] -> contenuto .srt (le voci vuote si saltano)."""
+    out, n = [], 0
+    for a, b, t in voci:
+        t = _testo_srt(t)
+        if not t:
+            continue
+        n += 1
+        b = max(float(b), float(a) + 0.05)
+        out.append("{}\n{} --> {}\n{}\n".format(n, _t_srt(a), _t_srt(b), t))
+    return "\n".join(out)
+
+
+def _frasi_karaoke(r):
+    """[(inizio, fine, [indici token])] per ogni frase giapponese, con la coda di visualizzazione."""
+    tok = r.get("tok") or {}
+    if not tok.get("seg") or not r.get("t0"):
+        return []
+    segs = segmenti_giapponesi(tok["seg"])
+    out = []
+    for k, (a, b) in enumerate(segs):
+        ini = float(r["t0"][a])
+        fin = max(float(r["t1"][i]) for i in range(a, b))
+        fin = max(fin, ini + 0.05)
+        succ = float(r["t0"][segs[k + 1][0]]) if k + 1 < len(segs) else None
+        coda = fin + CODA_SOTTOTITOLO
+        if succ is not None and succ > fin:
+            coda = min(coda, succ)
+        out.append((ini, max(fin, coda), list(range(a, b))))
+    return out
+
+
+def _riga_karaoke_ass(r, idx, testi):
+    """Testo ASS di una frase con i tag \\kf (riempimento progressivo) sui token."""
+    cur = float(r["t0"][idx[0]])
+    parti = []
+    for i in idx:
+        t = _testo_ass(testi[i])
+        if not t:
+            continue
+        ini = max(float(r["t0"][i]), cur)
+        fin = max(float(r["t1"][i]), ini)
+        vuoto = int(round(ini * 100)) - int(round(cur * 100))
+        if vuoto > 0:
+            parti.append("{{\\k{}}}".format(vuoto))
+        parti.append("{{\\kf{}}}{}".format(max(1, int(round(fin * 100)) - int(round(ini * 100))), t))
+        cur = fin
+    return "".join(parti)
+
+
+def sottotitoli_mpv(r, lingua=None):
+    """Sottotitoli del risultato r nei formati letti da mpv: {suffisso del file: contenuto}.
+    .ja.srt (giapponese), .ja-hira.srt (hiragana), .<lingua>.srt (traduzione, se c'e')
+    e .ja.ass (karaoke: i token si riempiono a tempo; hiragana, giapponese e traduzione)."""
+    out = {}
+    tok = r.get("tok") or {}
+    frasi = _frasi_karaoke(r)
+    if frasi:
+        o, h = tok["o"], tok["h"]
+        out[".ja.srt"] = _scrivi_srt([(a, b, "".join(o[i] for i in idx)) for a, b, idx in frasi])
+        con_hira = any(h[i] != o[i] for _, _, idx in frasi for i in idx)
+        if con_hira:
+            out[".ja-hira.srt"] = _scrivi_srt([(a, b, "".join(h[i] for i in idx)) for a, b, idx in frasi])
+    trad = r.get("trad")
+    righe = []
+    if trad and trad.get("righe"):
+        righe = [(float(a), float(b), t) for t, a, b in zip(trad["righe"], trad["t0"], trad["t1"])]
+        suff = ".{}.srt".format(lingua if lingua and lingua != "ja" else "trad")
+        out[suff] = _scrivi_srt(righe)
+
+    if frasi or righe:
+        ass = [
+            "[Script Info]",
+            "ScriptType: v4.00+",
+            "PlayResX: 1280",
+            "PlayResY: 720",
+            "WrapStyle: 0",
+            "ScaledBorderAndShadow: yes",
+            "",
+            "[V4+ Styles]",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, "
+            "Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+            "Alignment, MarginL, MarginR, MarginV, Encoding",
+            # Primary = colore dopo il riempimento karaoke, Secondary = colore prima
+            "Style: Giapponese,Noto Sans CJK JP,46,&H0000D7FF,&H00FFFFFF,&H00000000,&H80000000,"
+            "0,0,0,0,100,100,0,0,1,2.5,1,2,40,40,60,1",
+            "Style: Hiragana,Noto Sans CJK JP,30,&H0000D7FF,&H00FFFFFF,&H00000000,&H80000000,"
+            "0,0,0,0,100,100,0,0,1,2,1,2,40,40,118,1",
+            "Style: Traduzione,Noto Sans CJK JP,34,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,"
+            "0,0,0,0,100,100,0,0,1,2,1,2,40,40,12,1",
+            "",
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+        ]
+        righe_ass = []
+        for a, b, idx in frasi:
+            righe_ass.append((a, "Dialogue: 0,{},{},Giapponese,,0,0,0,,{}".format(
+                _t_ass(a), _t_ass(b), _riga_karaoke_ass(r, idx, tok["o"]))))
+            if any(tok["h"][i] != tok["o"][i] for i in idx):
+                righe_ass.append((a, "Dialogue: 0,{},{},Hiragana,,0,0,0,,{}".format(
+                    _t_ass(a), _t_ass(b), _riga_karaoke_ass(r, idx, tok["h"]))))
+        for a, b, t in righe:
+            t = _testo_ass(t)
+            if t:
+                righe_ass.append((a, "Dialogue: 0,{},{},Traduzione,,0,0,0,,{}".format(
+                    _t_ass(a), _t_ass(max(b, a + 0.05)), t)))
+        righe_ass.sort(key=lambda x: x[0])
+        out[".ja.ass"] = "\n".join(ass + [x[1] for x in righe_ass]) + "\n"
+    return out
+
+
+def scrivi_sottotitoli_mpv(r, base, lingua=None):
+    """Scrive accanto a 'base' (percorso senza estensione) i sottotitoli per mpv: restituisce i suffissi scritti."""
+    scritti = []
+    for suff, testo in sottotitoli_mpv(r, lingua).items():
+        if testo.strip():
+            with open(base + suff, "w", encoding="utf-8") as fh:
+                fh.write(testo)
+            scritti.append(suff)
+    return scritti
+
+
+def salva_risultato(r, media, lingua=None):
     """Salva accanto a 'media' gli stessi file di "Salva accanto all'audio":
-    _trascrizione.txt, _hiragana.txt, _traduzione.txt (se c'e') e _karaoke.json.
+    _trascrizione.txt, _hiragana.txt, _traduzione.txt (se c'e') e _karaoke.json, piu' i
+    sottotitoli per mpv (.srt e .ass, vedi sottotitoli_mpv).
     Se la trascrizione ha isolato la voce, conserva anche quella (<nome>_voce.wav),
     cosi' da non doverla separare di nuovo in seguito."""
     base = os.path.splitext(media)[0]
@@ -1411,6 +1636,7 @@ def salva_risultato(r, media):
             scritti.append(suff)
     scrivi_karaoke_json(r, media, base + "_karaoke.json")
     scritti.append("_karaoke.json")
+    scritti += scrivi_sottotitoli_mpv(r, base, lingua)
     if r.get("voce_file") and not r.get("voce_temporanea") \
             and os.path.isfile(r["voce_file"]) and os.path.abspath(r["voce_file"]) != base + "_voce.wav":
         try:
@@ -2263,6 +2489,127 @@ def _traduci_lmstudio(testi, lingua, url, modello, progresso=None, stato=None, c
     return risultati
 
 
+# ---------------------------------------------------------------------------
+# Traduzione "nel browser": si apre translate.google.com con un blocco di righe e lo script
+# Tampermonkey (google-translate-autocopy.user.js) copia la traduzione negli appunti. Una pagina
+# alla volta: la successiva si apre solo dopo aver ricevuto la traduzione della precedente, cosi'
+# l'ordine e' sempre corretto. Apertura del browser e lettura degli appunti devono avvenire nel
+# thread della GUI, mentre la traduzione gira in un thread di lavoro: PonteBrowser fa da ponte.
+# ---------------------------------------------------------------------------
+BROWSER_CALMA_MS = 500        # attesa dopo l'ultima modifica degli appunti prima di prendere il testo
+BROWSER_TIMEOUT_S = 90        # tempo massimo di attesa della traduzione di una pagina
+BROWSER_MAX_CAR = 4500        # limite di caratteri di Google Traduttore per pagina
+BROWSER_MAX_URL = 6500        # lunghezza massima dell'indirizzo dopo la codifica %XX
+_PONTE_BROWSER = None         # creato dalla finestra principale (thread GUI)
+
+
+class PonteBrowser(QObject):
+    """Vive nel thread GUI. traduci() si chiama da un thread di lavoro e blocca finche' la
+    traduzione non compare negli appunti (o finche' scade il tempo / l'utente interrompe)."""
+    _richiesta = pyqtSignal(int, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._evento = threading.Event()
+        self._risultato = ""
+        self._base = ""
+        self._id = 0                  # numero della richiesta in corso (le risposte vecchie si scartano)
+        self._attivo = False
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(BROWSER_CALMA_MS)
+        self._timer.timeout.connect(self._consegna)
+        self._richiesta.connect(self._apri)           # emesso da un altro thread: esecuzione accodata nel GUI
+        QApplication.clipboard().dataChanged.connect(self._cambiato)
+
+    def traduci(self, url):
+        self._id += 1
+        mio = self._id
+        self._evento.clear()
+        self._risultato = ""
+        self._richiesta.emit(mio, url)
+        t0 = time.time()
+        try:
+            while not self._evento.wait(0.2):
+                controlla_stop()
+                if time.time() - t0 > BROWSER_TIMEOUT_S:
+                    raise RuntimeError(
+                        "nessuna traduzione ricevuta dagli appunti entro {} s (lo script Tampermonkey e' "
+                        "attivo su translate.google.com?)".format(BROWSER_TIMEOUT_S))
+        finally:
+            self._id += 1                              # invalida eventuali eventi ancora in arrivo
+            self._attivo = False
+        return self._risultato
+
+    @pyqtSlot(int, str)
+    def _apri(self, num, url):
+        if num != self._id:
+            return
+        self._base = QApplication.clipboard().text()   # contenuto da ignorare: non e' la traduzione
+        self._attivo = True
+        QDesktopServices.openUrl(QUrl(url))
+
+    def _cambiato(self):
+        if self._attivo:
+            t = QApplication.clipboard().text()
+            if t.strip() and t != self._base:
+                self._timer.start()                    # riparte a ogni nuova copia
+
+    def _consegna(self):
+        t = QApplication.clipboard().text()
+        if self._attivo and t.strip() and t != self._base:
+            self._attivo = False
+            self._risultato = t
+            self._evento.set()
+
+
+def _traduci_browser(testi, lingua, progresso=None, stato=None):
+    """Traduce dal giapponese con Google Traduttore aperto nel browser. Le righe vanno in blocchi
+    numerati '[N] testo' (uno per pagina); i numeri permettono di rimettere ogni traduzione al
+    suo posto anche se Google unisce o separa le righe."""
+    if _PONTE_BROWSER is None:
+        raise RuntimeError("la traduzione nel browser funziona solo dalla finestra principale")
+    tl = {"zh": "zh-CN"}.get(lingua, lingua)           # codice cinese semplificato di Google
+    base = "https://translate.google.com/?sl=ja&tl={}&op=translate".format(tl)
+    risultati = ["" if not t else None for t in testi]
+    da_fare = [i for i, t in enumerate(testi) if t]
+
+    gruppi, cur, car, enc = [], [], 0, 0               # un gruppo = una pagina di Google Traduttore
+    for i in da_fare:
+        riga = "[{}] {}".format(len(cur) + 1, testi[i].replace("\n", " "))
+        if cur and (car + len(riga) + 1 > BROWSER_MAX_CAR or enc + len(quote(riga)) + 3 > BROWSER_MAX_URL):
+            gruppi.append(cur)
+            cur, car, enc = [], 0, 0
+            riga = "[1] " + testi[i].replace("\n", " ")
+        cur.append(i)
+        car += len(riga) + 1
+        enc += len(quote(riga)) + 3
+    if cur:
+        gruppi.append(cur)
+
+    fatte = 0
+    for gn, g in enumerate(gruppi, 1):
+        controlla_stop()
+        corpo = "\n".join("[{}] {}".format(k, testi[i].replace("\n", " ")) for k, i in enumerate(g, 1))
+        if stato:
+            stato("Google Traduttore (browser): pagina {}/{} ({} righe), in attesa della traduzione "
+                  "negli appunti...".format(gn, len(gruppi), len(g)))
+        ris = _PONTE_BROWSER.traduci(base + "&text=" + quote(corpo))
+        for a, b in (("\uff3b", "["), ("\uff3d", "]"), ("\u3010", "["), ("\u3011", "]")):
+            ris = ris.replace(a, b)                    # parentesi a larghezza piena -> normali
+        trovate = _leggi_numerate(ris, set(range(1, len(g) + 1)))
+        if not trovate:                                # Google ha tolto i numeri: provo per posizione
+            parti = [r.strip() for r in ris.splitlines() if r.strip()]
+            if len(parti) == len(g):
+                trovate = dict(enumerate(parti, 1))
+        for k, i in enumerate(g, 1):
+            risultati[i] = (trovate.get(k) or "").strip() or None
+        fatte += len(g)
+        if progresso:
+            progresso(fatte, len(da_fare))
+    return risultati
+
+
 def traduci_locale(testi, lingua, device="auto", progresso=None, stato=None, modello=None, lm=None,
                    prompt_template=""):
     """Traduzione locale dal giapponese. 'modello' e' una voce di MODELLI_TRAD
@@ -2272,7 +2619,10 @@ def traduci_locale(testi, lingua, device="auto", progresso=None, stato=None, mod
     Restituisce una lista lunga come 'testi' ("" per le righe vuote, None se senza risultato)."""
     nome, tipo, ident = modello or MODELLI_TRAD[0]
     _STAT_TRAD["modello"] = ident or nome
-    _STAT_TRAD["metodo"] = {"nllb": "NLLB", "ollama": "riga per riga (Ollama)"}.get(tipo, tipo)
+    _STAT_TRAD["metodo"] = {"nllb": "NLLB", "ollama": "riga per riga (Ollama)",
+                            "browser": "Google Traduttore (browser)"}.get(tipo, tipo)
+    if tipo == "browser":
+        return _traduci_browser(testi, lingua, progresso, stato)
     if tipo == "llamaserver":
         return _traduci_llamaserver(testi, lingua, lm or {}, progresso, stato, prompt_template)
     if tipo == "lmstudio":
@@ -3037,6 +3387,12 @@ class Worker(QThread):
 
                 segmenti.append((s0, s1, toks))
 
+            log_hira("whisper: trascrizione finita: %d segmenti grezzi, %d con testo (durata audio %s)"
+                     % (len(raw_segments), len(segmenti), getattr(info, "duration", "?")))
+            if not raw_segments:
+                log_hira("whisper: nessun segmento restituito (filtro VAD=%s, musica=%s, voce isolata=%s, lingua=%s): "
+                         "con musica cantata il VAD scambia spesso i testi per non-parlato"
+                         % (_opzioni(lingua_jp, False).get("vad_filter"), musica, bool(voce_isolata), lingua_jp))
             if n_ripetuti:
                 log_hira("whisper: %d segmenti con ripetizioni anomale corretti o scartati" % n_ripetuti)
                 avviso += " ({} segmenti con ripetizioni anomale corretti o scartati)".format(n_ripetuti)
@@ -3049,6 +3405,10 @@ class Worker(QThread):
                     b = max(b, a)
                     prev = a
                     nuovi.append((o, h, a, b))
+                nuovi, corretta = correggi_inizio_toks(nuovi)
+                if corretta:
+                    log_hira("riga %d: token iniziali fuori tempo riportati a %.2f s (erano a %.2f s)"
+                             % (n + 1, nuovi[0][2], toks[0][2]))
                 segmenti[n] = (s0, s1, nuovi)
 
             trad = None
@@ -3186,15 +3546,21 @@ class Worker(QThread):
             ))
 
         except FileNotFoundError:
+            log_hira("trascrizione: ffmpeg non trovato")
             self.errore.emit("ffmpeg non trovato: installalo e aggiungilo al PATH.")
 
         except subprocess.CalledProcessError as e:
+            log_hira("trascrizione: errore di un comando esterno: %s"
+                     % ((e.stderr or b"").decode(errors="replace") or str(e)))
             self.errore.emit((e.stderr or b"").decode(errors="replace") or str(e))
 
         except Interrotto:
+            log_hira("trascrizione: interrotta dall'utente")
             self.errore.emit("__interrotto__")
 
         except Exception as e:
+            import traceback
+            log_hira("trascrizione: errore: %r\n%s" % (e, traceback.format_exc()))
             msg = str(e)
 
             if "out of memory" in msg.lower():
@@ -3911,6 +4277,8 @@ class Finestra(QWidget):
         scr = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1180, scr.width() - 40), min(920, scr.height() - 90))
         self.setAcceptDrops(True)
+        global _PONTE_BROWSER
+        _PONTE_BROWSER = PonteBrowser(self)      # ponte thread di lavoro -> browser/appunti (traduzione "browser")
 
         self.worker = None
         self.decoder = None
@@ -3931,6 +4299,9 @@ class Finestra(QWidget):
         self._vecchi = []
         self.wav_tmp = None
         self.file_corrente = ""
+        self._sorgente_audio = None     # file che il player sta suonando (wav estratto oppure <nome>_voce.wav)
+        self._seek_pendente = None      # (posizione ms, riprendere?) da ripristinare dopo il cambio di sorgente
+        self._vuole_voce = False        # preferenza dell'utente: ascoltare solo la voce (salvata nella config)
         self.modo_video = False
         self.onda = None
         self._onda_ancora = None
@@ -4089,7 +4460,9 @@ class Finestra(QWidget):
             "Traduzione locale (nessun limite di richieste). NLLB: modelli generici, si scaricano da soli.\n"
             "TranslateGemma: modello specializzato nella traduzione, richiede Ollama installato e in\n"
             "esecuzione (https://ollama.com); se manca, il modello viene scaricato da Ollama al primo uso.\n"
-            "LM Studio: usa il server locale di LM Studio con il modello che hai caricato (indirizzo sotto).")
+            "LM Studio: usa il server locale di LM Studio con il modello che hai caricato (indirizzo sotto).\n"
+            "Google Traduttore (browser): apre una pagina alla volta di translate.google.com e legge la\n"
+            "traduzione dagli appunti; serve lo script Tampermonkey google-translate-autocopy.user.js.")
         rt.addWidget(self.lb_trad)
         rt.addWidget(self.cb_trad, 1)
         rt.addStretch(2)
@@ -4442,6 +4815,15 @@ class Finestra(QWidget):
         self.b_stop.setObjectName("tondo")
         self.b_stop.clicked.connect(self.ferma)
 
+        self.b_voce = QPushButton("🎤")
+        self.b_voce.setObjectName("tondo")
+        self.b_voce.setCheckable(True)
+        self.b_voce.setEnabled(False)
+        self.b_voce.setToolTip(
+            "Ascolta solo la voce (senza musica) al posto dell'audio originale.\n"
+            "Usa <nome>_voce.wav, creato dalla trascrizione con la separazione voce/musica attiva.")
+        self.b_voce.clicked.connect(self._click_solo_voce)
+
         self.lb_tempo = QLabel("00:00.0 / 00:00.0")
         self.lb_tempo.setObjectName("tempo")
 
@@ -4461,6 +4843,7 @@ class Finestra(QWidget):
 
         ctrl.addWidget(self.b_play)
         ctrl.addWidget(self.b_stop)
+        ctrl.addWidget(self.b_voce)
         ctrl.addWidget(self.lb_tempo)
         ctrl.addStretch(1)
 
@@ -4537,6 +4920,11 @@ class Finestra(QWidget):
             "'Applica' ogni riga torna al suo segmento, con i tempi esatti.")
         self.b_copia_num.clicked.connect(self.copia_numerata)
         h3.addWidget(lb3)
+        self.lb_car_o = QLabel("0 caratteri \u00b7 0 righe")           # contatore dei caratteri della trascrizione
+        self.lb_car_o.setStyleSheet("QLabel { color: #8a8f98; }")
+        self.lb_car_o.setToolTip("Caratteri della trascrizione (a capo esclusi)")
+        h3.addSpacing(10)
+        h3.addWidget(self.lb_car_o)
         h3.addStretch(1)
         h3.addWidget(self.b_copia_num)
         h3.addWidget(self.b_copia)
@@ -4547,6 +4935,7 @@ class Finestra(QWidget):
         self.out.setPlaceholderText("Il testo trascritto comparira' qui e puoi correggerlo a mano.")
         self.out.doppio_clic.connect(lambda pos: self.salta_a_testo(self.ev_o, pos))
         self.out.textChanged.connect(self._testo_o_modificato)
+        self.out.textChanged.connect(self._conta_caratteri)
         l3.addWidget(self.out, 1)
 
         split.addWidget(c3)
@@ -4600,6 +4989,11 @@ class Finestra(QWidget):
             "scelti sopra, e mette il risultato in questo riquadro agganciato ai tempi del giapponese.")
         self.b_traduci.clicked.connect(self.traduci_solo)
         h5.addWidget(lb5)
+        self.lb_car_t = QLabel("0 caratteri \u00b7 0 righe")           # contatore dei caratteri della traduzione
+        self.lb_car_t.setStyleSheet("QLabel { color: #8a8f98; }")
+        self.lb_car_t.setToolTip("Caratteri della traduzione (a capo esclusi)")
+        h5.addSpacing(10)
+        h5.addWidget(self.lb_car_t)
         h5.addStretch(1)
         h5.addWidget(self.b_traduci)
         h5.addWidget(self.b_applica_trad)
@@ -4610,6 +5004,7 @@ class Finestra(QWidget):
         self.out_trad.setPlaceholderText("Il testo nella lingua scelta comparira' qui (una riga per frase).")
         self.out_trad.doppio_clic.connect(lambda pos: self.salta_a_testo(self.ev_t, pos, self.t0_t))
         self.out_trad.textChanged.connect(self._testo_t_modificato)
+        self.out_trad.textChanged.connect(self._conta_caratteri_t)
         l5.addWidget(self.out_trad, 1)
 
         split.addWidget(self.c5)
@@ -4686,6 +5081,7 @@ class Finestra(QWidget):
             sottotitoli=self.cb_sub.currentIndex(),
             velocita=self.cb_vel.currentText(),
             volume=self.sl_vol.value(),
+            solo_voce=bool(self._vuole_voce),
             cartella=self.ultima_cartella,
             finestra=[self.width(), self.height()],
         )
@@ -4785,6 +5181,8 @@ class Finestra(QWidget):
         vol = d.get("volume")
         if isinstance(vol, int) and 0 <= vol <= 100:
             self.sl_vol.setValue(vol)
+        if isinstance(d.get("solo_voce"), bool):
+            self._vuole_voce = d["solo_voce"]
         if isinstance(d.get("cartella"), str) and os.path.isdir(d["cartella"]):
             self.ultima_cartella = d["cartella"]
         fin = d.get("finestra")
@@ -4860,6 +5258,9 @@ class Finestra(QWidget):
         self.player.stop()
         self.player.setMedia(QMediaContent())
         self._rimuovi_wav()
+        self._sorgente_audio = None
+        self._seek_pendente = None
+        self.b_voce.setEnabled(False)
         self.onda.pulisci()
         self._mostra_video(False, schermo=False)
 
@@ -4905,8 +5306,15 @@ class Finestra(QWidget):
         self.modo_video = bool(ha_video) and info is not None
         self._mostra_video(self.modo_video)
         # l'audio suona sempre dal wav estratto (affidabile con qualunque codec); il video lo disegna ffmpeg
-        self._log_player("apro l'audio (%s), video=%s" % (wav, self.modo_video))
-        self.player.setMedia(QMediaContent(QUrl.fromLocalFile(wav)))
+        sorgente, e_voce = self._sorgente_voluta()
+        self._log_player("apro l'audio (%s), video=%s" % (sorgente, self.modo_video))
+        self._sorgente_audio = sorgente
+        self._seek_pendente = None
+        self.b_voce.setEnabled(True)
+        self.b_voce.setChecked(e_voce)     # il pulsante mostra cosa si sta davvero ascoltando
+        if self._vuole_voce and not e_voce:
+            self.lb_stato.setText(self.lb_stato.text() + " - voce pulita non trovata, audio originale")
+        self.player.setMedia(QMediaContent(QUrl.fromLocalFile(sorgente)))
         self.player.setPlaybackRate(float(self.cb_vel.currentText().rstrip("x")))
         if self.modo_video:
             self._info_video = info
@@ -5225,6 +5633,61 @@ class Finestra(QWidget):
         self._log_player("errore del player (%s): %s" % (codice, self.player.errorString()))
         self.lb_stato.setText("Errore del player: " + self.player.errorString())
 
+    def _sorgente_voluta(self):
+        """(file da riprodurre, True se e' la voce pulita). Senza <nome>_voce.wav si ripiega sull'originale."""
+        if self._vuole_voce and self.file_corrente:
+            v = cerca_voce_pulita(self.file_corrente)
+            if v:
+                return v, True
+        return self.wav_tmp, False
+
+    def _click_solo_voce(self):
+        if self.wav_tmp is None:
+            self.b_voce.setChecked(False)
+            return
+        on = self.b_voce.isChecked()
+        if on and not cerca_voce_pulita(self.file_corrente):
+            self.b_voce.setChecked(False)
+            self.lb_stato.setText("Voce pulita non trovata (%s_voce.wav): trascrivi il file con la separazione "
+                                  "voce/musica attiva." % os.path.splitext(os.path.basename(self.file_corrente))[0])
+            return
+        self._vuole_voce = on
+        self._cambia_sorgente_audio()
+        self.lb_stato.setText("Ascolto: solo voce (senza musica)" if on else "Ascolto: audio originale")
+        self._salva_impostazioni()
+
+    def _cambia_sorgente_audio(self):
+        """Scambia l'audio (originale <-> solo voce) mantenendo posizione, velocita' e stato play/pausa."""
+        sorgente, _ = self._sorgente_voluta()
+        if not sorgente or sorgente == self._sorgente_audio:
+            return
+        pos = self.player.position()
+        riprende = self.player.state() == QMediaPlayer.PlayingState
+        self._sorgente_audio = sorgente
+        self._seek_pendente = (pos, riprende)
+        self.player.setMedia(QMediaContent(QUrl.fromLocalFile(sorgente)))
+        self.player.setPlaybackRate(float(self.cb_vel.currentText().rstrip("x")))
+
+    def _ripristina_posizione(self, st):
+        """Dopo il cambio di sorgente il nuovo media va riposizionato quando e' caricato."""
+        if self._seek_pendente is None:
+            return
+        if st in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
+            pos, riprende = self._seek_pendente
+            self._seek_pendente = None
+            self.player.setPosition(pos)
+            if riprende:
+                self.player.play()
+            self.aggiorna_pos(pos)
+        elif st == QMediaPlayer.InvalidMedia:       # file non leggibile: si torna all'originale
+            pos, riprende = self._seek_pendente
+            self._vuole_voce = False
+            self.b_voce.setChecked(False)
+            self._sorgente_audio = None
+            self.lb_stato.setText("Impossibile riprodurre la voce pulita: torno all'audio originale.")
+            self._cambia_sorgente_audio()
+            self._seek_pendente = (pos, riprende)
+
     def _stato_media(self, st):
         nomi = {QMediaPlayer.UnknownMediaStatus: "sconosciuto", QMediaPlayer.NoMedia: "nessun media",
                 QMediaPlayer.LoadingMedia: "caricamento", QMediaPlayer.LoadedMedia: "caricato",
@@ -5232,6 +5695,7 @@ class Finestra(QWidget):
                 QMediaPlayer.BufferedMedia: "bufferizzato", QMediaPlayer.EndOfMedia: "fine",
                 QMediaPlayer.InvalidMedia: "NON VALIDO per il backend"}
         self._log_player("stato media: " + nomi.get(st, str(st)))
+        self._ripristina_posizione(st)
 
     # ---------------------------------------------------------------- video (fotogrammi da ffmpeg)
     def _ferma_frame(self):
@@ -5327,6 +5791,8 @@ class Finestra(QWidget):
         self.aggiorna_pos(self.player.position())
 
     def aggiorna_pos(self, ms):
+        if self._seek_pendente is not None:
+            ms = self._seek_pendente[0]
         t = ms / 1000.0
         self.forma.imposta_pos(t)
         if not self.sl_pos.trascina:
@@ -5578,7 +6044,7 @@ class Finestra(QWidget):
         elif self._batch_due_fasi and r.get("da_tradurre"):
             # fase 1: salvo subito la trascrizione (senza traduzione) e metto il file in coda per la fase 2
             try:
-                salva_risultato(r, path)
+                salva_risultato(r, path, (self._batch_params or {}).get("lingua"))
                 self._batch_etichetta(it, "✎")
                 self._batch_lavori.append(dict(i=self._batch_i, path=path, r=r, fatto=False))
             except OSError as e:
@@ -5586,7 +6052,7 @@ class Finestra(QWidget):
                 self._batch_esiti["err"].append((path, "salvataggio non riuscito: {}".format(e)))
         else:
             try:
-                salva_risultato(r, path)
+                salva_risultato(r, path, (self._batch_params or {}).get("lingua"))
                 if "traduzione" in r.get("avviso", ""):
                     self._batch_etichetta(it, "⚠")
                     self._batch_esiti["avvisi"].append((path, r["avviso"].strip()))
@@ -5676,7 +6142,7 @@ class Finestra(QWidget):
         r["trad"] = allinea_traduzione(r["t0"], r["t1"], trad, (r.get("tok") or {}).get("seg"))
         r["avviso"] = (r.get("avviso", "") + avviso)
         try:
-            salva_risultato(r, lav["path"])
+            salva_risultato(r, lav["path"], (self._batch_params or {}).get("lingua"))
             if trad is None or "traduzione" in avviso:
                 self._batch_etichetta(it, "⚠")
                 self._batch_esiti["avvisi"].append((lav["path"], (avviso.strip() or "traduzione non riuscita")))
@@ -5956,6 +6422,17 @@ class Finestra(QWidget):
         self.ultimo_ris = r
         self._imposta_testi(r["orig"], r["hira"], r["span_o"], r["span_h"], r["t0"], r["t1"], r.get("tok"), r.get("trad"))
 
+        if not (r.get("orig") or "").strip():
+            log_hira("trascrizione: risultato vuoto (nessun testo riconosciuto)")
+            self.lb_stato.setText("Nessun testo riconosciuto.")
+            QMessageBox.information(
+                self, "Nessun testo riconosciuto",
+                "Whisper non ha trovato parlato in questo file.\n\n"
+                "Se contiene musica cantata prova ad attivare 'Musica di sottofondo' oppure "
+                "'Isola prima la voce dalla musica': il filtro VAD, altrimenti, scambia i testi cantati per "
+                "non-parlato e li scarta. Controlla anche che la lingua scelta sia quella giusta.")
+            return
+
         # se la trascrizione ha usato una voce isolata (temporanea, che sta per essere cancellata),
         # la teniamo in cache accanto all'audio: "Salva voce e musica" e le trascrizioni successive
         # la riutilizzano senza separare di nuovo. La musica (<nome>_musica.wav) l'ha gia' salvata
@@ -5986,8 +6463,26 @@ class Finestra(QWidget):
         if msg == "__interrotto__":
             self.lb_stato.setText("Trascrizione interrotta.")
             return
+        log_hira("trascrizione: errore mostrato all'utente: %s" % msg)
         self.lb_stato.setText("Errore.")
         QMessageBox.critical(self, "Errore", msg)
+
+    @staticmethod
+    def _aggiorna_contatore(etichetta, casella, nome):
+        t = casella.toPlainText()
+        n = len(t.replace("\n", ""))
+        righe = sum(1 for r in t.splitlines() if r.strip())
+        etichetta.setText("{} caratteri \u00b7 {} righe".format("{:,}".format(n).replace(",", "."), righe))
+        etichetta.setToolTip("Caratteri della {}: {} (a capo esclusi)\n"
+                             "Con gli a capo: {}\nRighe: {}".format(nome, n, len(t), righe))
+
+    def _conta_caratteri(self):
+        """Contatore sotto il titolo TRASCRIZIONE (anche quando il testo si modifica a mano)."""
+        self._aggiorna_contatore(self.lb_car_o, self.out, "trascrizione")
+
+    def _conta_caratteri_t(self):
+        """Contatore sotto il titolo TRADUZIONE (anche quando il testo si modifica a mano)."""
+        self._aggiorna_contatore(self.lb_car_t, self.out_trad, "traduzione")
 
     def _testo_o_modificato(self):
         if not self._prog and self.ev_o.attivo:
@@ -6024,6 +6519,10 @@ class Finestra(QWidget):
     # ------------------------------------------------------- karaoke (.json)
     def _scrivi_json(self, percorso):
         scrivi_karaoke_json(self.ultimo_ris, self.ed_file.text().strip(), percorso)
+
+    def _scrivi_sottotitoli(self, base):
+        """Sottotitoli per mpv (.srt/.ass) accanto a 'base'; restituisce i suffissi scritti."""
+        return scrivi_sottotitoli_mpv(self.ultimo_ris, base, LINGUE[self.cb_lingua.currentIndex()][1])
 
     @staticmethod
     def _valida_karaoke(d):
@@ -6317,6 +6816,8 @@ class Finestra(QWidget):
                 try:
                     self._scrivi_json(pj)
                     msg += " + " + os.path.basename(pj)
+                    base_f = os.path.splitext(f)[0]
+                    msg += "".join(" + " + os.path.basename(base_f + s) for s in self._scrivi_sottotitoli(base_f))
                 except OSError as e:
                     QMessageBox.critical(self, "Errore di salvataggio", str(e))
             self.lb_stato.setText(msg)
@@ -6350,6 +6851,8 @@ class Finestra(QWidget):
 
         base = os.path.splitext(audio)[0]
         nomi = [s for s, _ in testi] + (["_karaoke.json"] if con_json else [])
+        if con_json:
+            nomi += list(sottotitoli_mpv(self.ultimo_ris, LINGUE[self.cb_lingua.currentIndex()][1]))
         esistenti = [os.path.basename(base + s) for s in nomi if os.path.exists(base + s)]
 
         if esistenti:
@@ -6366,6 +6869,7 @@ class Finestra(QWidget):
                     fh.write(t)
             if con_json:
                 self._scrivi_json(base + "_karaoke.json")
+                self._scrivi_sottotitoli(base)
         except OSError as e:
             QMessageBox.critical(self, "Errore di salvataggio", str(e))
             return
