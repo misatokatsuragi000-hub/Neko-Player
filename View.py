@@ -133,23 +133,24 @@ def get_script_shebang(script_path):
 
 
 def find_system_python():
-    """Fallback: cerca un interprete Python DI SISTEMA (non venv).
+    """Fallback: usa il Python DI SISTEMA (non venv).
 
-    Usato solo quando lo script non dichiara un proprio shebang. sys.executable
-    punterebbe al venv di View.py (es. ~/venvs/generale/bin/python) che potrebbe
-    non avere i moduli richiesti (es. gi/PyGObject).
+    L'eseguibile di sistema è /usr/bin/python; se assente si ripiega su
+    /usr/bin/python3 e infine sugli eseguibili "python"/"python3" trovati nel
+    PATH, escludendo però i venv (sys.executable di View.py potrebbe puntare a
+    un ambiente virtuale privo dei moduli richiesti, es. gi/PyGObject).
     """
-    candidates = []
+    preferred = ['/usr/bin/python', '/usr/bin/python3']
+    for py in preferred:
+        if os.path.isfile(py) and os.access(py, os.X_OK):
+            return py
+
     for name in ('python3', 'python'):
         p = shutil.which(name)
         if p:
-            candidates.append(p)
-    candidates += ['/usr/bin/python3', '/usr/bin/python', '/usr/local/bin/python3']
-
-    for py in candidates:
-        rp = os.path.realpath(py)
-        if os.path.isfile(rp) and 'venv' not in rp.lower() and '.virtualenv' not in rp.lower():
-            return py
+            rp = os.path.realpath(p)
+            if 'venv' not in rp.lower() and '.virtualenv' not in rp.lower():
+                return p
     return sys.executable
 
 
@@ -2384,6 +2385,14 @@ class FastGalleryViewer(QMainWindow):
 
             menu_open_with = menu.addMenu("🚀 Apri con")
             self.populate_open_with_submenu(menu_open_with, target_item.path)
+
+            # MODIFICA: "Imposta come Sfondo Animato" diretto nel menu contestuale principale
+            local_wallpaper = self.find_local_wallpaper_script()
+            if local_wallpaper and not target_item.is_dir and self.is_wallpaper_target(target_item.path):
+                action_wp_direct = menu.addAction("🎬 Imposta come Sfondo Animato")
+                action_wp_direct.triggered.connect(
+                    lambda ch=False, w=local_wallpaper, p=target_item.path: self.launch_app(w, p))
+
             menu.addSeparator()
 
             action_copy = menu.addAction("📋 Copia")
@@ -2780,18 +2789,30 @@ class FastGalleryViewer(QMainWindow):
             curr_path = self.single_model.files[self.current_single_idx].path
         self.populate_open_with_submenu(self.menu_open_with, curr_path)
 
+    def find_local_wallpaper_script(self):
+        """Restituisce il percorso di wallpaper.py se presente accanto a View.py o nella cartella Apps."""
+        candidates = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "wallpaper.py"),
+            os.path.expanduser("~/Apps/wallpaper.py"),
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+        return None
+
+    def is_wallpaper_target(self, file_path):
+        ext = os.path.splitext(file_path)[1].lower()
+        return ext in KNOWN_VIDEO_EXTENSIONS or ext == '.gif'
+
     def populate_open_with_submenu(self, menu, target_file_path):
         menu.clear()
 
         # MODIFICA: Integrazione diretta con wallpaper.py
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        local_wallpaper = os.path.join(script_dir, "wallpaper.py")
-        if os.path.exists(local_wallpaper) and target_file_path:
-            ext = os.path.splitext(target_file_path)[1].lower()
-            if ext in KNOWN_VIDEO_EXTENSIONS or ext == '.gif':
-                action_wp = menu.addAction("🎬 Imposta come Sfondo Animato")
-                action_wp.triggered.connect(lambda ch=False, p=target_file_path: self.launch_app(local_wallpaper, p))
-                menu.addSeparator()
+        local_wallpaper = self.find_local_wallpaper_script()
+        if local_wallpaper and target_file_path and self.is_wallpaper_target(target_file_path):
+            action_wp = menu.addAction("🎬 Imposta come Sfondo Animato")
+            action_wp.triggered.connect(lambda ch=False, p=target_file_path: self.launch_app(local_wallpaper, p))
+            menu.addSeparator()
 
         saved_apps = self.settings.value("custom_apps_dict", {})
         if not isinstance(saved_apps, dict):
