@@ -105,6 +105,55 @@ def parse_input_target():
             return cleaned
     return None
 
+def get_script_shebang(script_path):
+    """Legge la riga shebang (#!) di uno script Python in modo robusto.
+
+    Restituisce il path dell'interprete dichiarato nello script (es.
+    '#!/usr/bin/env python3' -> '/usr/bin/python3'), oppure None se lo script
+    non ha uno shebang eseguibile / valido.
+    """
+    try:
+        with open(script_path, 'r', encoding='utf-8', errors='ignore') as f:
+            first_line = f.readline().strip()
+    except Exception:
+        return None
+    if not first_line.startswith('#!'):
+        return None
+    interp = first_line[2:].strip()
+    if not interp:
+        return None
+    parts = interp.split()
+    if parts and os.path.basename(parts[0]) == 'env' and len(parts) > 1:
+        parts = parts[1:]  # gestisce '#!/usr/bin/env python3'
+    exe = parts[0]
+    resolved = shutil.which(exe) if not os.path.isabs(exe) else exe
+    if resolved and os.path.isfile(resolved) and os.access(resolved, os.X_OK):
+        return resolved
+    return None
+
+
+def find_system_python():
+    """Fallback: usa il Python DI SISTEMA (non venv).
+
+    L'eseguibile di sistema è /usr/bin/python; se assente si ripiega su
+    /usr/bin/python3 e infine sugli eseguibili "python"/"python3" trovati nel
+    PATH, escludendo però i venv (sys.executable di View.py potrebbe puntare a
+    un ambiente virtuale privo dei moduli richiesti, es. gi/PyGObject).
+    """
+    preferred = ['/usr/bin/python', '/usr/bin/python3']
+    for py in preferred:
+        if os.path.isfile(py) and os.access(py, os.X_OK):
+            return py
+
+    for name in ('python3', 'python'):
+        p = shutil.which(name)
+        if p:
+            rp = os.path.realpath(p)
+            if 'venv' not in rp.lower() and '.virtualenv' not in rp.lower():
+                return p
+    return sys.executable
+
+
 def build_launch_command(app_cmd, file_path):
     abs_path = os.path.abspath(file_path)
 
@@ -113,21 +162,36 @@ def build_launch_command(app_cmd, file_path):
         cmd_str = re.sub(r'@@.*?@@', f'@@ {shlex.quote(abs_path)} @@', cmd_str)
         cmd_str = re.sub(r'%[a-zA-Z]', '', cmd_str)
         parts = [p for p in shlex.split(cmd_str) if p.strip()]
-        return parts
-
-    if re.search(r'["\']?%[uUfF]["\']?', app_cmd):
+    elif re.search(r'["\']?%[uUfF]["\']?', app_cmd):
         cmd_str = re.sub(r'["\']?%[uUfF]["\']?', shlex.quote(abs_path), app_cmd)
         cmd_str = re.sub(r'%[a-zA-Z]', '', cmd_str)
         parts = [p for p in shlex.split(cmd_str) if p.strip()]
-        return parts
-
-    cmd_str = re.sub(r'["\']?%[a-zA-Z]["\']?', '', app_cmd)
-    parts = [p for p in shlex.split(cmd_str) if p.strip()]
-
-    if len(parts) >= 2 and parts[0].endswith('flatpak') and parts[1] == 'run':
-        parts.extend(['@@', abs_path, '@@'])
     else:
-        parts.append(abs_path)
+        # Percorso puro (es. /path/wallpaper.py selezionato dal file dialog): non deve
+        # essere spezzato da shlex, altrimenti i percorsi con spazi vengono troncati
+        # ("sh: cannot execute .../wallpaper.py") e lo script non parte.
+        if os.path.isfile(app_cmd):
+            parts = [os.path.abspath(app_cmd), abs_path]
+        else:
+            cmd_str = re.sub(r'["\']?%[a-zA-Z]["\']?', '', app_cmd)
+            try:
+                parts = [p for p in shlex.split(cmd_str) if p.strip()]
+            except ValueError:
+                parts = cmd_str.split()
+
+            if len(parts) >= 2 and parts[0].endswith('flatpak') and parts[1] == 'run':
+                parts.extend(['@@', abs_path, '@@'])
+            else:
+                parts.append(abs_path)
+
+    # MODIFICA: Se si lancia uno script Python (.py):
+    # 1) rispetta lo shebang (#!/usr/bin/env python3 o #!/percorso/python) scritto
+    #    in cima allo script, così ogni script può dichiarare il SUO interprete;
+    # 2) se non c'è alcuno shebang, usa il python di sistema (non sys.executable,
+    #    che potrebbe essere un venv senza PyGObject/gi).
+    if parts and parts[0].endswith('.py'):
+        interp = get_script_shebang(parts[0]) or find_system_python()
+        parts.insert(0, interp)
 
     return parts
 
@@ -2321,6 +2385,11 @@ class FastGalleryViewer(QMainWindow):
 
             menu_open_with = menu.addMenu("🚀 Apri con")
             self.populate_open_with_submenu(menu_open_with, target_item.path)
+
+            # MODIFICA: "Imposta come Sfondo Animato" diretto nel menu contestuale principale
+            if not target_item.is_dir:
+                self.add_wallpaper_action(menu, target_item.path)
+
             menu.addSeparator()
 
             action_copy = menu.addAction("📋 Copia")
@@ -2640,6 +2709,14 @@ class FastGalleryViewer(QMainWindow):
         self.btn_open_with.setMenu(self.menu_open_with)
         single_toolbar.addWidget(self.btn_open_with)
 
+        # MODIFICA: pulsante dedicato "Imposta come Sfondo Animato" (visibile solo per video/GIF)
+        self.btn_wallpaper = QPushButton("🎬 Sfondo Animato")
+        self.btn_wallpaper.setStyleSheet("font-weight: bold; padding: 6px 12px;")
+        self.btn_wallpaper.clicked.connect(
+            lambda: self.launch_app(self.find_local_wallpaper_script(), self.get_active_single_path()))
+        self.btn_wallpaper.setVisible(False)
+        single_toolbar.addWidget(self.btn_wallpaper)
+
         self.lbl_single_info = QLabel("")
         self.lbl_single_info.setStyleSheet("color: #aaa; margin-left: 15px; font-weight: bold;")
         single_toolbar.addWidget(self.lbl_single_info)
@@ -2717,8 +2794,57 @@ class FastGalleryViewer(QMainWindow):
             curr_path = self.single_model.files[self.current_single_idx].path
         self.populate_open_with_submenu(self.menu_open_with, curr_path)
 
+    def find_local_wallpaper_script(self):
+        """Restituisce il percorso di wallpaper.py se presente accanto a View.py o in alcune cartelle note."""
+        candidates = []
+        try:
+            candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "wallpaper.py"))
+        except Exception:
+            pass
+        # Cartelle tipiche di installazione (es. dischi secondari /mnt/...)
+        candidates += [
+            os.path.expanduser("~/Apps/wallpaper.py"),
+            "/mnt/1CE16DBE48849731/Apps/wallpaper.py",
+        ]
+        # Cerca anche nelle directory presenti nel PATH (come farebbe una shell)
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            if d:
+                candidates.append(os.path.join(d, "wallpaper.py"))
+        for c in candidates:
+            try:
+                if c and os.path.isfile(c):
+                    return c
+            except OSError:
+                continue
+        return None
+
+    def is_wallpaper_target(self, file_path):
+        ext = os.path.splitext(file_path)[1].lower()
+        return ext in KNOWN_VIDEO_EXTENSIONS or ext == '.gif'
+
+    def get_active_single_path(self):
+        """Percorso del file attualmente visualizzato nella vista singola (o None)."""
+        if 0 <= self.current_single_idx < len(self.single_model.files):
+            return self.single_model.files[self.current_single_idx].path
+        return None
+
+    def add_wallpaper_action(self, menu, target_file_path):
+        """Aggiunge la voce '🎬 Imposta come Sfondo Animato' al menu se applicabile.
+        Ritorna True se l'azione è stata aggiunta."""
+        local_wallpaper = self.find_local_wallpaper_script()
+        if local_wallpaper and target_file_path and self.is_wallpaper_target(target_file_path):
+            action_wp = menu.addAction("🎬 Imposta come Sfondo Animato")
+            action_wp.triggered.connect(
+                lambda ch=False, w=local_wallpaper, p=target_file_path: self.launch_app(w, p))
+            return True
+        return False
+
     def populate_open_with_submenu(self, menu, target_file_path):
         menu.clear()
+
+        # MODIFICA: Integrazione diretta con wallpaper.py
+        if self.add_wallpaper_action(menu, target_file_path):
+            menu.addSeparator()
 
         saved_apps = self.settings.value("custom_apps_dict", {})
         if not isinstance(saved_apps, dict):
@@ -2738,12 +2864,24 @@ class FastGalleryViewer(QMainWindow):
 
         menu.addSeparator()
 
+        # Selezione al volo di qualsiasi script Python (.py)
+        action_py = menu.addAction("🐍 Esegui Script Python al volo...")
+        action_py.triggered.connect(lambda ch=False, p=target_file_path: self.launch_python_script_direct(p))
+
         action_add = menu.addAction("➕ Configura / Aggiungi nuova app...")
         action_add.triggered.connect(lambda ch=False, p=target_file_path: self.configure_new_app(p))
 
         if saved_apps:
             action_clear = menu.addAction("🗑 Cancella lista app salvate")
             action_clear.triggered.connect(self.clear_configured_apps)
+
+    def launch_python_script_direct(self, target_file_path=None):
+        fpath, _ = QFileDialog.getOpenFileName(
+            self, "Seleziona Script Python",
+            os.path.expanduser("~"), "Script Python (*.py);;Tutti i file (*)"
+        )
+        if fpath:
+            self.launch_app(fpath, target_file_path)
 
     def open_in_file_manager(self, file_path, app_cmd=""):
         abs_path = os.path.abspath(file_path)
@@ -2790,8 +2928,38 @@ class FastGalleryViewer(QMainWindow):
         cmd = build_launch_command(app_cmd, abs_file_path)
 
         try:
-            subprocess.Popen(cmd)
-            self.lbl_stats.setText(f"Avviato con: {os.path.basename(cmd[0])}")
+            # start_new_session=True rende lo sfondo indipendente dal ciclo di vita di View.py
+            work_dir = os.path.dirname(abs_file_path)
+            proc = subprocess.Popen(cmd, cwd=work_dir, start_new_session=True,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+            # Se il processo muore entro ~1.5s (es. errore di sintassi nel parser di
+            # wallpaper.py, modulo mancante, xprop/mpv non installati), mostra l'errore
+            # invece di far credere che lo sfondo animato sia partito.
+            def _check_early_exit(p=proc, c=cmd):
+                try:
+                    code = p.poll()
+                    if code is not None and code != 0:
+                        err = ""
+                        try:
+                            err = p.stderr.read().decode(errors="replace").strip()[-600:]
+                        except Exception:
+                            pass
+                        QMessageBox.warning(
+                            self, "Errore Avvio",
+                            f"Il processo è terminato subito (codice {code}):\n"
+                            f"{' '.join(c)}\n\n{err}"
+                        )
+                except Exception:
+                    pass
+            QTimer.singleShot(1500, _check_early_exit)
+
+            # L'elemento [0] è un interprete Python se è python* oppure se è uno script .py
+            # lanciato con shebang personalizzato (es. '#!/x/venv/bin/python3.11').
+            is_interpreter = (os.path.basename(cmd[0]).startswith('python')
+                              or cmd[0].endswith('.py'))
+            prog = os.path.basename(cmd[1]) if len(cmd) > 1 and is_interpreter else os.path.basename(cmd[0])
+            self.lbl_stats.setText(f"Avviato con: {prog}")
         except Exception as e:
             QMessageBox.warning(self, "Errore Avvio", f"Errore nell'avvio dell'applicazione:\n{e}")
 
@@ -2894,6 +3062,11 @@ class FastGalleryViewer(QMainWindow):
         self.lbl_single_info.setText(
             f"[{tipo}] {item.name}  —  [{idx + 1} / {len(self.single_model.files)}]  —  {format_size(item.size)}"
         )
+
+        # Mostra il pulsante "Sfondo Animato" solo per video/GIF se wallpaper.py è disponibile
+        if hasattr(self, 'btn_wallpaper'):
+            self.btn_wallpaper.setVisible(bool(self.find_local_wallpaper_script())
+                                          and self.is_wallpaper_target(item.path))
 
         if item.is_video:
             self.btn_orig_size.hide()
