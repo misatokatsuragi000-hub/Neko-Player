@@ -2387,11 +2387,8 @@ class FastGalleryViewer(QMainWindow):
             self.populate_open_with_submenu(menu_open_with, target_item.path)
 
             # MODIFICA: "Imposta come Sfondo Animato" diretto nel menu contestuale principale
-            local_wallpaper = self.find_local_wallpaper_script()
-            if local_wallpaper and not target_item.is_dir and self.is_wallpaper_target(target_item.path):
-                action_wp_direct = menu.addAction("🎬 Imposta come Sfondo Animato")
-                action_wp_direct.triggered.connect(
-                    lambda ch=False, w=local_wallpaper, p=target_item.path: self.launch_app(w, p))
+            if not target_item.is_dir:
+                self.add_wallpaper_action(menu, target_item.path)
 
             menu.addSeparator()
 
@@ -2712,6 +2709,14 @@ class FastGalleryViewer(QMainWindow):
         self.btn_open_with.setMenu(self.menu_open_with)
         single_toolbar.addWidget(self.btn_open_with)
 
+        # MODIFICA: pulsante dedicato "Imposta come Sfondo Animato" (visibile solo per video/GIF)
+        self.btn_wallpaper = QPushButton("🎬 Sfondo Animato")
+        self.btn_wallpaper.setStyleSheet("font-weight: bold; padding: 6px 12px;")
+        self.btn_wallpaper.clicked.connect(
+            lambda: self.launch_app(self.find_local_wallpaper_script(), self.get_active_single_path()))
+        self.btn_wallpaper.setVisible(False)
+        single_toolbar.addWidget(self.btn_wallpaper)
+
         self.lbl_single_info = QLabel("")
         self.lbl_single_info.setStyleSheet("color: #aaa; margin-left: 15px; font-weight: bold;")
         single_toolbar.addWidget(self.lbl_single_info)
@@ -2790,28 +2795,55 @@ class FastGalleryViewer(QMainWindow):
         self.populate_open_with_submenu(self.menu_open_with, curr_path)
 
     def find_local_wallpaper_script(self):
-        """Restituisce il percorso di wallpaper.py se presente accanto a View.py o nella cartella Apps."""
-        candidates = [
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "wallpaper.py"),
+        """Restituisce il percorso di wallpaper.py se presente accanto a View.py o in alcune cartelle note."""
+        candidates = []
+        try:
+            candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "wallpaper.py"))
+        except Exception:
+            pass
+        # Cartelle tipiche di installazione (es. dischi secondari /mnt/...)
+        candidates += [
             os.path.expanduser("~/Apps/wallpaper.py"),
+            "/mnt/1CE16DBE48849731/Apps/wallpaper.py",
         ]
+        # Cerca anche nelle directory presenti nel PATH (come farebbe una shell)
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            if d:
+                candidates.append(os.path.join(d, "wallpaper.py"))
         for c in candidates:
-            if os.path.exists(c):
-                return c
+            try:
+                if c and os.path.isfile(c):
+                    return c
+            except OSError:
+                continue
         return None
 
     def is_wallpaper_target(self, file_path):
         ext = os.path.splitext(file_path)[1].lower()
         return ext in KNOWN_VIDEO_EXTENSIONS or ext == '.gif'
 
+    def get_active_single_path(self):
+        """Percorso del file attualmente visualizzato nella vista singola (o None)."""
+        if 0 <= self.current_single_idx < len(self.single_model.files):
+            return self.single_model.files[self.current_single_idx].path
+        return None
+
+    def add_wallpaper_action(self, menu, target_file_path):
+        """Aggiunge la voce '🎬 Imposta come Sfondo Animato' al menu se applicabile.
+        Ritorna True se l'azione è stata aggiunta."""
+        local_wallpaper = self.find_local_wallpaper_script()
+        if local_wallpaper and target_file_path and self.is_wallpaper_target(target_file_path):
+            action_wp = menu.addAction("🎬 Imposta come Sfondo Animato")
+            action_wp.triggered.connect(
+                lambda ch=False, w=local_wallpaper, p=target_file_path: self.launch_app(w, p))
+            return True
+        return False
+
     def populate_open_with_submenu(self, menu, target_file_path):
         menu.clear()
 
         # MODIFICA: Integrazione diretta con wallpaper.py
-        local_wallpaper = self.find_local_wallpaper_script()
-        if local_wallpaper and target_file_path and self.is_wallpaper_target(target_file_path):
-            action_wp = menu.addAction("🎬 Imposta come Sfondo Animato")
-            action_wp.triggered.connect(lambda ch=False, p=target_file_path: self.launch_app(local_wallpaper, p))
+        if self.add_wallpaper_action(menu, target_file_path):
             menu.addSeparator()
 
         saved_apps = self.settings.value("custom_apps_dict", {})
@@ -3030,6 +3062,11 @@ class FastGalleryViewer(QMainWindow):
         self.lbl_single_info.setText(
             f"[{tipo}] {item.name}  —  [{idx + 1} / {len(self.single_model.files)}]  —  {format_size(item.size)}"
         )
+
+        # Mostra il pulsante "Sfondo Animato" solo per video/GIF se wallpaper.py è disponibile
+        if hasattr(self, 'btn_wallpaper'):
+            self.btn_wallpaper.setVisible(bool(self.find_local_wallpaper_script())
+                                          and self.is_wallpaper_target(item.path))
 
         if item.is_video:
             self.btn_orig_size.hide()
