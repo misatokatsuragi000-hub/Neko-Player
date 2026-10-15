@@ -2211,6 +2211,10 @@ class VideoProcessorThread(QThread):
         self._seek_gen = 0
         self._shown_pos = 0
         self.display_size = None
+        self.src_size = None           # (larghezza, altezza) del video originale aperto, per l'HUD
+        self.native_size = False       # True: modalita' "Dimensioni reali": i frame escono alla dimensione del modello, senza riduzione all'altezza della finestra
+        self._refit_dirty = False      # richiesta (dalla GUI) di rifare il frame corrente con la dimensione di uscita nuova
+        self._last_full = None         # (frame prima dell'eventuale riduzione, w, h): serve a rifare il frame in pausa
 
         # Shader GLSL di post-processing (applicati ai frame dopo la pipeline AI, nello stesso thread)
         self.shader_paths = ()
@@ -2347,6 +2351,10 @@ class VideoProcessorThread(QThread):
         self.shader_force_when = bool(on)
         self._shader_dirty = True
 
+    def request_refit(self):
+        """Chiede di ridisegnare (se in pausa) il frame corrente alla dimensione di uscita attuale (vedi native_size)."""
+        self._refit_dirty = True
+
     def set_shaders(self, paths):
         """Imposta la catena di shader (percorsi, nell'ordine di applicazione). La compilazione avviene nel thread video."""
         self.shader_paths = tuple(paths)
@@ -2393,11 +2401,14 @@ class VideoProcessorThread(QThread):
         duration_sec = total_frames / video_fps
         vid_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         vid_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.src_size = (vid_w, vid_h)
         self.running = True
         self._shown_pos = 0
         self._rife_prev = None
         self._last_raw = None
+        self._last_full = None
         self._shader_dirty = False
+        self._refit_dirty = False
         self._warmup(vid_w, vid_h)
         if AUDIO_SYNC:
             t_wait = time.perf_counter()
@@ -2417,9 +2428,10 @@ class VideoProcessorThread(QThread):
         sync_disabled = False
         ended = False
         while self.running:
-            if self._shader_dirty:
+            if self._shader_dirty or self._refit_dirty:
+                refit, self._refit_dirty = self._refit_dirty, False
                 self._shader_dirty = False
-                if self.paused: self._reemit_shaded()   # in pausa il frame non cambia: lo si ridisegna con i nuovi shader
+                if self.paused: self._reemit_shaded(refit)   # in pausa il frame non cambia: lo si ridisegna con i nuovi shader / dimensione
             head = self._peek(frames_q)
             if head is None:
                 if not decoder.is_alive():
@@ -2614,6 +2626,7 @@ class VideoProcessorThread(QThread):
             display_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             full_h, full_w = display_frame.shape[:2]
         h, w = display_frame.shape[:2]
+        self._last_full = (display_frame, full_w, full_h)
         size = self._reduced_size(w, h)
         if size: display_frame = cv2.resize(display_frame, size, interpolation=cv2.INTER_AREA)
         self._last_raw = (display_frame, full_w, full_h)
@@ -2660,8 +2673,8 @@ class VideoProcessorThread(QThread):
                     print(f"[Shader] {os.path.basename(p)}: {msg}")
                     self.shader_failed.emit([p], msg)
             if not chain.passes: return frame
-            return chain.run(frame, self._shown_pos / max(self.video_fps, 1.0), self._shown_pos, self.display_size,
-                             self.shader_force_when)
+            return chain.run(frame, self._shown_pos / max(self.video_fps, 1.0), self._shown_pos,
+                             None if self.native_size else self.display_size, self.shader_force_when)
         except Exception as e:
             print(f"[Shader] Errore: {e}")
             failed = list(paths)
@@ -2673,7 +2686,13 @@ class VideoProcessorThread(QThread):
             self.shader_failed.emit(failed, str(e))
             return frame
 
-    def _reemit_shaded(self):
+    def _reemit_shaded(self, refit=False):
+        if refit and self._last_full is not None:
+            # la dimensione di uscita e' cambiata: si riparte dal frame intero (non ridotto) e lo si riduce di nuovo, se serve
+            base, fw, fh = self._last_full
+            size = self._reduced_size(base.shape[1], base.shape[0])
+            if size: base = cv2.resize(base, size, interpolation=cv2.INTER_AREA)
+            self._last_raw = (base, fw, fh)
         raw = self._last_raw
         if raw is None: return
         frame, full_w, full_h = raw
@@ -2689,6 +2708,7 @@ class VideoProcessorThread(QThread):
             except Exception: pass
 
     def _reduced_size(self, w, h):
+        if self.native_size: return None   # "Dimensioni reali": nessuna riduzione, il frame resta come l'ha prodotto il modello
         ds = self.display_size
         if not ds: return None
         dw, dh = ds
@@ -4808,6 +4828,10 @@ class NekoPlayer(QMainWindow):
     _min = False
     _media_loaded = False   # c'e' un video/audio caricato (il pulsante play e' 'attivo')
     _wandering = False      # la testa sta girando per lo schermo (play senza video)
+    REAL_MIN_PCT = 10        # "Dimensioni reali": scala minima (%)
+    REAL_STEP_PCT = 10       # passo di - e + (%)
+    REAL_MOVE_PX = 40        # passo di spostamento coi tasti 2468 del tastierino (pixel)
+    REAL_KEEP_PX = 60        # pixel di video che restano sempre visibili quando lo si sposta
     def __init__(self, initial_video=None):
         super().__init__()
         flags = Qt.Window | Qt.FramelessWindowHint
@@ -4863,6 +4887,11 @@ class NekoPlayer(QMainWindow):
         self._video_aspect = None
         self._video_fill_mode = "height"  # "height": adatta il video all'altezza; "width": alla larghezza; "contain": angoli dentro l'ellisse
         self._last_display_frame = None   # ultima cornice mostrata, per ridisegnarla al volo
+        # Modalita' "Dimensioni reali": il video scalato dal modello viene mostrato a dimensione naturale (o ridotta a passi
+        # del 10%), centrato e spostabile col tastierino numerico; la parte fuori dall'area video viene tagliata
+        self._real_size = False
+        self._real_pct = 100              # scala in percentuale: da REAL_MIN_PCT a 100 (= dimensione naturale), a passi di REAL_STEP_PCT
+        self._real_off = [0, 0]           # spostamento del video rispetto al centro dell'area video, in pixel
         # Modalità "minimal": dimensioni della finestra separate, salvate in config come window_minimal_*
         self._minimal_on = False              # stato del toggle (spunta nel menu col tasto destro)
         self._minimal_size = None             # (w, h) minimal caricate/salvate da config
@@ -6222,8 +6251,10 @@ class NekoPlayer(QMainWindow):
         self._ear_rel_l = lay["rel_l"]
         self._ear_rel_r = lay["rel_r"]
 
-    def _vertical_reach(self, w: int, h: int):
+    def _vertical_reach(self, w: int, h: int, ears: bool = True):
         # (px sopra la finestra occupati dalle orecchie, px sotto la finestra): l'ellisse non sporge sotto
+        # ears=False: le orecchie non contano (possono uscire dallo schermo), conta solo la finestra
+        if not ears: return 0, 0
         above = max(0.0, -self._ears_layout(float(w), float(h))["tip_top"])
         return int(math.ceil(above)), 0
 
@@ -6231,9 +6262,9 @@ class NekoPlayer(QMainWindow):
         # px che sporgono a sinistra (= a destra) della finestra: nessuno, il profilo è la finestra stessa
         return 0
 
-    def _solve_height(self, w: int, avail: int) -> int:
+    def _solve_height(self, w: int, avail: int, ears: bool = True) -> int:
         min_h = max(self.minimumSizeHint().height(), self.minimumHeight(), 1)
-        def total(h): return sum(self._vertical_reach(w, h)) + h
+        def total(h): return sum(self._vertical_reach(w, h, ears)) + h
         if total(min_h) > avail: return min_h
         lo, hi = min_h, max(min_h, avail)
         while lo < hi:
@@ -6253,13 +6284,14 @@ class NekoPlayer(QMainWindow):
             else: hi = mid - 1
         return lo
 
-    def _fits_screen(self, w: int, h: int, sg) -> bool:
-        above, below = self._vertical_reach(w, h)
+    def _fits_screen(self, w: int, h: int, sg, ears: bool = True) -> bool:
+        above, below = self._vertical_reach(w, h, ears)
         return above + h + below <= sg.height() and w + 2 * self._side_reach(w, h) <= sg.width()
 
-    def fit_to_screen(self, fit_w: bool, fit_h: bool):
+    def fit_to_screen(self, fit_w: bool, fit_h: bool, ears: bool = True):
         """Adatta la finestra centrale allo schermo.
-        Altezza: punte delle orecchie sul bordo superiore, arco inferiore sul bordo inferiore.
+        Altezza: punte delle orecchie sul bordo superiore, arco inferiore sul bordo inferiore
+        (con ears=False le orecchie non contano: la finestra occupa tutta l'altezza dello schermo).
         Larghezza: archi laterali sui bordi sinistro e destro (i baffi non contano).
         Ciò che non viene adattato resta invariato (dimensione e posizione sull'asse corrispondente)."""
         if self.isFullScreen() or self.isMaximized() or self.isMinimized() or not self.isVisible(): return
@@ -6270,7 +6302,7 @@ class NekoPlayer(QMainWindow):
             # Larghezza e altezza dipendono l'una dall'altra (curvatura degli archi, dimensione delle orecchie):
             # si alternano i due calcoli finché raggiungono un punto stabile
             for _ in range(30):
-                nh = self._solve_height(w, sg.height())
+                nh = self._solve_height(w, sg.height(), ears)
                 nw = self._solve_width(nh, sg.width())
                 if (nw, nh) == (w, h): break
                 w, h = nw, nh
@@ -6278,22 +6310,43 @@ class NekoPlayer(QMainWindow):
                 min_w = max(self.minimumSizeHint().width(), self.minimumWidth(), 1)
                 min_h = max(self.minimumSizeHint().height(), self.minimumHeight(), 1)
                 for _ in range(400):
-                    if self._fits_screen(w, h, sg) or (w <= min_w and h <= min_h): break
+                    if self._fits_screen(w, h, sg, ears) or (w <= min_w and h <= min_h): break
                     w, h = max(min_w, w - 1), max(min_h, h - 1)
-        elif fit_h: h = self._solve_height(w, sg.height())
+        elif fit_h: h = self._solve_height(w, sg.height(), ears)
         elif fit_w: w = self._solve_width(h, sg.width())
         x = sg.left() + self._side_reach(w, h) if fit_w else self.x()
-        y = sg.top() + self._vertical_reach(w, h)[0] if fit_h else self.y()
+        y = sg.top() + self._vertical_reach(w, h, ears)[0] if fit_h else self.y()
         self._ears_key = None
         self._whiskers_key = None
         self.setGeometry(x, y, w, h)
         self._ears_force_raise = True
         self.sync_ears_position()
         self.save_settings()
+        # il window manager puo' applicare la nuova geometria in ritardo: si rinfresca subito e di nuovo dopo,
+        # cosi' menu (play + volume), bocca e orecchie seguono le dimensioni finali
+        self._refresh_after_fit()
+        QTimer.singleShot(0, self._refresh_after_fit)
+        QTimer.singleShot(150, self._refresh_after_fit)
+
+    def _refresh_after_fit(self):
+        """Ricalcola forma, bocca, orecchie e disposizione del menu sulle dimensioni attuali della finestra."""
+        if self.isFullScreen() or not self.isVisible(): return
+        self._update_shape()
+        self._layout_grips()
+        self._scale_mouth()
+        self._recompute_ears_geometry(float(self.width()), float(self.height()))
+        self._last_size_key = None
+        self._ears_key = None
+        self._whiskers_key = None
+        self._ears_force_raise = True
+        self._layout_overlay()
+        self._update_display_target()
+        self._redraw_last_frame()
+        self.sync_ears_position()
 
     def fit_height_to_screen(self): self.fit_to_screen(False, True)
     def fit_width_to_screen(self): self.fit_to_screen(True, False)
-    def fit_all_to_screen(self): self.fit_to_screen(True, True)
+    def fit_all_to_screen(self): self.fit_to_screen(True, True, ears=False)   # "Adatta tutto": le orecchie non contano nell'altezza
 
     def _video_native_ratio(self):
         """Aspect ratio nativo (larghezza/altezza) del video corrente, o None."""
@@ -6320,6 +6373,8 @@ class NekoPlayer(QMainWindow):
             ("Adatta video", lambda: self.set_video_fill_mode("contain"), has_video),
             ("Adatta video L", lambda: self.set_video_fill_mode("width"), has_video),
             ("Adatta video H", lambda: self.set_video_fill_mode("height"), has_video),
+            ("Dimensioni reali" + (f" ({self._real_pct}%)" if self._real_size else ""), self.toggle_real_size,
+             (has_video and not self._audio_only) or self._real_size, bool(self._real_size)),
             # Toggle: dimensioni separate "minimal" (salvate in config come window_minimal_*)
             ("Minimal", self.toggle_minimal_mode, can_fit, bool(self._minimal_on)),
             ("Sottotitoli" if self.subs is not None else "Sottotitoli (nessun karaoke)",
@@ -7114,6 +7169,9 @@ class NekoPlayer(QMainWindow):
 
     def keyPressEvent(self, event: QKeyEvent):
         key = event.key()
+        if self._real_size and self._real_size_key(event):
+            event.accept()
+            return
         if key == Qt.Key_Q:
             self.close()
             event.accept()
@@ -7618,7 +7676,11 @@ class NekoPlayer(QMainWindow):
         if mode not in ("width", "height", "contain"): return
         self._video_fill_mode = mode
         self.save_settings()
-        # Ridisegna subito l'ultima cornice con il nuovo riempimento
+        if self._real_size: self.set_real_size(False)   # sceglie un adattamento: si esce da "Dimensioni reali" (e ridisegna)
+        else: self._redraw_last_frame()
+
+    def _redraw_last_frame(self):
+        """Ridisegna subito l'ultima cornice (nuovo riempimento, scala o spostamento)."""
         frame = self._last_display_frame
         if frame is not None:
             try:
@@ -7628,13 +7690,101 @@ class NekoPlayer(QMainWindow):
         else:
             self.video_display.update()
 
-    def update_video_frame(self, frame, fps, gpu_ms, out_w, out_h):
+    # ------------------------------------------------------------ dimensioni reali
+    def toggle_real_size(self):
+        self.set_real_size(not self._real_size)
+
+    def set_real_size(self, on):
+        """Attiva/disattiva "Dimensioni reali": il video resta alla dimensione prodotta dal modello (niente riduzione
+        all'altezza della finestra), a scala 100% e centrato. - / + cambiano la scala, 2 4 6 8 del tastierino lo spostano."""
+        on = bool(on)
+        if on == self._real_size: return
+        self._real_size = on
+        if on:
+            self._real_pct = 100
+            self._real_off = [0, 0]
+        self.worker.native_size = on
+        self.worker.request_refit()        # in pausa il worker rifa' il frame con la dimensione di uscita nuova
+        self._redraw_last_frame()
+        if on: self.show_toast(f"Dimensioni reali: {self._real_pct}%  (- / +: scala, 2 4 6 8: sposta)", 2500)
+
+    def _real_zoom(self, sign):
+        old = self._real_pct
+        new = max(self.REAL_MIN_PCT, min(100, old + sign * self.REAL_STEP_PCT))
+        if new != old:
+            k = new / float(old)           # la parte di video al centro della finestra resta al centro
+            self._real_off = [int(round(self._real_off[0] * k)), int(round(self._real_off[1] * k))]
+            self._real_pct = new
+            self._redraw_last_frame()
+        self.show_toast(f"Dimensioni reali: {self._real_pct}%"
+                        + (" (naturale)" if self._real_pct == 100 else ""), 1200)
+
+    def _real_move(self, dx, dy):
+        self._real_off = [self._real_off[0] + dx * self.REAL_MOVE_PX, self._real_off[1] + dy * self.REAL_MOVE_PX]
+        self._redraw_last_frame()          # update_video_frame limita lo spostamento
+
+    def _real_size_key(self, event):
+        """Tasti di "Dimensioni reali": - / + (scala) e 2 4 6 8 (spostamento). True se l'evento e' stato gestito."""
+        key, mods = event.key(), event.modifiers()
+        if key in (Qt.Key_Plus, Qt.Key_Equal, Qt.Key_Minus) and not (mods & Qt.ControlModifier):
+            self._real_zoom(-1 if key == Qt.Key_Minus else 1)
+            return True
+        # 8 = ci si sposta verso l'alto, 4 verso sinistra, 2 verso il basso, 6 verso destra: a muoversi e' la "vista", quindi il video scorre al contrario
+        dirs = {Qt.Key_8: (0, 1), Qt.Key_2: (0, -1), Qt.Key_4: (1, 0), Qt.Key_6: (-1, 0)}
+        if mods & Qt.KeypadModifier:       # tastierino con NumLock spento: manda le frecce (quelle normali restano i salti nel tempo)
+            dirs.update({Qt.Key_Up: (0, 1), Qt.Key_Down: (0, -1), Qt.Key_Left: (1, 0), Qt.Key_Right: (-1, 0)})
+        d = dirs.get(key)
+        if d is None: return False
+        self._real_move(*d)
+        return True
+
+    def _real_size_pixmap(self, frame, tw, th):
+        """Pixmap grande quanto l'area video (tw x th) con il frame a scala _real_pct%, centrato e spostato di _real_off;
+        quel che esce dall'area viene tagliato e, se il video e' piu' piccolo, il resto resta vuoto."""
         h, w = frame.shape[:2]
+        if self._real_pct < 100:
+            sw = max(1, int(round(w * self._real_pct / 100.0)))
+            sh = max(1, int(round(h * self._real_pct / 100.0)))
+            img = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_AREA)
+        else:
+            img, sw, sh = frame, w, h
+        # almeno REAL_KEEP_PX pixel di video restano visibili: il video non si puo' perdere fuori dalla finestra
+        mx = max(0, (sw + tw) // 2 - self.REAL_KEEP_PX)
+        my = max(0, (sh + th) // 2 - self.REAL_KEEP_PX)
+        ox = max(-mx, min(mx, self._real_off[0]))
+        oy = max(-my, min(my, self._real_off[1]))
+        self._real_off = [ox, oy]
+        out = QPixmap(max(1, tw), max(1, th))
+        out.fill(Qt.transparent)
+        x0, y0 = (tw - sw) // 2 + ox, (th - sh) // 2 + oy
+        vx0, vy0 = max(0, x0), max(0, y0)
+        vx1, vy1 = min(tw, x0 + sw), min(th, y0 + sh)
+        if vx1 > vx0 and vy1 > vy0:
+            crop = np.ascontiguousarray(img[vy0 - y0:vy1 - y0, vx0 - x0:vx1 - x0])   # solo la parte visibile
+            qi = QImage(crop.data, crop.shape[1], crop.shape[0], crop.strides[0], QImage.Format_RGB888)
+            p = QPainter(out)
+            p.drawImage(vx0, vy0, qi)
+            p.end()
+        return out
+
+    def update_video_frame(self, frame, fps, gpu_ms, out_w, out_h):
         self._last_display_frame = np.ascontiguousarray(frame)
+        target = self.video_display.size()
+        if self._real_size:
+            pixmap = self._real_size_pixmap(frame, target.width(), target.height())
+        else:
+            pixmap = self._fitted_pixmap(frame, target.width(), target.height())
+        self.video_display.setPixmap(pixmap)
+        self.worker.display_size = (target.width(), target.height())
+        now = time.monotonic()
+        if now - self._last_hud_update < 0.25: return
+        self._update_hud(fps, gpu_ms, out_w, out_h, now)
+
+    def _fitted_pixmap(self, frame, tw, th):
+        """Frame adattato all'area video secondo la modalita' di riempimento (altezza, larghezza, contain)."""
+        h, w = frame.shape[:2]
         q_img = QImage(frame.data, w, h, frame.strides[0], QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(q_img)
-        target = self.video_display.size()
-        tw, th = target.width(), target.height()
         fill_mode = getattr(self, "_video_fill_mode", "height")
         if fill_mode == "width":
             # Adatta alla larghezza dell'area centrale; se è più alto, taglia sopra/sotto (centrato)
@@ -7665,10 +7815,9 @@ class NekoPlayer(QMainWindow):
                 pixmap = pixmap.scaledToHeight(th, Qt.FastTransformation)
             if tw > 0 and pixmap.width() > tw:
                 pixmap = pixmap.copy((pixmap.width() - tw) // 2, 0, tw, pixmap.height())
-        self.video_display.setPixmap(pixmap)
-        self.worker.display_size = (target.width(), target.height())
-        now = time.monotonic()
-        if now - self._last_hud_update < 0.25: return
+        return pixmap
+
+    def _update_hud(self, fps, gpu_ms, out_w, out_h, now):
         self._last_hud_update = now
         if self.show_osd:
             models = []
@@ -7684,6 +7833,11 @@ class NekoPlayer(QMainWindow):
                 prec = "FP16" if (self.worker.upscaler and self.worker.upscaler['np_dtype'] == np.float16) else "FP32"
                 model_text = " -> ".join(models) + f" [{prec}]"
 
+            src = self.worker.src_size
+            src_line = f"\n🎞️ Video originale: {src[0]}x{src[1]}" if src and src[0] > 0 and src[1] > 0 else ""
+            if self._real_size:
+                src_line += (f"\n🔍 Dimensioni reali: {self._real_pct}% -> "
+                             f"{int(round(out_w * self._real_pct / 100.0))}x{int(round(out_h * self._real_pct / 100.0))} a schermo")
             shader_line = ""
             if self.active_shaders:
                 shader_line = "\n🎨 Shader: " + ", ".join(os.path.splitext(n)[0] for n in self.active_shaders)
@@ -7692,7 +7846,7 @@ class NekoPlayer(QMainWindow):
                 f"⏱️ Latenza GPU: {gpu_ms:.1f} ms\n"
                 f"🧠 Pipeline: {model_text}\n"
                 f"🎬 Decodifica: {self.worker.decode_mode}\n"
-                f"📺 Risoluzione Frame: {out_w}x{out_h}" + shader_line
+                f"📺 Risoluzione Frame: {out_w}x{out_h}" + src_line + shader_line
             )
             self.osd_label.adjustSize()
             if self.isFullScreen() or self.isMaximized():
