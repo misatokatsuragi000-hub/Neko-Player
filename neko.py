@@ -2215,6 +2215,8 @@ class VideoProcessorThread(QThread):
         self.native_size = False       # True: modalita' "Dimensioni reali": i frame escono alla dimensione del modello, senza riduzione all'altezza della finestra
         self._refit_dirty = False      # richiesta (dalla GUI) di rifare il frame corrente con la dimensione di uscita nuova
         self._last_full = None         # (frame prima dell'eventuale riduzione, w, h): serve a rifare il frame in pausa
+        self._pending = 0              # frame emessi e non ancora mostrati dalla GUI (contropressione: la coda resta corta)
+        self._pending_lock = threading.Lock()
 
         # Shader GLSL di post-processing (applicati ai frame dopo la pipeline AI, nello stesso thread)
         self.shader_paths = ()
@@ -2351,6 +2353,22 @@ class VideoProcessorThread(QThread):
         self.shader_force_when = bool(on)
         self._shader_dirty = True
 
+    MAX_PENDING_FRAMES = 2
+
+    def _emit_frame(self, frame, fps, gpu_ms, w, h, force=False):
+        """Emette un frame verso la GUI solo se questa non e' gia' indietro di piu' di MAX_PENDING_FRAMES: i frame a dimensione
+        piena (4K/8K in "Dimensioni reali") pesano decine di MB e una coda illimitata finirebbe la RAM."""
+        with self._pending_lock:
+            if self._pending >= self.MAX_PENDING_FRAMES and not force: return False
+            self._pending += 1
+        self.frame_ready.emit(frame, fps, gpu_ms, w, h)
+        return True
+
+    def frame_consumed(self):
+        """Chiamato dalla GUI quando ha finito di mostrare un frame ricevuto."""
+        with self._pending_lock:
+            if self._pending > 0: self._pending -= 1
+
     def request_refit(self):
         """Chiede di ridisegnare (se in pausa) il frame corrente alla dimensione di uscita attuale (vedi native_size)."""
         self._refit_dirty = True
@@ -2407,6 +2425,7 @@ class VideoProcessorThread(QThread):
         self._rife_prev = None
         self._last_raw = None
         self._last_full = None
+        with self._pending_lock: self._pending = 0
         self._shader_dirty = False
         self._refit_dirty = False
         self._warmup(vid_w, vid_h)
@@ -2509,8 +2528,16 @@ class VideoProcessorThread(QThread):
             proc_est = proc if proc_est == 0.0 else 0.9 * proc_est + 0.1 * proc
             next_t += frame_interval
         stop_evt.set()
-        decoder.join()
-        cap.release()
+        # se il decoder e' fermo in una lettura dalla pipe di ffmpeg (es. decodifica hardware bloccata) la join non
+        # tornerebbe mai e con lei la GUI: si uccide ffmpeg per sbloccare la lettura e si attende al massimo qualche secondo
+        if hasattr(cap, "_kill"):
+            try: cap._kill()
+            except Exception: pass
+        decoder.join(timeout=5.0)
+        if decoder.is_alive():
+            print("[Neko Player] Il decoder non si e' fermato in tempo: lo abbandono per non bloccare il player.")
+        else:
+            cap.release()
         self._release_shaders()   # il contesto OpenGL va rilasciato dal thread che l'ha creato
         self.running = False
         if ended: self.playback_finished.emit()
@@ -2636,10 +2663,10 @@ class VideoProcessorThread(QThread):
         if mid_frame is not None: mid_frame = self._shade_and_fit(mid_frame)[0]
         if mid_frame is not None and interp:
             # frame intermedio subito, frame reale mezzo intervallo dopo
-            self.frame_ready.emit(np.ascontiguousarray(mid_frame), fps_val * 2.0, gpu_time_ms, full_w, full_h)
+            self._emit_frame(np.ascontiguousarray(mid_frame), fps_val * 2.0, gpu_time_ms, full_w, full_h)
             time.sleep(0.5 / max(self.video_fps, 1.0))
             fps_val *= 2.0
-        self.frame_ready.emit(np.ascontiguousarray(display_frame), fps_val, gpu_time_ms, full_w, full_h)
+        self._emit_frame(np.ascontiguousarray(display_frame), fps_val, gpu_time_ms, full_w, full_h)
 
     def _shade_and_fit(self, frame):
         """Applica gli shader; se hanno ingrandito il frame (es. upscale 2x) lo riporta alla dimensione di visualizzazione."""
@@ -2698,7 +2725,7 @@ class VideoProcessorThread(QThread):
         frame, full_w, full_h = raw
         out, shaded = self._shade_and_fit(frame)
         full_w, full_h = self._scaled_full(full_w, full_h, (frame.shape[1], frame.shape[0]), shaded)
-        self.frame_ready.emit(np.ascontiguousarray(out), self.real_fps, 0.0, full_w, full_h)
+        self._emit_frame(np.ascontiguousarray(out), self.real_fps, 0.0, full_w, full_h, force=True)
 
     def _release_shaders(self):
         chain, self._shader_chain = self._shader_chain, None
@@ -2833,7 +2860,9 @@ class VideoProcessorThread(QThread):
 
     def stop(self):
         self.running = False
-        self.wait()
+        # attesa limitata: un thread video bloccato non deve congelare tutta l'interfaccia (e lo schermo intero)
+        if not self.wait(10000):
+            print("[Neko Player] Il thread video non si e' fermato entro 10 s: proseguo senza attenderlo.")
 
 class BubbleMenu(QWidget):
     """Menu contestuale a forma di nuvola dei pensieri di un fumetto: il profilo e' fatto di lobi tondeggianti e, al posto
@@ -4829,7 +4858,8 @@ class NekoPlayer(QMainWindow):
     _media_loaded = False   # c'e' un video/audio caricato (il pulsante play e' 'attivo')
     _wandering = False      # la testa sta girando per lo schermo (play senza video)
     REAL_MIN_PCT = 10        # "Dimensioni reali": scala minima (%)
-    REAL_STEP_PCT = 10       # passo di - e + (%)
+    REAL_STEP_PCT = 10       # passo di - e + (%), sia sotto sia sopra il 100%
+    REAL_MAX_PCT = 3200      # ingrandimento massimo (oltre il 100% senza filtri: pixel replicati, mai interpolati)
     REAL_MOVE_PX = 40        # passo di spostamento coi tasti 2468 del tastierino (pixel)
     REAL_KEEP_PX = 60        # pixel di video che restano sempre visibili quando lo si sposta
     def __init__(self, initial_video=None):
@@ -4889,6 +4919,7 @@ class NekoPlayer(QMainWindow):
         self._last_display_frame = None   # ultima cornice mostrata, per ridisegnarla al volo
         # Modalita' "Dimensioni reali": il video scalato dal modello viene mostrato a dimensione naturale (o ridotta a passi
         # del 10%), centrato e spostabile col tastierino numerico; la parte fuori dall'area video viene tagliata
+        self._startup_hide = False        # aperto a schermo intero: il menu resta nascosto finche' il mouse non arriva nella sua zona
         self._real_size = False
         self._real_pct = 100              # scala in percentuale: da REAL_MIN_PCT a 100 (= dimensione naturale), a passi di REAL_STEP_PCT
         self._real_off = [0, 0]           # spostamento del video rispetto al centro dell'area video, in pixel
@@ -4957,7 +4988,7 @@ class NekoPlayer(QMainWindow):
         self.audio_player = QMediaPlayer(self)
         self.audio_player.mediaStatusChanged.connect(self._on_audio_status)
         self.worker = VideoProcessorThread()
-        self.worker.frame_ready.connect(self.update_video_frame)
+        self.worker.frame_ready.connect(self._on_frame_ready)
         self.worker.position_changed.connect(self.update_timeline)
         self.worker.playback_finished.connect(self.on_video_finished)
         self.worker.loop_restarted.connect(self.on_loop_restarted)
@@ -5248,8 +5279,17 @@ class NekoPlayer(QMainWindow):
         self.controls_panel.raise_()
         self._update_shape()
 
+    OVERLAY_HOVER_MARGIN = 0    # px attorno al menu in cui il mouse lo fa comparire / lo tiene visibile
+
     def _overlay_zone_rect(self):
+        """Zona sensibile del mouse per il menu: solo il rettangolo dove il menu si trova davvero (piu' un piccolo margine),
+        anche quando e' nascosto (la sua geometria resta quella in cui comparira')."""
         if not hasattr(self, "controls_panel"): return QRect()
+        g = self.controls_panel.geometry()
+        if g.width() >= 40 and g.height() >= 20:
+            m = self.OVERLAY_HOVER_MARGIN
+            return g.adjusted(-m, -m, m, m)
+        # geometria del menu non ancora disponibile: zona larga di ripiego, cosi' il menu resta raggiungibile
         cw, ch = self.container.width(), self.container.height()
         if getattr(self, "_minimal_on", False):
             top = max(0, ch // 2 - 30)   # in minimal il pannello parte da metà finestra
@@ -5312,7 +5352,7 @@ class NekoPlayer(QMainWindow):
                         local = self.container.mapFromGlobal(QCursor.pos())
                         zone = self._overlay_zone_rect()
                         near = (zone.contains(local) or
-                                self.controls_panel.geometry().adjusted(-30, -30, 30, 30).contains(local))
+                                self.controls_panel.geometry().adjusted(-self.OVERLAY_HOVER_MARGIN, -self.OVERLAY_HOVER_MARGIN, self.OVERLAY_HOVER_MARGIN, self.OVERLAY_HOVER_MARGIN).contains(local))
                     except Exception: near = True
                 if near:
                     self._controls_hover = True
@@ -5331,7 +5371,7 @@ class NekoPlayer(QMainWindow):
             try:
                 local = self.container.mapFromGlobal(gp)
                 zone = self._overlay_zone_rect()
-                inside = (zone.contains(local) or self.controls_panel.geometry().adjusted(-30, -30, 30, 30).contains(local))
+                inside = (zone.contains(local) or self.controls_panel.geometry().adjusted(-self.OVERLAY_HOVER_MARGIN, -self.OVERLAY_HOVER_MARGIN, self.OVERLAY_HOVER_MARGIN, self.OVERLAY_HOVER_MARGIN).contains(local))
             except Exception: inside = True
             if inside:
                 self._controls_hover = True
@@ -5343,7 +5383,7 @@ class NekoPlayer(QMainWindow):
                     self._overlay_hide_timer.start(500)
             return
         self._set_minimal_compact(False)
-        if not self._has_video():
+        if not self._has_video() and not self._startup_hide:
             self._controls_hover = True
             if not self._controls_visible or not self.controls_panel.isVisible(): self._show_overlay()
             self._overlay_hide_timer.stop()
@@ -5353,9 +5393,10 @@ class NekoPlayer(QMainWindow):
         try:
             local = self.container.mapFromGlobal(gp)
             zone = self._overlay_zone_rect()
-            inside = (zone.contains(local) or self.controls_panel.geometry().adjusted(-30, -30, 30, 30).contains(local))
+            inside = (zone.contains(local) or self.controls_panel.geometry().adjusted(-self.OVERLAY_HOVER_MARGIN, -self.OVERLAY_HOVER_MARGIN, self.OVERLAY_HOVER_MARGIN, self.OVERLAY_HOVER_MARGIN).contains(local))
         except Exception: inside = True
         if inside:
+            self._startup_hide = False
             self._controls_hover = True
             if not self._controls_visible: self._show_overlay()
             self._overlay_hide_timer.start()
@@ -5614,7 +5655,7 @@ class NekoPlayer(QMainWindow):
 
     def _hide_overlay(self):
         if not hasattr(self, "controls_panel"): return
-        if not self._has_video():
+        if not self._has_video() and not self._startup_hide:
             if MINIMAL_CLOCK and getattr(self, "_minimal_on", False) and not self._controls_hover:
                 return      # minimal senza video e mouse lontano: i controlli restano nascosti (c'e' l'orologio)
             if not self._controls_visible: self._show_overlay()
@@ -6618,7 +6659,7 @@ class NekoPlayer(QMainWindow):
         print(f"[Shader] disattivato: {', '.join(names)}\n{msg}")
         self.show_toast(f"Shader disattivato: {', '.join(names)}\n{msg.strip()[:500]}")
 
-    def show_toast(self, text, ms=8000):
+    def show_toast(self, text, ms=8000, corner=None):
         """Avviso temporaneo sopra il video (non modale: con la finestra senza cornice un QMessageBox poteva restare nascosto e bloccare l'app)."""
         lab = getattr(self, "_toast", None)
         if lab is None:
@@ -6634,7 +6675,18 @@ class NekoPlayer(QMainWindow):
         lab.setText(text)
         lab.setMaximumWidth(max(200, int(cw * 0.7)))
         lab.adjustSize()
-        lab.move(max(0, (cw - lab.width()) // 2), int(ch * 0.12))
+        if corner == "br":      # in basso a destra
+            if self.isFullScreen() or self.isMaximized():
+                lab.move(max(0, cw - lab.width() - 16), max(0, ch - lab.height() - 16))
+            else:
+                # la finestra e' un'ellisse: l'angolo del rettangolo cadrebbe fuori, quindi si tiene il bordo basso-destro
+                # dell'avviso dentro il profilo (un po' sopra il bordo inferiore)
+                by = int(ch * 0.90)
+                y = max(0, by - lab.height())
+                x = int(cw / 2.0 + ellipse_half_width(cw, ch, by, 8)) - lab.width()
+                lab.move(max(0, x), y)
+        else:
+            lab.move(max(0, (cw - lab.width()) // 2), int(ch * 0.12))
         lab.show()
         lab.raise_()
         self._toast_timer.start(ms)
@@ -6930,6 +6982,9 @@ class NekoPlayer(QMainWindow):
             "subtitles_scale": float(self.sub_scale),
             "show_bg_texture": self.chk_texture.isChecked(),
             "video_fill_mode": getattr(self, "_video_fill_mode", "height"),
+            "real_size": bool(self._real_size),
+            "real_size_pct": int(self._real_pct),
+            "real_size_offset": [int(self._real_off[0]), int(self._real_off[1])],
             "minimal_mode": bool(getattr(self, "_minimal_on", False)),
             "last_video_dir": self.last_video_dir,
             "last_model_dir": self.last_model_dir,
@@ -7002,6 +7057,17 @@ class NekoPlayer(QMainWindow):
             self.container.set_show_texture(saved_texture)
             saved_fill = config_data.get("video_fill_mode", "height")
             if saved_fill in ("width", "height", "contain"): self._video_fill_mode = saved_fill
+            # "Dimensioni reali": se era attiva viene ripristinata, con scala e spostamento
+            try:
+                pct = int(config_data.get("real_size_pct", 100))
+                pct = int(round(pct / float(self.REAL_STEP_PCT))) * self.REAL_STEP_PCT
+                self._real_pct = max(self.REAL_MIN_PCT, min(self.REAL_MAX_PCT, pct))
+                off = config_data.get("real_size_offset", [0, 0])
+                self._real_off = [int(off[0]), int(off[1])]
+            except Exception:
+                self._real_pct, self._real_off = 100, [0, 0]
+            self._real_size = bool(config_data.get("real_size", False))
+            self.worker.native_size = self._real_size
             # Stato e dimensioni separate della modalità "minimal"
             # (le dimensioni minimal sostituiscono window_width/height: verranno salvate
             #  al prossimo write, così le due coppie restano sempre coerenti con lo stato)
@@ -7110,8 +7176,17 @@ class NekoPlayer(QMainWindow):
                     self.status.showMessage(f"Denoise: {os.path.basename(saved_denoise_model)}")
                 except Exception as e: print(f"[Config] Errore Denoise: {e}")
 
-            if config_data.get("fullscreen", False): QTimer.singleShot(100, self.toggle_fullscreen)
+            if config_data.get("fullscreen", False): QTimer.singleShot(100, self._startup_fullscreen)
         except Exception as e: print(f"[Config] Errore: {e}")
+
+    def _startup_fullscreen(self):
+        """Riapertura a schermo intero: il menu (play + volume) resta nascosto finche' il mouse non va nella sua zona."""
+        self._startup_hide = True
+        if not self.isFullScreen(): self.toggle_fullscreen()
+        self._overlay_hide_timer.stop()
+        self._controls_visible = False
+        self.controls_panel.hide()
+        self.video_display.update()
 
     def toggle_fullscreen(self):
         self._ears_key = None
@@ -7204,6 +7279,12 @@ class NekoPlayer(QMainWindow):
             event.accept()
         elif key == Qt.Key_E:
             self.cycle_audio_track()
+            event.accept()
+        elif key in (Qt.Key_PageDown, Qt.Key_PageUp):
+            self.open_sibling_file(1 if key == Qt.Key_PageDown else -1)
+            event.accept()
+        elif key == Qt.Key_Delete:
+            self.trash_current_file()
             event.accept()
         elif key in (Qt.Key_Plus, Qt.Key_Equal, Qt.Key_Minus):
             su = key != Qt.Key_Minus
@@ -7605,6 +7686,91 @@ class NekoPlayer(QMainWindow):
             self.save_settings()
         return path
 
+    def _sibling_files(self, current):
+        """File multimediali della cartella di `current` in ordine alfabetico "naturale" (file2 prima di file10).
+        Gli audio con lo stesso nome di un video (es. i .mka esportati da hira) sono tracce del video, non file a parte."""
+        d = os.path.dirname(current)
+        try: names = os.listdir(d)
+        except OSError: return []
+        def ext_of(n): return os.path.splitext(n)[1].lower().lstrip(".")
+        video_stems = {os.path.splitext(n)[0].casefold() for n in names if ext_of(n) in VIDEO_EXTS}
+        files = [n for n in names
+                 if os.path.isfile(os.path.join(d, n))
+                 and (ext_of(n) in VIDEO_EXTS
+                      or (ext_of(n) in AUDIO_EXTS and os.path.splitext(n)[0].casefold() not in video_stems))]
+        cur = os.path.basename(current)
+        if cur not in files: files.append(cur)
+        files.sort(key=lambda n: [int(t) if t.isdigit() else t.casefold() for t in re.split(r"(\d+)", n)])
+        return files
+
+    def open_sibling_file(self, step):
+        """PageDown / PageUp: apre il file successivo / precedente (ordine alfabetico) nella cartella di quello in riproduzione."""
+        cur = self._audio_path if self._audio_only else self.worker.video_path
+        if not cur or not os.path.isfile(cur):
+            self.show_toast("Nessun file aperto", 1500, corner="br")
+            return
+        files = self._sibling_files(cur)
+        i = files.index(os.path.basename(cur)) + step
+        if not (0 <= i < len(files)):
+            self.show_toast("Ultimo file della cartella" if step > 0 else "Primo file della cartella", 1500, corner="br")
+            return
+        path = os.path.join(os.path.dirname(cur), files[i])
+        self.last_video_dir = os.path.dirname(path)
+        self.save_settings()
+        self.play_video_file(path)
+        self.show_toast(f"{files[i]}  ({i + 1}/{len(files)})", 2000, corner="br")
+
+    @staticmethod
+    def _move_to_trash(path):
+        """Sposta il file nel cestino (mai cancellazione definitiva). True se riuscito."""
+        try:
+            from PyQt5.QtCore import QFile
+            r = QFile.moveToTrash(path)            # Qt >= 5.15: (bool, percorso nel cestino)
+            if (r[0] if isinstance(r, tuple) else bool(r)): return True
+        except Exception: pass
+        for cmd in (["gio", "trash", path], ["trash-put", path]):
+            try:
+                if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30).returncode == 0:
+                    return True
+            except Exception: continue
+        try:
+            from send2trash import send2trash
+            send2trash(path)
+            return True
+        except Exception: return False
+
+    def trash_current_file(self):
+        """Canc: sposta nel cestino il file in riproduzione e passa al successivo della cartella (o al precedente se era
+        l'ultimo); se non ce ne sono altri, ferma la riproduzione."""
+        cur = self._audio_path if self._audio_only else self.worker.video_path
+        if not cur or not os.path.isfile(cur):
+            self.show_toast("Nessun file da cestinare", 1500, corner="br")
+            return
+        files = self._sibling_files(cur)
+        name = os.path.basename(cur)
+        i = files.index(name) if name in files else -1
+        nxt = files[i + 1] if 0 <= i < len(files) - 1 else (files[i - 1] if i > 0 else None)
+        if not self._move_to_trash(cur):
+            self.show_toast(f"Impossibile spostare nel cestino: {name}", 3000, corner="br")
+            return
+        folder = os.path.dirname(cur)
+        if nxt:
+            def _open_next():
+                self.play_video_file(os.path.join(folder, nxt))     # chiude il file cestinato e apre il nuovo
+                self.resume_positions.pop(cur, None)                # la ripresa del file cestinato non serve piu'
+                self.save_settings()
+            QTimer.singleShot(50, _open_next)                       # dopo che il ciclo eventi ha chiuso il tasto e lo spostamento
+        else:
+            self.worker.stop()
+            self.audio_player.stop()
+            self._leave_audio_mode()
+            self.worker.video_path = None
+            self._last_display_frame = None
+            self.on_video_finished()
+            self.resume_positions.pop(cur, None)
+            self.save_settings()
+        self.show_toast(f"Nel cestino: {name}", 2500, corner="br")
+
     def select_video(self):
         file_path = self._pick_file("video")
         if file_path: self.play_video_file(file_path)
@@ -7706,22 +7872,29 @@ class NekoPlayer(QMainWindow):
         self.worker.native_size = on
         self.worker.request_refit()        # in pausa il worker rifa' il frame con la dimensione di uscita nuova
         self._redraw_last_frame()
-        if on: self.show_toast(f"Dimensioni reali: {self._real_pct}%  (- / +: scala, 2 4 6 8: sposta)", 2500)
+        self.save_settings()
+        if on: self.show_toast(f"Dimensioni reali: {self._real_pct}%  (- / +: scala anche oltre il 100%, 2 4 6 8: sposta)", 2500, corner="br")
+
+    def _real_next_pct(self, pct, sign):
+        """Scala successiva: sempre a passi del 10%, da REAL_MIN_PCT a REAL_MAX_PCT (il 100% e' la dimensione naturale)."""
+        return max(self.REAL_MIN_PCT, min(self.REAL_MAX_PCT, pct + sign * self.REAL_STEP_PCT))
 
     def _real_zoom(self, sign):
         old = self._real_pct
-        new = max(self.REAL_MIN_PCT, min(100, old + sign * self.REAL_STEP_PCT))
+        new = self._real_next_pct(old, sign)
         if new != old:
             k = new / float(old)           # la parte di video al centro della finestra resta al centro
             self._real_off = [int(round(self._real_off[0] * k)), int(round(self._real_off[1] * k))]
             self._real_pct = new
             self._redraw_last_frame()
-        self.show_toast(f"Dimensioni reali: {self._real_pct}%"
-                        + (" (naturale)" if self._real_pct == 100 else ""), 1200)
+            self.save_settings()
+        note = " (naturale)" if self._real_pct == 100 else (" (pixel ingranditi, senza filtri)" if self._real_pct > 100 else "")
+        self.show_toast(f"Dimensioni reali: {self._real_pct}%{note}", 1200, corner="br")
 
     def _real_move(self, dx, dy):
         self._real_off = [self._real_off[0] + dx * self.REAL_MOVE_PX, self._real_off[1] + dy * self.REAL_MOVE_PX]
         self._redraw_last_frame()          # update_video_frame limita lo spostamento
+        self.save_settings()
 
     def _real_size_key(self, event):
         """Tasti di "Dimensioni reali": - / + (scala) e 2 4 6 8 (spostamento). True se l'evento e' stato gestito."""
@@ -7740,14 +7913,19 @@ class NekoPlayer(QMainWindow):
 
     def _real_size_pixmap(self, frame, tw, th):
         """Pixmap grande quanto l'area video (tw x th) con il frame a scala _real_pct%, centrato e spostato di _real_off;
-        quel che esce dall'area viene tagliato e, se il video e' piu' piccolo, il resto resta vuoto."""
+        quel che esce dall'area viene tagliato e, se il video e' piu' piccolo, il resto resta vuoto.
+        Sopra il 100% (analisi di immagini a bassa risoluzione) i pixel vengono solo replicati (nearest neighbor, nessun
+        filtro), e si ingrandisce soltanto la parte visibile."""
         h, w = frame.shape[:2]
-        if self._real_pct < 100:
-            sw = max(1, int(round(w * self._real_pct / 100.0)))
-            sh = max(1, int(round(h * self._real_pct / 100.0)))
+        pct = self._real_pct
+        img = frame
+        if pct > 100:
+            sw, sh = -(-w * pct // 100), -(-h * pct // 100)      # arrotondati per eccesso: l'ultimo pixel sorgente resta visibile
+        elif pct < 100:
+            sw, sh = max(1, int(round(w * pct / 100.0))), max(1, int(round(h * pct / 100.0)))
             img = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_AREA)
         else:
-            img, sw, sh = frame, w, h
+            sw, sh = w, h
         # almeno REAL_KEEP_PX pixel di video restano visibili: il video non si puo' perdere fuori dalla finestra
         mx = max(0, (sw + tw) // 2 - self.REAL_KEEP_PX)
         my = max(0, (sh + th) // 2 - self.REAL_KEEP_PX)
@@ -7760,12 +7938,23 @@ class NekoPlayer(QMainWindow):
         vx0, vy0 = max(0, x0), max(0, y0)
         vx1, vy1 = min(tw, x0 + sw), min(th, y0 + sh)
         if vx1 > vx0 and vy1 > vy0:
-            crop = np.ascontiguousarray(img[vy0 - y0:vy1 - y0, vx0 - x0:vx1 - x0])   # solo la parte visibile
+            if pct > 100:
+                # ogni pixel di schermo prende il pixel sorgente che lo copre (nearest neighbor, nessuna interpolazione);
+                # si calcola solo la parte visibile. Con scale non intere alcuni pixel risultano piu' larghi di altri.
+                xs = np.minimum(((np.arange(vx0, vx1) - x0) * 100) // pct, w - 1)
+                ys = np.minimum(((np.arange(vy0, vy1) - y0) * 100) // pct, h - 1)
+                crop = np.ascontiguousarray(frame[ys[:, None], xs[None, :]])
+            else:
+                crop = np.ascontiguousarray(img[vy0 - y0:vy1 - y0, vx0 - x0:vx1 - x0])   # solo la parte visibile
             qi = QImage(crop.data, crop.shape[1], crop.shape[0], crop.strides[0], QImage.Format_RGB888)
             p = QPainter(out)
             p.drawImage(vx0, vy0, qi)
             p.end()
         return out
+
+    def _on_frame_ready(self, frame, fps, gpu_ms, out_w, out_h):
+        try: self.update_video_frame(frame, fps, gpu_ms, out_w, out_h)
+        finally: self.worker.frame_consumed()      # sblocca l'emissione del prossimo frame (contropressione)
 
     def update_video_frame(self, frame, fps, gpu_ms, out_w, out_h):
         self._last_display_frame = np.ascontiguousarray(frame)
@@ -7901,6 +8090,20 @@ if __name__ == '__main__':
     if len(sys.argv) > 1:
         candidate_path = sys.argv[1]
         if os.path.isfile(candidate_path): video_argument = os.path.abspath(candidate_path)
+    # Diagnostica blocchi: se il thread della GUI non gira per piu' di 10 secondi, faulthandler scrive lo stack di tutti
+    # i thread in ~/neko_hang.log (si riarma da solo ogni secondo finche' l'interfaccia risponde).
+    try:
+        import faulthandler
+        _hang_log = open(os.path.join(os.path.expanduser("~"), "neko_hang.log"), "a", buffering=1)
+        _hang_log.write(f"\n=== avvio neko.py {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        faulthandler.enable(file=_hang_log)
+        _arm_hang_dump = lambda: faulthandler.dump_traceback_later(10, repeat=False, file=_hang_log)
+        _hang_timer = QTimer()
+        _hang_timer.timeout.connect(_arm_hang_dump)
+        _hang_timer.start(1000)
+        _arm_hang_dump()
+    except Exception as e:
+        print(f"[Neko Player] Diagnostica blocchi non attiva: {e}")
     player = NekoPlayer(initial_video=video_argument)
     player.show()
     if BYPASS_WM: QTimer.singleShot(150, player._grab_focus)
